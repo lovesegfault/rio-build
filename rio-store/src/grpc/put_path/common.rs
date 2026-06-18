@@ -1219,7 +1219,7 @@ impl StoreServiceImpl {
         // `stall: None`, `progress: None` — PutPath claims carry no
         // narinfo-declared size and write no progress evidence; the
         // download-stall takeover arm is structurally unreachable for
-        // them (`r[store.substitute.stale-reclaim+3]`), and
+        // them (`r[store.substitute.stale-reclaim+4]`), and
         // `fetched_bytes` stays NULL — the structural exemption from
         // every download-stall rule
         // (`r[store.substitute.progress-heartbeat]`). sh-023: the

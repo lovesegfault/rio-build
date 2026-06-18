@@ -662,7 +662,7 @@ let
         client.succeed("pkill -CONT -f 'http.server 8080' || true")
         client.succeed("tc qdisc del dev eth1 root || true")
 
-        # Post-abort claim behavior (stale-reclaim+3 arm 1): a DEDICATED
+        # Post-abort claim behavior (stale-reclaim+4 arm 1): a DEDICATED
         # re-fetch with its own -max-time 180 — QueryPathInfo blocks on
         # the full re-download + finalize from byte 0 (the release
         # NULLed fetched_bytes); a 30 s budget would client-cancel under

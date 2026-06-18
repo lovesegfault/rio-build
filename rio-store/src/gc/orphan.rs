@@ -30,7 +30,7 @@ use uuid::Uuid;
 /// attempts return miss until this scanner reclaims it.
 /// [`Substituter::ingest`](crate::substitute::Substituter) does its
 /// own 5-minute reclaim on the hot path (see
-/// `r[store.substitute.stale-reclaim+3]`); this sweep is the safety
+/// `r[store.substitute.stale-reclaim+4]`); this sweep is the safety
 /// net for placeholders nobody re-requests.
 ///
 /// Safe against reaping live uploads: uploaders heartbeat

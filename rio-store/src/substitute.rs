@@ -2178,7 +2178,7 @@ impl Substituter {
         info.store_path_hash = store_path_hash.to_vec();
         let refs_str: Vec<String> = info.references.iter().map(ToString::to_string).collect();
 
-        // r[impl store.substitute.stale-reclaim+3]
+        // r[impl store.substitute.stale-reclaim+4]
         // Substitution claims carry the stall params: the verified
         // narinfo's NarSize scopes the takeover predicate to
         // mid-download claims (persist phase exempt), and the window

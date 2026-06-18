@@ -219,16 +219,15 @@ it (no replacement series: the warm path they measured no longer exists).
 Surviving carriers of the load-bearing content: the input-closure warm-up is
 the executor's own manifest prime (#rref("builder.warmgate.manifest-prime"))
 plus JIT lookup, and the "never materialize a path the build cannot read"
-property is owned by the JIT allowlist
-(#rref("builder.fuse.jit-register"), #rref("builder.fuse.jit-lookup")), whose
-classification helper (`jit_classify`) is unchanged.
+property is owned by the dispatch-side input-closure attestation
+(#rref("sched.dispatch.input-roots")) and the castore mount's allowlist.
 
 #r("builder.warmgate.manifest-prime")[
   After computing the input closure and before daemon spawn, the executor
   issues ONE `BatchGetManifest` for the full closure and primes the FUSE
   cache's manifest-hint map (basename → `ManifestHint`). Each subsequent JIT
-  `GetPath` carries the primed hint so the store skips its two PG lookups
-  (#rref("store.get.manifest-hint")). Any `BatchGetManifest` error degrades to
+  `GetPath` carries the primed hint so the store skips its two PG lookups.
+  Any `BatchGetManifest` error degrades to
   a no-op --- per-path `GetPath` then queries PG as before. I-110c: \~1600 PG
   hits per builder collapse to ≤2.
 ]

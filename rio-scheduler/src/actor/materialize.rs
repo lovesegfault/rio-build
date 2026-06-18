@@ -2232,7 +2232,7 @@ impl DagActor {
     /// Note a materialization claim in the in-memory view (called by
     /// the pull mint after the fenced transaction committed for a
     /// materialization-kind delivery). Reachable only flag-on.
-    // r[impl obs.metric.scheduler]
+    // r[impl obs.metric.scheduler+2]
     pub(super) fn note_materialization_claimed(&mut self, drv_hash: &DrvHash, holder: &ExecutorId) {
         if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
             // A fresh mint resets the ghost strike (merged_bug_055 C).
@@ -3867,7 +3867,7 @@ impl DagActor {
     /// and note a fence refusal. Returns whether the resolution was
     /// APPLIED (rows > 0) — the at-most-once edge callers may hang
     /// further accounting on (the PD-20 conversion counter).
-    // r[impl obs.metric.scheduler]
+    // r[impl obs.metric.scheduler+2]
     async fn resolve_materialization_job(
         &mut self,
         job_id: Uuid,

@@ -133,7 +133,7 @@ pub(crate) async fn insert_manifest_uploading_as(
 /// (the whole point of releasing in place instead of deleting: stall
 /// evidence survives the handoff). Returns the new claim token, or
 /// `None` if no released row exists (live claim, completed, or gone).
-// r[impl store.substitute.stale-reclaim+3]
+// r[impl store.substitute.stale-reclaim+4]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
 pub(crate) async fn claim_released_placeholder(
     pool: &PgPool,
@@ -165,7 +165,7 @@ pub(crate) async fn claim_released_placeholder(
 
 /// Take over a **download-stalled** live claim in place: the
 /// download-scoped stall-reclaim arm of
-/// `r[store.substitute.stale-reclaim+3]`. The predicate is
+/// `r[store.substitute.stale-reclaim+4]`. The predicate is
 /// [`STALL_TAKEOVER_PREDICATE`] (single-sourced beside this fn) — the
 /// two-clock, phase-keyed rule (092, merged_bug_003):
 ///
@@ -194,7 +194,7 @@ pub(crate) async fn claim_released_placeholder(
 /// `nar_size` is the caller's verified-narinfo `NarSize` (every
 /// substitution claimant parses the narinfo before claiming); the
 /// row itself stores no expected size while uploading.
-// r[impl store.substitute.stale-reclaim+3]
+// r[impl store.substitute.stale-reclaim+4]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
 pub(crate) async fn stall_takeover_placeholder(
     pool: &PgPool,
@@ -228,7 +228,7 @@ pub(crate) async fn stall_takeover_placeholder(
 }
 
 /// The single-sourced stall-takeover rule (092, merged_bug_003;
-/// live_055(a), bughunt-9; r[store.substitute.stale-reclaim+3]).
+/// live_055(a), bughunt-9; r[store.substitute.stale-reclaim+4]).
 /// `$4` = the competitor\'s verified NarSize, `$5` = the stall window
 /// in seconds. One phase, two eligible shapes:
 ///

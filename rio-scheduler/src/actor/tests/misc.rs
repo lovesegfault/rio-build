@@ -3329,7 +3329,7 @@ fn claimability_precedence_grid() {
     assert_eq!(e.claimability(now), Claimability::ClaimableNow);
 }
 
-// r[verify obs.metric.scheduler]
+// r[verify obs.metric.scheduler+2]
 /// bug_282: the width-observability chokepoint routes each event class
 /// to ITS OWN counter (and its own warn latch). Pre-fix RED: the
 /// zero-width materialization re-arm called the saturation noter with

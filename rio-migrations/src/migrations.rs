@@ -2129,7 +2129,7 @@ pub const M_091: () = ();
 /// budget-parked owners were deposed after >stall-window parks (their
 /// progress froze with liveness fresh), and dead owners in the
 /// 180-300s window were striked instead of reaped. See
-/// store.substitute.stale-reclaim+3.
+/// store.substitute.stale-reclaim+4.
 pub const M_092: () = ();
 
 /// `migrations/093_live_pins_kind_key.sql`

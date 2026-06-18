@@ -166,7 +166,7 @@ pub struct IngestHooks {
 
 /// Substitution-claim parameters for [`claim_placeholder`]'s
 /// download-stalled takeover arm and owner attribution
-/// (`r[store.substitute.stale-reclaim+3]`). PutPath/PutPathBatch pass
+/// (`r[store.substitute.stale-reclaim+4]`). PutPath/PutPathBatch pass
 /// `None`: builder claims carry no narinfo-declared size and no
 /// progress evidence, so the stall arm is structurally unreachable
 /// for and from them.
@@ -273,7 +273,7 @@ pub async fn claim_placeholder(
     )
     .await?;
 
-    // r[impl store.substitute.stale-reclaim+3]
+    // r[impl store.substitute.stale-reclaim+4]
     // The slot is occupied. Three takeover arms, in precedence order:
     //
     //   (1) released-in-place row (`claim_id` NULL — the owner-side
@@ -958,7 +958,7 @@ mod tests {
         .expect("set_progress");
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// merged_bug_003 (a): an ALIVE owner parked on the local byte
     /// budget — progress frozen past the stall window, liveness fresh,
     /// `claim_phase = 'budget_parked'` — is EXEMPT from takeover as
@@ -988,7 +988,7 @@ mod tests {
         assert_eq!(strikes, 0, "no strike accrued");
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// merged_bug_003 (b): a DEAD owner (no heartbeat 200s) is NOT
     /// striked by the takeover (liveness conjunct fails) and not yet
     /// reaped (300s threshold) — the competitor sees Concurrent. Past
@@ -1049,7 +1049,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// W9-BK (live_055(a), bughunt-9): a claim with ZERO bytes — no
     /// heartbeat ever mirrored (`fetched_bytes`/`last_progress_at`
     /// NULL), `updated_at` past the stall window — is
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(strikes, 1, "the handoff records the strike in place");
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// W9-BK exempt faces: (i) a LIVE zero-progress owner (heartbeats
     /// fresh, first byte pending — e.g. mid-narinfo/connect inside its
     /// own watchdog) is NOT deposed; (ii) a parked owner is exempt AS
@@ -1148,7 +1148,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// merged_bug_003 (c): a PERSISTING owner is exempt even when the
     /// competitor expects a BIGGER NAR. Pre-092 RED: the persist
     /// exemption was the inference `fetched_bytes == nar_size`, which
@@ -1179,7 +1179,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// merged_bug_003 (d): the intended victim — an ALIVE owner whose
     /// DOWNLOAD is wedged (phase downloading, progress frozen past the
     /// window, liveness fresh) — IS taken over in place, with the
@@ -1475,7 +1475,7 @@ mod tests {
 
     // ── The four-case stall battery (review-findings watch-item 1) ──
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// Case 1: a frozen mid-download claim (progress evidence present,
     /// `fetched_bytes < nar_size`, progress clock older than the stall
     /// window, heartbeat ALIVE) is taken over IN PLACE: new
@@ -1521,7 +1521,7 @@ mod tests {
         assert_eq!(claimed_by.as_deref(), Some("claimant-pod"));
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// Case 2: an ADVANCING download (progress clock fresh) is never
     /// stall-reclaimed — slow ≠ stuck.
     #[tokio::test]
@@ -1543,7 +1543,7 @@ mod tests {
         assert_eq!(stalls, 0, "no strike for a healthy transfer");
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// Case 3: a PutPath claim (`fetched_bytes` NULL — no progress
     /// handle) is structurally exempt from the stall arm no matter how
     /// old its progress-free state is, as long as it heartbeats.
@@ -1567,7 +1567,7 @@ mod tests {
         assert_eq!(stalls, 0);
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// Case 4: a download-complete (persist-phase) claim
     /// (`fetched_bytes == nar_size`) is NEVER stall-reclaimable — only
     /// the 5-minute heartbeat-death rule applies there. Stealing
@@ -1598,7 +1598,7 @@ mod tests {
 
     // ── Release-in-place / strike-once / reset ──
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     // r[verify store.substitute.stall-abort+2]
     /// A released-in-place row (the owner-side stall abort's leavings:
     /// `claim_id` NULL, `stall_count` recorded) is claimable
@@ -1635,7 +1635,7 @@ mod tests {
         assert_eq!(stalls, 1, "stall evidence survives the handoff");
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     // r[verify store.substitute.stall-abort+2]
     /// Claim-guarded strike-once, both interleavings:
     /// (a) a competing stall-reclaim lands first → the owner's late
@@ -1712,7 +1712,7 @@ mod tests {
         assert_eq!(stalls, 1, "one stall event, one strike (release-first)");
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// Heartbeat-death keeps DELETING (the unchanged 5-minute rule),
     /// which RESETS stall evidence: benign churn (deploys, scale-in,
     /// crashes) never accrues strikes. The dead-owner arm wins over
@@ -1749,7 +1749,7 @@ mod tests {
         assert_eq!(fetched, None);
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// The reclaim counter is reason-labeled: `heartbeat` for the
     /// death-DELETE arm, `stall_reclaim` for the in-place takeover.
     /// (`stall_abort` is emitted at the owner-side abort site in

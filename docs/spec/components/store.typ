@@ -102,7 +102,7 @@ narinfo.
   of the same digest, or by re-fetching the run's chunks from the backend
   and recomputing; a mismatch rejects the upload. `nar_hash`, `nar_size`,
   and `references` are computed by the authenticated builder's fused walk
-  over the same bytes it uploads (#rref("builder.upload.fused-walk")) and
+  over the same bytes it uploads (#rref("builder.upload.references-scanned")) and
   are committed as claimed; the store does not regenerate the NAR to
   recompute them.
 ]
@@ -983,7 +983,7 @@ its admitting floor; the derivation owns the repair --- no new rejection.
   inside its normal upload retry budget --- by the next attempt this drop-path
   cleanup has released the placeholder, or the concurrent upload finished and
   the retry lands as an idempotent skip
-  (#rref("builder.upload.aborted-poll")).
+  (#rref("builder.upload.idempotent-precheck")).
 ]
 
 = NAR Reassembly

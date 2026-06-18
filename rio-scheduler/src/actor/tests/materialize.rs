@@ -6322,7 +6322,7 @@ async fn conversion_strictness_dwell_survives_failover() -> TestResult {
 
 // ── T-6.2 (Phase B): the job-lifecycle metrics ──────────────────────────────
 
-// r[verify obs.metric.scheduler]
+// r[verify obs.metric.scheduler+2]
 // r[verify sched.materialize.job+2]
 /// T-6.2 (red-first): the job-lifecycle counters the dashboards and
 /// alerts consume —
@@ -7557,7 +7557,7 @@ async fn consumption_coverage_saturates_on_missing_relation_rows() -> TestResult
 // the view entry is what makes the armed action level-triggered
 // instead of stranding the pending row invisibly.
 
-// r[verify obs.metric.scheduler]
+// r[verify obs.metric.scheduler+2]
 /// bug_086: the zero-width event (NoVerifiableSet) is a CONSUMPTION
 /// event — pre-fix the note + warn fired BEFORE close_for_consumption,
 /// so a deposed believer's Deferred close counted the event the

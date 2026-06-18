@@ -2518,7 +2518,7 @@ fn width_warn_due(latch: &std::sync::atomic::AtomicI64) -> bool {
 /// THE width-observability chokepoint (bug_282): per-variant counters
 /// and per-variant rate-limited warns. Counter always; warn
 /// rate-limited (either arm can fire per classification pass).
-// r[impl obs.metric.scheduler]
+// r[impl obs.metric.scheduler+2]
 pub(crate) fn note_width_event(event: WidthEvent<'_>) {
     use std::sync::atomic::AtomicI64;
     match event {

@@ -47,7 +47,7 @@
 # root substitution and the burst actually fans out).
 #
 # Tracey: markers at the default.nix wiring entry per the house rule —
-# store.substitute.stale-reclaim+3 (the zero-progress takeover under
+# store.substitute.stale-reclaim+4 (the zero-progress takeover under
 # deployment config) and store.substitute.raced-subscribe (the parked
 # burst). This header is prose, never marker-bearing.
 {

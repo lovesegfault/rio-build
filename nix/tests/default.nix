@@ -837,7 +837,7 @@ in
   #   warn pair, stale_reclaimed_total{reason="stall_abort"} == 1, row
   #   released in place (claim/progress NULL, stall_count=1,
   #   status='uploading' preserved).
-  # r[verify store.substitute.stale-reclaim+3]
+  # r[verify store.substitute.stale-reclaim+4]
   #   substitute-stall-abort: the post-heal re-claim completes
   #   (status='complete' far below the 300s heartbeat-death threshold
   #   proves the released-in-place arm), with the stall_count=1 strike
@@ -1544,7 +1544,7 @@ in
   #   during the pre-eligibility window). Structural counts only —
   #   counter entries + durable rows, never gauge samples (N13).
   #
-  # r[verify store.substitute.stale-reclaim+3]
+  # r[verify store.substitute.stale-reclaim+4]
   #   head reclaimed: the zero-progress takeover arm under chart-
   #   rendered config (substituteStallSecs=60, the validate() floor) —
   #   stall_count=1 exactly, stale_reclaimed{stall_reclaim}=1 exactly,

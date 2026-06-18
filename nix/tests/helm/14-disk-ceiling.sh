@@ -49,10 +49,14 @@ test "$max_node_disk" -ge "$need" || {
 # constants (the member-4 census[gen:] precedent at
 # jobs.rs::pod_ephemeral_request), so the helm value and the rust
 # accounting cannot drift silently. Inputs: defaultDisk,
-# poolDefaults.fuseCacheBytes, LOG_BUDGET_BYTES, the no-estimate
-# headroom arm, and the density-input row (allocatable =
-# karpenter.dataVolumeSize × 0.9). Touch ANY input ⇒ re-derive the
-# whole table (narration rows + these asserts together).
+# LOG_BUDGET_BYTES, the no-estimate headroom arm, and the
+# density-input row (allocatable = karpenter.dataVolumeSize × 0.9).
+# Touch ANY input ⇒ re-derive the whole table (narration rows + these
+# asserts together).
+# The per-pod fuse-cache addend is GONE since P0560/ADR-022 (castore
+# caches are node-level mountd-owned hostPaths outside per-pod
+# ephemeral-storage accounting); the W10-CQ fuseCacheBytes
+# MEASURED-RULED record is dropped accordingly.
 # The recovery path for a too-small default is the worker-classified
 # disk ladder (25→50→100, floor persisted once per pname) — the
 # cross-crate end-to-end witness lives beside the classifier
@@ -67,10 +71,10 @@ test "$default_disk" = "26843545600" || {
   echo "  derives from 25 GiB; re-derive BOTH before moving the default" >&2
   exit 1
 }
-default_req=$(( default_disk * DEFAULT_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
-test "$default_req" = "95026151424" || {
+default_req=$(( default_disk * DEFAULT_HEADROOM_PCT / 100 + LOG_BUDGET_BYTES ))
+test "$default_req" = "41339060224" || {
   echo "FAIL: default-pod ephemeral request $default_req B != the committed" >&2
-  echo "  88.5 GiB row (95026151424 B = 25×1.5 + 50 fuse + 1 log GiB)" >&2
+  echo "  38.5 GiB row (41339060224 B = 25×1.5 + 1 log GiB)" >&2
   exit 1
 }
 # Density-input row: allocatable = dataVolumeSize × 0.9 (the same
@@ -84,54 +88,29 @@ test "$data_vol" = "500Gi" || {
 }
 alloc=$(( 500 * 1024 * 1024 * 1024 * 9 / 10 ))
 pods=$(( alloc / default_req ))
-test "$pods" -eq 5 || {
-  echo "FAIL: derived pods/node $pods != the committed 5 (the 2→5 density row)" >&2
+test "$pods" -eq 11 || {
+  echo "FAIL: derived pods/node $pods != the committed 11 (the 5→11 density row, post-P0560 fuse-addend drop)" >&2
   exit 1
 }
 # The historical 100 GiB row, kept as the comparison anchor (the B8
 # live specimen: a 201 GiB ask): 2 pods/node on the same allocatable.
 # (12xlarge nvme: measured 12 at 201 GiB ⇒ allocatable ∈ [2412, 2613)
-# GiB ⇒ 27–29 pods/node at 88.5 GiB — a BAND over instance-store
-# capacities, narration-only: no nvme allocatable renders here.)
-old_req=$(( 107374182400 * DEFAULT_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
+# GiB — a BAND over instance-store capacities, narration-only: no nvme
+# allocatable renders here.)
+old_req=$(( 107374182400 * DEFAULT_HEADROOM_PCT / 100 + LOG_BUDGET_BYTES ))
 test $(( alloc / old_req )) -eq 2 || {
   echo "FAIL: the historical 100 GiB row no longer derives 2 pods/node —" >&2
-  echo "  a density INPUT (fuse/log/allocatable) moved; re-derive the table" >&2
+  echo "  a density INPUT (log/allocatable) moved; re-derive the table" >&2
   exit 1
 }
 
-# live_057-d (W10-CQ): the fuse-cache MEASURED-RULED record's
-# narration binds. The values.yaml comment at fuseCacheBytes must
-# name the measured trigger's occupancy gauge, carry the warm-pod
-# dominance rows consistent with the LIVE values, and the value
-# itself stands at the ruled 50 GiB until the 7-day p99 trigger
-# fires (the gauge is the cross-plane instrument, landed beside the
-# builder quota sample; quoted here, never re-run).
-test "$fuse" = "53687091200" || {
-  echo "FAIL: poolDefaults.fuseCacheBytes=$fuse B != the RULED 50 GiB" >&2
-  echo "  (53687091200 B). The measured ruling stands until the 7-day p99" >&2
-  echo "  rio_builder_fuse_cache_bytes_used trigger; re-derive the RULED" >&2
-  echo "  record + the W10-CQ/W10-CP rows together before moving it" >&2
-  exit 1
-}
-grep -q 'rio_builder_fuse_cache_bytes_used' values.yaml || {
-  echo "FAIL: the fuse RULED record lost its trigger gauge name" >&2
-  echo "  (rio_builder_fuse_cache_bytes_used — the H9″ instrument)" >&2
-  exit 1
-}
-warm_req=$(( 1073741824 * DEFAULT_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
-test "$warm_req" = "56371445760" || {
-  echo "FAIL: warm-pod (1 GiB solve) request $warm_req B != the committed" >&2
-  echo "  52.5 GiB row (56371445760 B) — re-derive the dominance rows" >&2
-  exit 1
-}
-grep -q '52.5 GiB' values.yaml || {
-  echo "FAIL: the warm-pod 52.5 GiB dominance row drifted from values.yaml" >&2
-  exit 1
-}
-fuse_share=$(( fuse * 100 / default_req ))
-test "$fuse_share" -eq 56 || {
-  echo "FAIL: fuse share of the default-pod request is ${fuse_share}%, the" >&2
-  echo "  committed dominance row says 56% — re-derive both" >&2
-  exit 1
-}
+# live_057-d (W10-CQ) DROPPED: the fuseCacheBytes MEASURED-RULED record
+# is obsolete under ADR-022 — there is no per-pod fuse cache addend, no
+# poolDefaults.fuseCacheBytes key, and the warm-pod fuse-dominance rows
+# (52.5 GiB / 56%) no longer derive. The
+# rio_builder_fuse_cache_bytes_used gauge survives as a node-level
+# castore-cache occupancy instrument (metric-help.json), no longer a
+# per-pod sizing input. TODO(adr-022-rebase): re-derive the values.yaml
+# W10-CP narration rows (sla.defaultDisk comment) for 38.5 GiB / 11
+# pods/node in a follow-up; the asserts above are the load-bearing
+# half.

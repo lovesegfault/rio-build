@@ -4065,7 +4065,7 @@ rec {
     # conjunct (strikes only inside the freshness window — long-dead
     # owners always fall to the no-strike reap arm). The heartbeat is
     # modeled as the reliable claim-guarded ticker it is in cas.rs.
-    # r[verify store.substitute.stale-reclaim+3]
+    # r[verify store.substitute.stale-reclaim+4]
     # r[verify store.put.placeholder-claim+2]
     quint-placeholder-claim-main = mkQuintCheck {
       name = "placeholder-claim-main";

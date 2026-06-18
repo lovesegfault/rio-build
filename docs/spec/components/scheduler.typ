@@ -1337,7 +1337,7 @@ view) and the controller's Job/pod census.
   `QueryPathInfo` BFS.
 ]
 The `nar_index.root_node` column is written in the same transaction that makes
-a path's manifest `complete` (#rref("store.index.authoritative")), so every
+a path's manifest `complete`, so every
 closure path that is substitutable at dispatch time has an `input_roots`
 entry. A closure path with no entry is one the store does not (yet) hold; the
 builder falls back to `GetNarIndex`/`QueryPathInfo` for it and fails the build
