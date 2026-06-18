@@ -3783,7 +3783,7 @@ the SUM of the per-class headrooms, never unbounded).
   the TWO promoting letters --- the per-container kubelet attributions ---
   gated on the establishment transaction's append+decide `won` flag so
   promotion fires at most once per attempt, ever; node-condition
-  `EvictedDiskPressure` and EVERY other witnessed letter MUST establish
+  `EvictedDiskPressure` and every other witnessed letter MUST establish
   classify-only, leaving the floor untouched. Marks MUST be consumed at
   establishment and pruned against the open-attempt view.
 ]

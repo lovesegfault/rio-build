@@ -68,7 +68,6 @@ docs/spec/components/scheduler.typ	aggregation exists anywhere); a replica scale
 docs/spec/components/scheduler.typ	and non-FODs ONLY to builder-kind executors. The kind boundary is enforced
 docs/spec/components/scheduler.typ	armed-action totality test and the failover VM scenario.
 docs/spec/components/scheduler.typ	as a typed `Unhostable` carrying demand and best-class. The totality
-docs/spec/components/scheduler.typ	at most once per attempt, ever; EVERY other witnessed letter (both
 docs/spec/components/scheduler.typ	budget's exclusion key is the attempt's _source node_, and ONLY that: an
 docs/spec/components/scheduler.typ	cached content, mark that edge as cutoff and skip downstream only when ALL
 docs/spec/components/scheduler.typ	claimable listing forever, so re-listing can never recover it). Crashed
@@ -81,7 +80,6 @@ docs/spec/components/scheduler.typ	intent id can never name a real intent, and t
 docs/spec/components/scheduler.typ	intent stays queued and the @fod waits --- the scheduler NEVER hands a FOD to
 docs/spec/components/scheduler.typ	its ceiling or the global --- and the grounding is EXCLUSION-ONLY negative
 docs/spec/components/scheduler.typ	job lifecycle's totality is the form the obligation takes when every
-docs/spec/components/scheduler.typ	kubelet `containerStatuses` attribution --- is the ONLY promoting letter
 docs/spec/components/scheduler.typ	never admit a cell the strip would refuse). The walk's "can never
 docs/spec/components/scheduler.typ	parameter (`<> ALL($1::text[])`). The partial index `derivations_status_idx`
 docs/spec/components/scheduler.typ	set confirms a live-wanted path missing-and-unsubstitutable under EVERY
@@ -1064,7 +1062,6 @@ rio-scheduler/src/actor/event.rs	/// Events carry no sequence numbers and are no
 rio-scheduler/src/actor/event.rs	/// a SAME-verdict epilogue arriving after the closer already
 rio-scheduler/src/actor/event.rs	/// store's `EXEC_STATUS_TERMINAL.contains(..)` test sees can never
 rio-scheduler/src/actor/executor.rs	/// claim can never surface as from-source dispatchable against
-rio-scheduler/src/actor/floor.rs	// evictions remain CLASSIFY-ONLY BY RULING
 rio-scheduler/src/actor/floor.rs	/// Project `floor` under the live `ceil` — the ONLY constructor,
 rio-scheduler/src/actor/floor.rs	/// across boots with no re-clamp anywhere — it then (i) pins every
 rio-scheduler/src/actor/floor.rs	/// disposition row above (the `GcPhase3Outcome::ALL` form).

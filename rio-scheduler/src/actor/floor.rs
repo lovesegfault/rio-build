@@ -111,7 +111,7 @@ pub fn bump_floor_or_count(
         // emptyDir-sizeLimit eviction (`WitnessAxis::WitnessedDisk`,
         // label `witnessed_disk`), once per attempt via the
         // establishment transaction's `won` flag. NODE-CONDITION
-        // witnessed evictions remain CLASSIFY-ONLY BY RULING
+        // witnessed evictions remain classify-only by ruling
         // ([`witnessed_disposition`]): the EvictedDiskPressure letter
         // now carries node-condition shapes only (pool/job.rs
         // pod_attempt_terminal_reason splits pod-attributed to
