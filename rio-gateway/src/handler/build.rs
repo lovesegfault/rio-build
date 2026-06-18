@@ -625,26 +625,24 @@ async fn relay_log_batch<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Render the `rio: retry` marker's optional ` — re-dispatching at
-/// <size>` suffix (sh-042). Exhaustive over [`PredecessorFloorAxis`]:
-/// `None` (no floor bumped — every reason except the two grace=0
-/// promote arms) renders no suffix; `Mem`/`Disk` render the new
-/// mint's solved bytes via [`rio_common::fmt::fmt_size_iec`] (so the
-/// marker → next `rio: builder` header transition reads coherently).
-/// The VM regex pinning this is `^rio: retry\s+.*\d+ (GiB|MiB)` — the
-/// property under test is "a sizing suffix appears", not its rung.
+/// Render the `rio: retry <reason>[ — re-dispatching at <size>]`
+/// marker (sh-042). Exhaustive over [`PredecessorFloorAxis`]: `None`
+/// (no floor bumped — every reason except the two grace=0 promote
+/// arms) renders no suffix; `Mem`/`Disk` render the new mint's solved
+/// bytes via [`rio_common::fmt::fmt_size_iec`] (so the marker → next
+/// `rio: builder` header transition reads coherently). Pinned by the
+/// `r[verify gw.display.redispatch-footer]` wire test.
 ///
 /// [`PredecessorFloorAxis`]: types::PredecessorFloorAxis
-fn sizing_suffix(axis: types::PredecessorFloorAxis, bytes: u64) -> String {
+fn retry_marker_line(p: &types::StartedPredecessor) -> String {
     use types::PredecessorFloorAxis as A;
-    match axis {
-        A::None => String::new(),
-        A::Mem | A::Disk => {
-            format!(
-                " — re-dispatching at {}",
-                rio_common::fmt::fmt_size_iec(Some(bytes))
-            )
-        }
+    let human = rio_common::classify::attempt_terminal_reason_human(&p.termination_reason);
+    match p.floor_bumped() {
+        A::None => format!("rio: retry    {human}"),
+        A::Mem | A::Disk => format!(
+            "rio: retry    {human} — re-dispatching at {}",
+            rio_common::fmt::fmt_size_iec(Some(p.new_axis_bytes))
+        ),
     }
 }
 
@@ -799,52 +797,49 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             start_subst_display(stderr, act, &drv_event.derivation_path, &out).await?;
         }
         types::DerivationEventKind::Started => {
+            // Tail subscription first — BEFORE both the `rio: retry`
+            // emit and the duplicate-Started early-return below: its
+            // arm re-uses the existing activity id, while a duplicate
+            // Started carrying a NEW exec_id must still replace the
+            // subscription (the old execution's log is dead).
+            // `on_started` is idempotent for an unchanged exec_id
+            // (returns `true`) and ignores an empty one; the return
+            // gates the marker so a replayed Started for an exec_id
+            // this session already follows stays user-silent — the
+            // pre-sh-042 silence guarantee the duplicate-check below
+            // provided before the marker emit existed (sh-042-r1).
+            let already_tracking = tails.on_started(&drv_event.derivation_path, &drv_event.exec_id);
             // r[impl gw.display.redispatch-footer]
             // sh-042: when this Started supersedes a closed
             // predecessor, emit the scheduler-authoritative `rio:
-            // retry` marker on the EXISTING actBuild aid BEFORE the
-            // tail supersession below — at this point neither
-            // `tails.on_started` nor `flip_to_family` nor the
-            // duplicate-check has run, so the old tail and
-            // `act.display[drv] = DrvDisplay::Build(old_aid)` are
-            // both still alive. The emit goes via `stderr.result`
-            // directly to the wire (same shape as `relay_log_batch`),
-            // not through the tail's `out_tx`. The `rio: retry`
-            // prefix (NOT `rio: result` — `footer_lines` never emits
-            // `rio: retry`) is order-independent against any
-            // builder-emitted `rio: result cancelled (sigterm)` that
-            // may still be queued in the predecessor tail's `out_tx`:
-            // the unbiased `tokio::select!` and the 256-deep mpsc
-            // mean a queued footer can drain on the NEXT iteration
-            // onto the same reused aid in either order, and neither
-            // line contradicts the other (one is the attempt's local
+            // retry` marker on the EXISTING actBuild aid BEFORE
+            // `flip_to_family`/the duplicate-check, so
+            // `act.display[drv] = DrvDisplay::Build(old_aid)` is
+            // still alive. The emit goes via [`relay_log_batch`]
+            // (`stderr.result` directly to the wire), not through the
+            // tail's `out_tx`. The `rio: retry` prefix (NOT `rio:
+            // result` — `footer_lines` never emits `rio: retry`) is
+            // order-independent against any builder-emitted `rio:
+            // result cancelled (sigterm)` that may still be queued in
+            // the predecessor tail's `out_tx`: the unbiased
+            // `tokio::select!` and the 256-deep mpsc mean a queued
+            // footer can drain on the NEXT iteration onto the same
+            // reused aid in either order, and neither line
+            // contradicts the other (one is the attempt's local
             // outcome; one is the scheduler's re-dispatch decision).
-            if let Some(p) = drv_event.predecessor.as_ref() {
-                let line = format!(
-                    "rio: retry    {}{}",
-                    rio_common::classify::attempt_terminal_reason_human(&p.termination_reason),
-                    sizing_suffix(p.floor_bumped(), p.new_axis_bytes),
-                );
-                match act.display.get(&drv_event.derivation_path) {
-                    Some(DrvDisplay::Build(aid)) => {
-                        stderr
-                            .result(*aid, ResultType::BuildLogLine, &[ResultField::String(line)])
-                            .await?;
-                    }
-                    // Gateway↔scheduler reconnect cold-start (no aid
-                    // open yet) or a Subst→Build flip the rfind's
-                    // attempt_kind == Build guard normally precludes:
-                    // STDERR_NEXT fallback, same as relay_log_batch.
-                    _ => stderr.log(&format!("{line}\n")).await?,
-                }
+            if let Some(p) = drv_event.predecessor.as_ref().filter(|_| !already_tracking) {
+                let line = retry_marker_line(p);
+                relay_log_batch(
+                    stderr,
+                    act,
+                    types::BuildLogBatch {
+                        derivation_path: drv_event.derivation_path.clone(),
+                        lines: vec![line.into_bytes()],
+                        ..Default::default()
+                    },
+                )
+                .await?;
             }
-            // Tail subscription first — BEFORE the duplicate-Started
-            // early-return below: its arm re-uses the existing activity
-            // id, while a duplicate Started carrying a NEW exec_id must
-            // still replace the subscription (the old execution's log
-            // is dead). `on_started` is idempotent for an unchanged
-            // exec_id and ignores an empty one.
-            tails.on_started(&drv_event.derivation_path, &drv_event.exec_id);
             // A failed substitute fetch reverts to Ready → may later
             // dispatch as a build. Flip the dangling actSubstitute +
             // actCopyPath pair closed so nom doesn't show it stuck

@@ -3351,6 +3351,74 @@ fn predecessor_subst_to_build_flip_is_none() {
     );
 }
 
+/// Regression pin (sh-042-r1): `attempt_kind == Build` lives in the
+/// post-`.and_then`, NOT inside the rfind predicate. With it inside
+/// rfind, an intervening Materialization record is SKIPPED and rfind
+/// resurrects the older Build record — the same skip-past-stale
+/// hazard as [`predecessor_does_not_skip_past_none_to_stale_record`]
+/// one structural-guard over. Within one resubmit cycle: Build A
+/// closes `oom_killed` → I-047 dep-output-GC'd Ready→Queued demotes
+/// to Materialization B → B fails → re-mint Build C. C's just-closed
+/// predecessor is B (a Subst→Build flip; `dag.proto:152` says
+/// "Absent on … a Subst→Build flip"), NOT A from two attempts ago.
+#[test]
+fn predecessor_does_not_skip_past_mat_to_stale_build() {
+    let exec_a = Uuid::now_v7();
+    let history = [
+        rec(AttemptKind::Build, Some(exec_a), Some("oom_killed"), 0),
+        rec(
+            AttemptKind::Materialization,
+            Some(Uuid::now_v7()),
+            Some("materialization_infra"),
+            0,
+        ),
+    ];
+    assert!(
+        predecessor_for_started(&history, 0, Some(&solve(8 << 30, 50 << 30))).is_none(),
+        "an intervening Materialization must not let rfind resurrect A"
+    );
+}
+
+/// Axis-map pin (sh-042-r1): the two grace=0 promote arms — and only
+/// those — name a `PredecessorFloorAxis`. Migrated from
+/// rio-common/src/classify.rs when the pass-through `FloorAxis` enum
+/// was inlined.
+#[test]
+fn predecessor_axis_maps_only_promote_arms() {
+    let li = solve(8 << 30, 50 << 30);
+    let probe = |reason: &str| {
+        predecessor_for_started(
+            &[rec(
+                AttemptKind::Build,
+                Some(Uuid::now_v7()),
+                Some(reason),
+                0,
+            )],
+            0,
+            Some(&li),
+        )
+        .expect("established reason")
+    };
+    let p = probe("oom_killed");
+    assert_eq!(p.floor_bumped(), PredecessorFloorAxis::Mem);
+    assert_eq!(p.new_axis_bytes, 8 << 30);
+    let p = probe("evicted_empty_dir_size_limit");
+    assert_eq!(p.floor_bumped(), PredecessorFloorAxis::Disk);
+    assert_eq!(p.new_axis_bytes, 50 << 30);
+    for r in [
+        "deadline_exceeded",
+        "preempted",
+        "evicted_disk_pressure",
+        "",
+    ] {
+        assert_eq!(
+            probe(r).floor_bumped(),
+            PredecessorFloorAxis::None,
+            "{r:?} is ClassifyOnly"
+        );
+    }
+}
+
 /// Guard pin 3/5 — `resubmit_cycle == cycle`: a poison-clear bumps
 /// `state.retry.resubmit_cycles` (completion.rs:4074); a prior cycle's
 /// closed record must NOT be carried forward as the new cycle's

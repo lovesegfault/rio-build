@@ -59,14 +59,20 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
     // ingesting). A `--follow` tail would set this true and re-open
     // on premature end; not yet exposed.
     let pinned_exec = a.exec_id.is_some();
-    let token_set = a.tenant_token.is_some();
+    // sh-042-r1: clap v4's `env =` populates `Some("")` for an
+    // empty-string `RIO_TENANT_TOKEN` (verified against the pinned
+    // clap: unset→None, empty→Some(""), set→Some("abc")). Treat
+    // empty as absent for both the header insert and the NotFound
+    // hint below — an empty `TENANT_TOKEN_HEADER` is a valid http
+    // HeaderValue but never a usable JWT.
+    let token_set = a.tenant_token.as_deref().is_some_and(|s| !s.is_empty());
     let mut request = tonic::Request::new(TailLogRequest {
         derivation: a.drv_path,
         exec_id: a.exec_id.unwrap_or_default(),
         since_line: 0,
         follow: false,
     });
-    if let Some(token) = a.tenant_token.as_deref() {
+    if let Some(token) = a.tenant_token.as_deref().filter(|s| !s.is_empty()) {
         request.metadata_mut().insert(
             rio_proto::TENANT_TOKEN_HEADER,
             token
@@ -384,6 +390,11 @@ mod tests {
         // High first_line_number (the --exec-id replay shape: a stored
         // execution's chunks start past zero only on a re-served
         // tail) — never panics, the gap is named.
-        let (_, _) = drain(&[chunk(u32::MAX as u64, &["z"])]);
+        let (out, gap) = drain(&[chunk(u32::MAX as u64, &["z"])]);
+        assert!(gap);
+        assert!(
+            out.starts_with("≡ rio: lines 0-4294967294 missing from stored log ≡\nz\n"),
+            "high-boundary gap is named: {out}"
+        );
     }
 }

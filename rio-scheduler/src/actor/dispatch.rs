@@ -37,19 +37,24 @@ use super::DagActor;
 /// The rfind predicate is the STRUCTURAL key (newest build-kind
 /// attempt of THIS resubmit cycle that has an exec_id);
 /// `termination_reason.is_some()` is a SEPARATE post-`.filter()` so a
-/// None-reason newest record yields `None` rather than letting rfind
-/// skip past it to a stale older record — `max_infra_retries: 10`
-/// makes a witnessed-OOM(A, `Some("oom_killed")`) → worker-timeout(B,
-/// `None`) → re-mint(C) chain reachable within one cycle, and
-/// surfacing A as C's predecessor would mint a misleading marker.
+/// The rfind predicate is the STRUCTURAL key — `event_kind ==
+/// Attempt && exec_id.is_some() && resubmit_cycle == cycle` — and the
+/// CONTENT guards (`attempt_kind == Build`, `termination_reason`)
+/// live in the post-`.and_then` so a newest structural match that
+/// fails them yields `None` rather than letting rfind skip past it to
+/// a stale older record. `max_infra_retries: 10` makes a
+/// witnessed-OOM(A, `Some("oom_killed")`) → worker-timeout(B, `None`)
+/// → re-mint(C) chain reachable within one cycle, and the I-047
+/// dep-output-GC'd Ready→Queued demotion makes a Build(A) →
+/// Materialization(B) → re-mint(C) chain reachable too; surfacing A
+/// as C's predecessor would mint a misleading marker in both shapes.
 ///
 /// `attempt_kind == Build` is load-bearing: materialization charge
 /// rows DO carry an `exec_id` (`materialize.rs:2991`) and DO land in
 /// `attempt_history` (`materialize.rs:3632`), so `exec_id.is_some()`
-/// alone does not exclude them; without the kind guard a Subst→Build
-/// flip would surface a materialization-kind predecessor whose
-/// `termination_reason` alphabet is foreign to
-/// `attempt_terminal_reason_human`.
+/// alone does not exclude them; a Subst→Build flip's predecessor is
+/// `flip_to_family`'s `SubstCloseCause::FellThroughToBuild`, not a
+/// `rio: retry` marker (whose reason alphabet is build-only).
 ///
 /// `resubmit_cycle == cycle` keeps a poison-clear from carrying a
 /// prior cycle's record forward: close sites stamp the row from
@@ -57,44 +62,48 @@ use super::DagActor;
 /// which is NOT incremented by any infra/witnessed/timeout retry path
 /// — only on poison-clear (completion.rs:4074).
 ///
-/// `floor_bumped`/`new_axis_bytes` derive from the closed attempt's
-/// reason label via [`rio_common::classify::axis_for_reason_label`]
-/// and read `last_intent.{mem,disk}_bytes` — the JUST-stamped solve
-/// at `pull.rs:1227`, what the next pod will GET (so the marker →
-/// `rio: builder` header transition reads coherently).
+/// `floor_bumped`/`new_axis_bytes`: only the two grace=0 promote arms
+/// (`oom_killed` → `Mem`, `evicted_empty_dir_size_limit` → `Disk` —
+/// the inverse of `witnessed_disposition`'s `PromoteMemFloor` /
+/// `PromoteDiskFloor` arms in `rio-scheduler/src/actor/floor.rs`) name
+/// an axis; every other reason (including `deadline_exceeded`, which
+/// is `ClassifyOnly`) carries `PredecessorFloorAxis::None`. The bytes
+/// are `last_intent.{mem,disk}_bytes` — the JUST-stamped solve at
+/// `pull.rs:1227`, what the next pod will GET (so the marker → `rio:
+/// builder` header transition reads coherently).
 pub(super) fn predecessor_for_started(
     history: &[AttemptRecord],
     cycle: u32,
     last_intent: Option<&SolvedIntent>,
 ) -> Option<rio_proto::types::StartedPredecessor> {
-    use rio_common::classify::{FloorAxis, axis_for_reason_label};
     use rio_proto::types::{PredecessorFloorAxis, StartedPredecessor};
     let cycle = i32::try_from(cycle).unwrap_or(i32::MAX);
     history
         .iter()
         .rfind(|r| {
             r.event_kind == AttemptEventKind::Attempt
-                && r.attempt_kind == AttemptKind::Build
                 && r.exec_id.is_some()
                 && r.resubmit_cycle == cycle
         })
-        .filter(|r| r.termination_reason.is_some())
-        .map(|r| {
-            let reason = r
-                .termination_reason
-                .clone()
-                .expect("filter gated on is_some");
-            let (axis, bytes) = match (axis_for_reason_label(&reason), last_intent) {
-                (Some(FloorAxis::Mem), Some(li)) => (PredecessorFloorAxis::Mem, li.mem_bytes),
-                (Some(FloorAxis::Disk), Some(li)) => (PredecessorFloorAxis::Disk, li.disk_bytes),
+        .and_then(|r| {
+            if r.attempt_kind != AttemptKind::Build {
+                return None;
+            }
+            let reason = r.termination_reason.clone()?;
+            let exec_id = r.exec_id?;
+            let (axis, bytes) = match (reason.as_str(), last_intent) {
+                ("oom_killed", Some(li)) => (PredecessorFloorAxis::Mem, li.mem_bytes),
+                ("evicted_empty_dir_size_limit", Some(li)) => {
+                    (PredecessorFloorAxis::Disk, li.disk_bytes)
+                }
                 _ => (PredecessorFloorAxis::None, 0),
             };
-            StartedPredecessor {
-                exec_id: r.exec_id.map(|u| u.to_string()).unwrap_or_default(),
+            Some(StartedPredecessor {
+                exec_id: exec_id.to_string(),
                 termination_reason: reason,
                 floor_bumped: axis as i32,
                 new_axis_bytes: bytes,
-            }
+            })
         })
 }
 

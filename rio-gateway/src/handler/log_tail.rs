@@ -310,14 +310,19 @@ impl LogTailSet {
     /// - Existing subscription with a *different* exec_id → the
     ///   derivation was re-dispatched; the old execution's log is dead.
     ///   Hard-cancel and re-open at `since_line = 0` for the new one.
-    pub(super) fn on_started(&mut self, derivation_path: &str, exec_id: &str) {
+    ///
+    /// Returns `true` iff this call was the duplicate-same-exec no-op
+    /// (the third bullet) — the caller's `rio: retry` marker emit gates
+    /// on `!already_tracking` so a replayed Started for an exec_id this
+    /// session already follows stays user-silent (sh-042-r1).
+    pub(super) fn on_started(&mut self, derivation_path: &str, exec_id: &str) -> bool {
         if exec_id.is_empty() {
-            return;
+            return false;
         }
         let mut superseded: Option<JoinHandle<()>> = None;
         if let Some(existing) = self.tasks.get(derivation_path) {
             if existing.exec_id == exec_id {
-                return;
+                return true;
             }
             debug!(
                 drv = %derivation_path,
@@ -391,6 +396,7 @@ impl LogTailSet {
                 disposition,
             },
         );
+        false
     }
 
     /// The derivation went terminal (`Completed`/`Failed`). Stop the
