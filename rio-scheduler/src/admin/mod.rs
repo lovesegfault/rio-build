@@ -381,7 +381,7 @@ impl AdminService for AdminServiceImpl {
         // r[impl sched.sla.threat.read-path-auth]
         // Executor ids, features, and current builds are fleet topology
         // — exactly what a compromised builder needs to target
-        // `DrainExecutor`-style abuse or cross-tenant build snooping.
+        // the now-retired `DrainExecutor`-style abuse or cross-tenant build snooping.
         self.ensure_service_caller(
             request.metadata(),
             &["rio-controller", "rio-cli", "rio-dashboard"],

@@ -11,6 +11,8 @@
 let
   inherit (fixture) gatewayHost;
 
+  protoset = import ../../lib/protoset.nix { inherit pkgs; };
+
   # ── Test derivations ────────────────────────────────────────────────
   # Distinct markers so each build creates a fresh `builds` row instead
   # of DAG-dedup reusing an earlier build's result.

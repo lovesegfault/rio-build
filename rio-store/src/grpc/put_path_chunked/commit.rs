@@ -2,7 +2,7 @@
 //!
 //! The legacy upload path derives everything the commit transaction
 //! needs (`nar_index.entries`, the Directory DAG, `file_blobs` offsets)
-//! from the buffered NAR via [`cas::ParsedNar::parse`]. `PutPathChunked`
+//! from the buffered NAR via [`ParsedNar::parse`]. `PutPathChunked`
 //! never materializes the NAR, so the same artifacts must be derived
 //! from the validated Directory tree instead. [`tree_to_entries`]
 //! produces a [`NarLsEntry`] list **byte-for-byte identical** to what

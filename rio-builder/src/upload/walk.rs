@@ -10,7 +10,7 @@
 //!   (`FileEntry.digest`), and the content-addressed `Directory` DAG
 //!   (the [`WalkObserver`] half).
 //!
-//! Every consumer hangs off the same [`dump_path_observed`] walk, so
+//! Every consumer hangs off the same [`dump_path_observed`](rio_nix::nar::dump_path_observed) walk, so
 //! each output byte is read exactly once to *compute* the upload; only
 //! the chunks the store reports as missing are read a second time when
 //! they go on the wire ([`ChunkSource`] records where to find them).

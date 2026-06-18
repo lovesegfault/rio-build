@@ -56,7 +56,7 @@ impl SchedulerDb {
     ///
     /// Sorted by `store_path` so `input_closure_digest` is stable.
     // r[impl sched.dispatch.input-roots+2]
-    pub async fn compute_input_roots(
+    pub(crate) async fn compute_input_roots(
         &self,
         seeds: &[String],
     ) -> Result<Option<Vec<InputRootRow>>, sqlx::Error> {

@@ -349,10 +349,13 @@ pub fn describe_metrics() {
          reason: missing_token / invalid_token (no or unverifiable \
          x-rio-assignment-token), path_not_in_claims (token valid but the \
          uploaded path is not in its claim set), ca_path_mismatch (CA-derived \
-         path does not match the claimed output), service_token_invalid / \
-         service_caller_not_allowlisted / service_caller_not_permitted (the \
-         x-rio-service-token bypass failed verification or allowlisting). \
-         Sustained non-zero from one builder = a stale or forged token source."
+         path does not match the claimed output), input_closure_mismatch \
+         (echoed closure digest disagrees with the token's attested digest), \
+         deriver_mismatch (recorded deriver does not match the token's \
+         drv_hash), service_token_invalid / service_caller_not_allowlisted / \
+         service_caller_not_permitted (the x-rio-service-token bypass failed \
+         verification or allowlisting). Sustained non-zero from one builder = \
+         a stale or forged token source."
     );
     describe_counter!(
         "rio_store_putpath_incomplete_total",
@@ -675,10 +678,11 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_putpath_concurrent_wait_total",
         "Concurrent same-path PutPath/PutPathChunked waits resolved, labeled \
-         by outcome: completed (winner committed; waiter took the idempotent \
-         skip), takeover (winner aborted; waiter claimed the freed \
-         placeholder), timeout (budget exhausted; ABORTED surfaced to the \
-         client's own retry logic)."
+         by outcome: waiting (entry marker before the first poll; the only \
+         label that fires while still parked), completed (winner committed; \
+         waiter took the idempotent skip), takeover (winner aborted; waiter \
+         claimed the freed placeholder), timeout (budget exhausted; ABORTED \
+         surfaced to the client's own retry logic)."
     );
     describe_counter!(
         "rio_store_substitute_probe_cache_hits_total",

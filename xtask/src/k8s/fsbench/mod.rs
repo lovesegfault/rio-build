@@ -469,7 +469,7 @@ fn print_summary(r: &ResultV1, path: &std::path::Path) {
             };
             eprintln!("  placement   exact, {tag}; cold-honesty PASSED");
             if let Some(note) = &r.cluster_metrics.honesty_note {
-                eprintln!("  note        {note}");
+                eprintln!("  {:<12}{note}", "note");
             }
         }
         ("exact", Some(false)) => eprintln!(

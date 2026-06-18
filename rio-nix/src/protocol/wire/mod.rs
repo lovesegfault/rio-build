@@ -91,8 +91,8 @@ pub async fn read_bool<R: AsyncRead + Unpin>(r: &mut R) -> Result<bool> {
 
 /// Incremental-read chunk size for length-prefixed payloads. Buffers grow
 /// as data arrives instead of being allocated at the full claimed length
-/// upfront, so a peer that claims a large length but never sends the bytes
-/// holds memory proportional to what it actually sent (russh
+/// upfront, so a peer that claims a large length but never delivers the
+/// bytes holds memory proportional to what it actually sent (russh
 /// CVE-2024-43410 class).
 const READ_CHUNK: usize = 64 * 1024;
 
