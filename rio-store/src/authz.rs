@@ -115,6 +115,12 @@ pub const METHOD_CREDENTIALS: &[(&str, CredentialClass)] = &[
             check: HandlerCheck::IngestToken,
         },
     ),
+    (
+        "/rio.store.StoreService/PutPathChunked",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::IngestToken,
+        },
+    ),
     // Read-side path metadata: the sig-visibility gate scopes what a
     // tenant session can see; builders read through the same methods
     // with no claims (dual-mode). Gate witnesses ride the data path.
@@ -141,6 +147,23 @@ pub const METHOD_CREDENTIALS: &[(&str, CredentialClass)] = &[
     ),
     (
         "/rio.store.StoreService/BatchGetManifest",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::EndUserRejected,
+        },
+    ),
+    // Castore index reads (ADR-022): builder-internal — the builder
+    // resolves its assignment's input roots; end-user tenants reach
+    // the same data via DirectoryService (tenant-scoped). The
+    // EndUserRejected witness threading is a recorded follow-up
+    // (queries.rs `let _ =` discards it; runtime check intact).
+    (
+        "/rio.store.StoreService/GetNarIndex",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::EndUserRejected,
+        },
+    ),
+    (
+        "/rio.store.StoreService/GetNarIndexBatch",
         CredentialClass::HandlerEnforced {
             check: HandlerCheck::EndUserRejected,
         },
@@ -203,6 +226,54 @@ pub const METHOD_CREDENTIALS: &[(&str, CredentialClass)] = &[
             rationale: "chunk reads are keyed by content hash — possession of the hash \
                         is the capability (manifest access is what the gated methods \
                         protect); S3-presigned URLs serve the same bytes",
+        },
+    ),
+    (
+        "/rio.store.ChunkService/GetChunks",
+        CredentialClass::Public {
+            rationale: "bulk variant of GetChunk; same content-hash-is-capability rationale",
+        },
+    ),
+    (
+        "/rio.store.ChunkService/HasChunks",
+        CredentialClass::Public {
+            rationale: "presence probe by content hash; same content-hash-is-capability \
+                        rationale (does not reveal which paths reference the chunk)",
+        },
+    ),
+    // ── DirectoryService (ADR-022 castore reads) ────────────────────
+    // Every method derives `castore_tenant_id` from JWT or HMAC claims
+    // and filters via the `path_tenants` junction (`pt.tenant_id = $2`)
+    // — the c88 sig-visibility-on-castore-reads gate. A digest with no
+    // junction row visible to the caller's tenant reads as absent.
+    (
+        "/rio.store.DirectoryService/GetDirectory",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
+    ),
+    (
+        "/rio.store.DirectoryService/HasDirectories",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
+    ),
+    (
+        "/rio.store.DirectoryService/HasBlobs",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
+    ),
+    (
+        "/rio.store.DirectoryService/ReadBlob",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
+    ),
+    (
+        "/rio.store.DirectoryService/StatBlob",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
         },
     ),
     // ── rio.store.StoreAdminService — cluster-internal operators and
@@ -955,6 +1026,7 @@ mod tests {
         let bound = [
             "rio.store.StoreService",
             "rio.store.ChunkService",
+            "rio.store.DirectoryService",
             "rio.store.StoreAdminService",
             "rio.store.LogService",
         ];

@@ -1585,6 +1585,8 @@ mod registration_writer_census {
         ("backend/tiered.rs", include_str!("../../backend/tiered.rs")),
         ("budget.rs", include_str!("../../budget.rs")),
         ("cas.rs", include_str!("../../cas.rs")),
+        ("castore.rs", include_str!("../../castore.rs")),
+        ("castore_nar.rs", include_str!("../../castore_nar.rs")),
         ("chunker.rs", include_str!("../../chunker.rs")),
         ("config.rs", include_str!("../../config.rs")),
         ("error.rs", include_str!("../../error.rs")),
@@ -1604,6 +1606,7 @@ mod registration_writer_census {
         ("gc/tenant.rs", include_str!("../../gc/tenant.rs")),
         ("grpc/admin.rs", include_str!("../../grpc/admin.rs")),
         ("grpc/chunk.rs", include_str!("../../grpc/chunk.rs")),
+        ("grpc/directory.rs", include_str!("../directory.rs")),
         ("grpc/get_path.rs", include_str!("../../grpc/get_path.rs")),
         ("grpc/mod.rs", include_str!("../../grpc/mod.rs")),
         (
@@ -1617,6 +1620,26 @@ mod registration_writer_census {
         (
             "grpc/put_path_batch.rs",
             include_str!("../../grpc/put_path_batch.rs"),
+        ),
+        (
+            "grpc/put_path_chunked/commit.rs",
+            include_str!("../put_path_chunked/commit.rs"),
+        ),
+        (
+            "grpc/put_path_chunked/file_digest.rs",
+            include_str!("../put_path_chunked/file_digest.rs"),
+        ),
+        (
+            "grpc/put_path_chunked/mod.rs",
+            include_str!("../put_path_chunked/mod.rs"),
+        ),
+        (
+            "grpc/put_path_chunked/validate.rs",
+            include_str!("../put_path_chunked/validate.rs"),
+        ),
+        (
+            "grpc/put_path_chunked/verify.rs",
+            include_str!("../put_path_chunked/verify.rs"),
         ),
         ("grpc/queries.rs", include_str!("../../grpc/queries.rs")),
         ("grpc/sign.rs", include_str!("../../grpc/sign.rs")),
@@ -1675,6 +1698,7 @@ mod registration_writer_census {
             "metadata/upstreams.rs",
             include_str!("../../metadata/upstreams.rs"),
         ),
+        ("nar_index.rs", include_str!("../../nar_index.rs")),
         ("realisations.rs", include_str!("../../realisations.rs")),
         ("signing.rs", include_str!("../../signing.rs")),
         ("substitute.rs", include_str!("../../substitute.rs")),

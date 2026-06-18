@@ -169,6 +169,26 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         },
     ),
     (
+        "directories",
+        RetentionPolicy::SweptBy {
+            symbol: "decrement_directory_refs",
+            note: "ADR-022 castore: refcount-managed (NOT the dropped chunks.refcount). \
+                   sweep_one_batch decrements per swept path's nar_index; \
+                   refcount=0 rows tombstoned for the drain. KNOWN GAP: not yet \
+                   enrolled in gc::hold::BatchAuthority (reconciliation TODO).",
+        },
+    ),
+    (
+        "directory_paths",
+        RetentionPolicy::CascadeFrom {
+            parent: "manifests",
+            migration: "112_directory_paths.sql",
+            note: "ADR-022 castore: dies with its store path's manifests row \
+                   (delete_swept_path); the directories-side FK CASCADE is \
+                   secondary (a directory only goes when no path references it)",
+        },
+    ),
+    (
         "drv_attempts",
         RetentionPolicy::SweptBy {
             symbol: "gc_attempt_ledger",
@@ -203,6 +223,15 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
                    slack — the fence outlives every token the family signer \
                    can mint); one row per confirm-exited pod, so volume \
                    tracks pod churn",
+        },
+    ),
+    (
+        "file_blobs",
+        RetentionPolicy::CascadeFrom {
+            parent: "manifests",
+            migration: "110_nar_index.sql",
+            note: "ADR-022 castore: per-file (digest, store_path_hash, nar_offset) \
+                   binding; dies with its store path's manifests row (delete_swept_path)",
         },
     ),
     (
@@ -296,6 +325,16 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
             symbol: "gc_resolved_materialization_jobs",
             note: "tick_gc_materialization_jobs; forensic horizon + live-pin and \
                    interest guards (sched.db.table-retention)",
+        },
+    ),
+    (
+        "nar_index",
+        RetentionPolicy::CascadeFrom {
+            parent: "manifests",
+            migration: "110_nar_index.sql",
+            note: "ADR-022 castore: per-path Directory-DAG index; dies with its \
+                   store path's manifests row (delete_swept_path reads dir digests \
+                   from it BEFORE the cascade for decrement_directory_refs)",
         },
     ),
     (
