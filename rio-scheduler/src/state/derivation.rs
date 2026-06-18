@@ -1033,8 +1033,9 @@ pub struct CaState {
 /// `Default` = zeros = no clamp (cold start). Persisted as
 /// `derivations.floor_{mem,disk,deadline,cores}_*` (`M_044` + `M_106`)
 /// so a scheduler failover between OOM and retry doesn't reset to zero
-/// → re-OOM at probe defaults. The persist gates on `hard_promoted`
-/// only — soft 1.2× observations are this leader's tenure.
+/// → re-OOM at probe defaults. The persist gates on `hard_grew` (any
+/// axis strictly grew under hard headroom, including a grow-to-cap
+/// clip) — soft 1.2× observations are this leader's tenure.
 ///
 /// `cores` jumps to the partition-aware provisionable max on a
 /// reason-gated compute-bound witness — `cpu_seconds_total /
