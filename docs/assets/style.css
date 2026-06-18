@@ -215,6 +215,10 @@ h5:hover .anchor, h6:hover .anchor,
 .rio-toc a:hover { color: var(--fg); }
 .rio-toc a.active { color: var(--accent); border-left-color: var(--accent); }
 .rio-toc-l2 a { padding-left: 1.4rem; }
+/* The aside is always emitted for grid-column consistency (page.typ);
+   when it has no children (404, single-heading pages) hide the chrome
+   so it occupies the track invisibly. */
+.rio-toc:empty { background: none; border-left: none; padding: 0; }
 /* ─── code-block copy button ──────────────────────────────────────── */
 .rio-code { position: relative; }
 /* typst's html exporter wraps the loose <button> in an auto-<p>; the

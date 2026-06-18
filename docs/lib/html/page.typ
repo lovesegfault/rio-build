@@ -18,8 +18,12 @@
 
 #let page-shell(route, title, src-path, body) = {
   _current-route.update(route)
-  let desc = descriptions.at(src-path, default: none)
-  let trail = crumb-trail(chapters, src-path)
+  // src-path is none for synthesized pages (404) — no description,
+  // breadcrumb, or edit link in that case.
+  let desc = if src-path != none { descriptions.at(src-path, default: none) }
+  let trail = if src-path != none { crumb-trail(chapters, src-path) } else {
+    ()
+  }
   let page-url = if site-url != "" { site-url + "/" + route + ".html" }
   html.elem("html", attrs: (lang: "en"))[
     #html.head[
@@ -45,6 +49,10 @@
             content: desc,
           ))
         }
+        html.elem("meta", attrs: (
+          property: "og:image",
+          content: site-url + "/og-image.svg",
+        ))
       }
       #html.elem("meta", attrs: (name: "theme-color", content: _theme-color))
       #html.title[#title — rio-build design book]
@@ -140,13 +148,15 @@
           }
           #html.elem("h1")[#title]
           #body
-          #html.elem("footer", attrs: (class: "rio-edit"))[
-            #html.elem("a", attrs: (
-              href: repo-edit-base + src-path,
-              target: "_blank",
-              rel: "noopener",
-            ))[Edit this page on GitHub]
-          ]
+          #if src-path != none {
+            html.elem("footer", attrs: (class: "rio-edit"))[
+              #html.elem("a", attrs: (
+                href: repo-edit-base + src-path,
+                target: "_blank",
+                rel: "noopener",
+              ))[Edit this page on GitHub]
+            ]
+          }
         ]
         // On-this-page right-rail TOC. Headings are collected by
         // lib/rio.typ's html-mode `show heading:` rule into the
