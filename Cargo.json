@@ -475,6 +475,60 @@
         "lib"
       ]
     },
+    "antlr4rust": {
+      "crateName": "antlr4rust",
+      "version": "0.5.2",
+      "edition": "2021",
+      "sha256": "19m6x738zwz0b139d46vjrphl2hsk09fmxvnsxw75zxzfh154g89",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "better_any",
+          "packageId": "better_any"
+        },
+        {
+          "name": "bit-set",
+          "packageId": "bit-set"
+        },
+        {
+          "name": "byteorder",
+          "packageId": "byteorder"
+        },
+        {
+          "name": "lazy_static",
+          "packageId": "lazy_static"
+        },
+        {
+          "name": "murmur3",
+          "packageId": "murmur3"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell"
+        },
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        },
+        {
+          "name": "typed-arena",
+          "packageId": "typed-arena"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Konstantin Anisimov <rrevenantt@gmail.com>",
+        "Alex Snaps <alex@wcgw.dev>"
+      ]
+    },
     "anyhow": {
       "crateName": "anyhow",
       "version": "1.0.102",
@@ -2529,7 +2583,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -3405,6 +3459,25 @@
         "RustCrypto Developers"
       ]
     },
+    "better_any": {
+      "crateName": "better_any",
+      "version": "0.2.1",
+      "edition": "2018",
+      "sha256": "1r5ngybr99id9ivqm3jir6xg9vakd7ipwpnca1hbi94p6dabjwj3",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "any",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Konstantin Anisimov <rrevenantt@gmail.com>"
+      ]
+    },
     "bit-set": {
       "crateName": "bit-set",
       "version": "0.8.0",
@@ -3995,6 +4068,61 @@
       ],
       "authors": [
         "Alex Crichton <alex@alexcrichton.com>"
+      ]
+    },
+    "cel": {
+      "crateName": "cel",
+      "version": "0.13.0",
+      "edition": "2021",
+      "sha256": "1biq2xg0r32p24q7my91rh3jqybmjwkhkdh02290adcci8rhz927",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "antlr4rust",
+          "packageId": "antlr4rust"
+        },
+        {
+          "name": "chrono",
+          "packageId": "chrono"
+        },
+        {
+          "name": "lazy_static",
+          "packageId": "lazy_static"
+        },
+        {
+          "name": "nom",
+          "packageId": "nom"
+        },
+        {
+          "name": "pastey",
+          "packageId": "pastey"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 1.0.69"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "chrono",
+        "default",
+        "regex"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Clark McCauley <me@clarkmccauley.com>",
+        "Alex Snaps <alex@wcgw.dev>"
       ]
     },
     "cfg-if": {
@@ -8203,7 +8331,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -8295,7 +8423,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "unicode-bom",
@@ -8473,7 +8601,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "unicode-bom",
@@ -8515,7 +8643,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -8630,7 +8758,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -8699,7 +8827,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -8745,7 +8873,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -8828,7 +8956,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "walkdir",
@@ -8917,7 +9045,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -8958,7 +9086,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9024,7 +9152,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -9222,7 +9350,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9251,7 +9379,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9312,7 +9440,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9381,7 +9509,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9442,7 +9570,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -9479,7 +9607,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -9516,7 +9644,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9561,7 +9689,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9622,7 +9750,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9716,7 +9844,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9765,7 +9893,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9879,7 +10007,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -9952,7 +10080,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -10030,7 +10158,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -10079,7 +10207,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -10188,7 +10316,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -10244,7 +10372,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -10277,7 +10405,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -12909,7 +13037,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "windows-link",
@@ -13093,7 +13221,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -13134,7 +13262,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [
@@ -13384,6 +13512,7 @@
       ],
       "resolvedDefaultFeatures": [
         "aws-lc-rs",
+        "cel",
         "client",
         "config",
         "derive",
@@ -13401,6 +13530,73 @@
         "clux <sszynrae@gmail.com>",
         "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
+      ]
+    },
+    "kube-cel": {
+      "crateName": "kube-cel",
+      "version": "0.7.0",
+      "edition": "2024",
+      "sha256": "06lyqvzsmcvnajc1dij60pkqhj862kqbsj4x6ahwjnbi19b6ksr8",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "base64",
+          "packageId": "base64 0.22.1"
+        },
+        {
+          "name": "cel",
+          "packageId": "cel"
+        },
+        {
+          "name": "chrono",
+          "packageId": "chrono"
+        },
+        {
+          "name": "ipnet",
+          "packageId": "ipnet"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "semver",
+          "packageId": "semver"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "url",
+          "packageId": "url"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "encoders",
+        "format",
+        "ip",
+        "jsonpatch",
+        "lists",
+        "math",
+        "named_format",
+        "quantity",
+        "regex_funcs",
+        "semver_funcs",
+        "sets",
+        "strings",
+        "urls",
+        "validation"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "kube-client": {
@@ -13498,7 +13694,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -13598,6 +13794,10 @@
           "packageId": "k8s-openapi"
         },
         {
+          "name": "kube-cel",
+          "packageId": "kube-cel"
+        },
+        {
           "name": "schemars",
           "packageId": "schemars 1.2.1"
         },
@@ -13615,10 +13815,11 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
+        "cel",
         "json-patch",
         "jsonpatch",
         "schema",
@@ -13746,7 +13947,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -14441,7 +14642,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -14813,6 +15014,27 @@
       ],
       "authors": [
         "Håvar Nøvik <havar.novik@gmail.com>"
+      ]
+    },
+    "murmur3": {
+      "crateName": "murmur3",
+      "version": "0.4.1",
+      "edition": "2015",
+      "sha256": "073p2hncdnngin5mjbxnc8v35x4azqclmz4d712ga0zwkrcgk651",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "byteorder",
+          "packageId": "byteorder"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Stu Small <stuart.alan.small@gmail.com>"
       ]
     },
     "nalgebra": {
@@ -15548,7 +15770,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tracing",
@@ -15649,7 +15871,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -15769,7 +15991,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -16157,7 +16379,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -16294,6 +16516,20 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "pastey": {
+      "crateName": "pastey",
+      "version": "0.2.3",
+      "edition": "2018",
+      "sha256": "1d1mk45ma9w54ppws8x096q96qhqirxmj9j3hchj7fmi1087zrif",
+      "source": {
+        "type": "crates-io"
+      },
+      "procMacro": true,
+      "authors": [
+        "Aditya Kumar <git@adityais.dev>",
+        "David Tolnay <dtolnay@gmail.com>"
       ]
     },
     "pathdiff": {
@@ -17703,7 +17939,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -17788,7 +18024,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tinyvec",
@@ -18920,7 +19156,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -19102,7 +19338,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -19397,7 +19633,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -19580,7 +19816,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -19678,6 +19914,12 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "kube",
+          "packageId": "kube"
         }
       ],
       "crateBin": [
@@ -19803,7 +20045,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -20093,7 +20335,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -20199,7 +20441,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -20431,7 +20673,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -20716,7 +20958,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -21431,7 +21673,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -23798,7 +24040,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -23972,7 +24214,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tokio",
@@ -24086,7 +24328,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tracing",
@@ -24222,7 +24464,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tracing",
@@ -24316,7 +24558,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "tracing",
@@ -24967,7 +25209,28 @@
         "Jason White <me@jasonwhite.io>"
       ]
     },
-    "thiserror": {
+    "thiserror 1.0.69": {
+      "crateName": "thiserror",
+      "version": "1.0.69",
+      "edition": "2021",
+      "sha256": "0lizjay08agcr5hs9yfzzj6axs53a2rgx070a1dsi3jpkcrzbamn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "thiserror-impl",
+          "packageId": "thiserror-impl 1.0.69"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ]
+    },
+    "thiserror 2.0.18": {
       "crateName": "thiserror",
       "version": "2.0.18",
       "edition": "2021",
@@ -24978,7 +25241,7 @@
       "dependencies": [
         {
           "name": "thiserror-impl",
-          "packageId": "thiserror-impl"
+          "packageId": "thiserror-impl 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -24992,7 +25255,34 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
-    "thiserror-impl": {
+    "thiserror-impl 1.0.69": {
+      "crateName": "thiserror-impl",
+      "version": "1.0.69",
+      "edition": "2021",
+      "sha256": "1h84fmn2nai41cxbhk6pqf46bxqq1b344v8yz089w1chzi76rvjg",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ]
+    },
+    "thiserror-impl 2.0.18": {
       "crateName": "thiserror-impl",
       "version": "2.0.18",
       "edition": "2021",
@@ -26353,7 +26643,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "time",
@@ -26737,7 +27027,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -26753,6 +27043,25 @@
       "authors": [
         "Alexey Galakhov",
         "Daniel Abramov"
+      ]
+    },
+    "typed-arena": {
+      "crateName": "typed-arena",
+      "version": "2.0.2",
+      "edition": "2015",
+      "sha256": "0shj0jpmglhgw2f1i4b33ycdzwd1z205pbs1rd5wx7ks2qhaxxka",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The typed-arena developers"
       ]
     },
     "typenum": {
@@ -28571,6 +28880,10 @@
           "packageId": "base64 0.22.1"
         },
         {
+          "name": "bit-vec",
+          "packageId": "bit-vec"
+        },
+        {
           "name": "bitflags",
           "packageId": "bitflags",
           "target": "aarch64-unknown-linux-gnu"
@@ -28763,6 +29076,10 @@
         {
           "name": "inout",
           "packageId": "inout"
+        },
+        {
+          "name": "ipnet",
+          "packageId": "ipnet"
         },
         {
           "name": "jiff",
@@ -29028,7 +29345,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "time",
@@ -29145,6 +29462,10 @@
         {
           "name": "base64",
           "packageId": "base64 0.22.1"
+        },
+        {
+          "name": "bit-vec",
+          "packageId": "bit-vec"
         },
         {
           "name": "bitflags",
@@ -29345,6 +29666,10 @@
           "packageId": "inout"
         },
         {
+          "name": "ipnet",
+          "packageId": "ipnet"
+        },
+        {
           "name": "jiff",
           "packageId": "jiff"
         },
@@ -29608,7 +29933,7 @@
         },
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         },
         {
           "name": "time",

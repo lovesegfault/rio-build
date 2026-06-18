@@ -40,3 +40,11 @@ serde_json = { workspace = true }
 # Write-only for crdgen (and the crd_serializes test).
 serde-saphyr = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+# `cel` feature pulls kube-cel (pure-Rust CEL interpreter) so unit
+# tests can EVALUATE x-kubernetes-validations against test instances
+# instead of string-grepping the schema. Dev-only — prod binaries
+# don't link the CEL interpreter; the apiserver evaluates rules
+# server-side.
+kube = { workspace = true, features = ["cel"] }
