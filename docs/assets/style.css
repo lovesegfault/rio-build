@@ -50,44 +50,44 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
   font-family: "NewComputerModern"; font-weight: 400; font-style: normal;
   font-display: swap;
   src: local("NewCM10-Regular"),
-       url("/assets/fonts/NewCM10-Regular.otf") format("opentype");
+       url("/assets/fonts/NewCM10-Regular.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModern"; font-weight: 700; font-style: normal;
   font-display: swap;
   src: local("NewCM10-Bold"),
-       url("/assets/fonts/NewCM10-Bold.otf") format("opentype");
+       url("/assets/fonts/NewCM10-Bold.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModern"; font-weight: 400; font-style: italic;
   font-display: swap;
   src: local("NewCM10-Italic"),
-       url("/assets/fonts/NewCM10-Italic.otf") format("opentype");
+       url("/assets/fonts/NewCM10-Italic.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModern"; font-weight: 700; font-style: italic;
   font-display: swap;
   src: local("NewCM10-BoldItalic"),
-       url("/assets/fonts/NewCM10-BoldItalic.otf") format("opentype");
+       url("/assets/fonts/NewCM10-BoldItalic.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernMono"; font-weight: 400; font-style: normal;
   font-display: swap;
   src: local("NewCMMono10-Regular"),
-       url("/assets/fonts/NewCMMono10-Regular.otf") format("opentype");
+       url("/assets/fonts/NewCMMono10-Regular.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernMono"; font-weight: 700; font-style: normal;
   font-display: swap;
   src: local("NewCMMono10-Bold"),
-       url("/assets/fonts/NewCMMono10-Bold.otf") format("opentype");
+       url("/assets/fonts/NewCMMono10-Bold.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernMath";
   font-display: swap;
   src: local("NewComputerModernMath-Regular"),
        local("NewComputerModernMath"),
-       url("/assets/fonts/NewCMMath-Regular.otf") format("opentype");
+       url("/assets/fonts/NewCMMath-Regular.woff2") format("woff2");
 }
 /* MathML: additive only — UA stylesheet's `display: block math` and
    centring are load-bearing; overriding `display` or `font-family` to

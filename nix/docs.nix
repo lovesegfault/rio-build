@@ -231,6 +231,10 @@ let
             rioTypst
             pkgs.pagefind
             pkgs.makeWrapper
+            (pkgs.python3.withPackages (ps: [
+              ps.fonttools
+              ps.brotli
+            ]))
           ];
         }
       )
@@ -251,9 +255,23 @@ let
         # regular/bold), and math (NewCMMath-Regular for the Plane-1
         # glyphs typst emits, U+1D400–, which need an OpenType MATH
         # table). Matches the @font-face set in docs/assets/style.css.
+        # OTF→WOFF2 via pyftsubset: Chrome's OTS sanitizer rejects the
+        # upstream .otf ("CFF: Failed validating CharStrings INDEX" —
+        # the autohinter-generated hint programs are malformed per OTS),
+        # so body text fell back to generic serif in Chromium. A bare
+        # woff2_compress is NOT enough (it wraps the CFF table verbatim
+        # and OTS still rejects it); --no-hinting --desubroutinize
+        # rewrites the CharStrings into a form OTS accepts. --unicodes=*
+        # keeps every glyph; pyftsubset preserves the MATH table.
         mkdir -p $out/assets/fonts
-        cp ${pkgs.newcomputermodern}/share/fonts/opentype/public/{NewCMMath-Regular,NewCM10-{Regular,Bold,Italic,BoldItalic},NewCMMono10-{Regular,Bold}}.otf \
-          $out/assets/fonts/
+        for f in NewCM10-Regular NewCM10-Bold NewCM10-Italic NewCM10-BoldItalic \
+                 NewCMMono10-Regular NewCMMono10-Bold NewCMMath-Regular; do
+          pyftsubset \
+            ${pkgs.newcomputermodern}/share/fonts/opentype/public/$f.otf \
+            --output-file=$out/assets/fonts/$f.woff2 --flavor=woff2 \
+            '--unicodes=*' '--layout-features=*' \
+            --no-hinting --desubroutinize
+        done
         # Static search index over the emitted HTML.
         pagefind --site $out --output-subdir pagefind
         # `nix run .#docs` → serve the built tree. Only --index and the
