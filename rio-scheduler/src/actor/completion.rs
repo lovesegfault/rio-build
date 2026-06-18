@@ -1287,8 +1287,10 @@ impl DagActor {
     /// sh-041u — the unified peak-observe wrapper for `drv_hash`.
     /// Thin wrapper around [`super::floor::observe_peaks`] that
     /// handles the dag-node lookup, metric, log, and best-effort PG
-    /// persist (the M_044 persist gates on `hard_promoted` only —
-    /// soft observations are in-memory only; this leader's tenure).
+    /// persist (the M_044 persist gates on `hard_grew` — any axis
+    /// strictly grew under hard headroom, including a grow-to-cap
+    /// clip; soft observations are in-memory only, this leader's
+    /// tenure).
     ///
     /// Called on every non-success worker-reported close (chokepoint — quantifier: census(observe_resource_floor_caller_census) —
     /// #2, [`Self::handle_admitted_completion`]), the AD5
@@ -1320,8 +1322,9 @@ impl DagActor {
     /// large→xlarge from a pod-kill + store-replica-restart with zero
     /// builds run, and floor is sticky (M_044) so the next submitter
     /// paid for an oversized pod. Under sh-041u that surface is
-    /// closed by `hard_promoted` gating BOTH promotion-exempt and the
-    /// M_044 persist — a soft observe (peak × 1.2, in-memory only)
+    /// closed by `hard_grew` gating the M_044 persist and
+    /// `hard_promoted` (kernel-disjoint with `at_cap`) gating
+    /// promotion-exempt — a soft observe (peak × 1.2, in-memory only)
     /// cannot re-create it.
     pub(super) async fn observe_resource_floor(
         &mut self,
@@ -1329,10 +1332,10 @@ impl DagActor {
         mut peaks: super::floor::ObservedPeaks,
         reason: super::floor::AttemptCloseReason,
     ) -> super::floor::FloorOutcome {
-        let reason_label = reason.label();
         let Some(state) = self.dag.node(drv_hash) else {
             return super::floor::FloorOutcome::default();
         };
+        let reason_label = reason.label();
         // sh-041u r1: `wall` is the SCHEDULER's own `running_since`
         // anchor — derived HERE, never caller-supplied, so a
         // worker-minted duration cannot reach the trust gate by
@@ -1363,42 +1366,47 @@ impl DagActor {
             };
         let cfg = super::floor::ObserveCfg::from(&self.sla_config);
         let mut new_floor = None;
-        let outcome = if let Some(state) = self.dag.node_mut(drv_hash) {
-            let o = super::floor::observe_peaks(
-                state,
-                peaks,
-                reason,
-                &self.sla_ceilings,
-                prov_max_cores,
-                &cfg,
+        // sh-041u r2: presence proven by the `node()` guard above; no
+        // `.await` between, no dag mutation in this span. The retired
+        // `if let … else { default() }` was a dead arm.
+        let state = self
+            .dag
+            .node_mut(drv_hash)
+            .expect("present per node() guard above");
+        let outcome = super::floor::observe_peaks(
+            state,
+            peaks,
+            reason,
+            &self.sla_ceilings,
+            prov_max_cores,
+            &cfg,
+        );
+        if outcome.hard_grew || outcome.soft_promoted {
+            info!(
+                drv_hash = %drv_hash, reason = reason_label,
+                hard = outcome.hard_grew,
+                floor = ?state.sched.resource_floor,
+                "resource_floor observed"
             );
-            if o.hard_promoted || o.soft_promoted {
-                info!(
-                    drv_hash = %drv_hash, reason = reason_label,
-                    hard = o.hard_promoted,
-                    floor = ?state.sched.resource_floor,
-                    "resource_floor observed"
-                );
-                metrics::counter!(
-                    "rio_scheduler_resource_floor_bumps_total",
-                    "reason" => reason_label,
-                    "headroom" => if o.hard_promoted { "hard" } else { "soft" }
-                )
-                .increment(1);
-            }
-            // sh-041u Q1 default: M_044 persist gates on
-            // `hard_promoted` only — soft observations are in-memory
-            // only (a soft observe can be `target < last_intent`;
-            // persisting it via the GREATEST() ratchet would never
-            // heal downward, and the SLA fit's pname-keyed p90
-            // already covers the same evidence).
-            if o.hard_promoted {
-                new_floor = Some(state.sched.resource_floor);
-            }
-            o
-        } else {
-            super::floor::FloorOutcome::default()
-        };
+            metrics::counter!(
+                "rio_scheduler_resource_floor_bumps_total",
+                "reason" => reason_label,
+                "headroom" => if outcome.hard_grew { "hard" } else { "soft" }
+            )
+            .increment(1);
+        }
+        // sh-041u Q1 default: M_044 persist gates on `hard_grew` —
+        // any axis strictly grew under hard headroom (INCLUDING a
+        // grow-to-cap clip; sh-041u r2: gating on the kernel-disjoint
+        // `hard_promoted` skipped the persist there, so failover
+        // rehydrated floor=0 → re-OOM at probe defaults). Soft
+        // observations are in-memory only (a soft observe can be
+        // `target < last_intent`; persisting it via the GREATEST()
+        // ratchet would never heal downward, and the SLA fit's
+        // pname-keyed p90 already covers the same evidence).
+        if outcome.hard_grew {
+            new_floor = Some(state.sched.resource_floor);
+        }
         // M_044: persist the floor so failover doesn't reset it →
         // re-OOM at probe defaults. Outside the node_mut borrow
         // (await point); best-effort — a lost write degrades to one
@@ -4121,7 +4129,7 @@ impl DagActor {
     /// out of scope). Transients are never HARD-promoted and never
     /// exempt (P4) — `TransientFailure → Other` at chokepoint #2 means
     /// `observe_peaks` runs a SOFT-only observe (peak × 1.2, in-memory,
-    /// never `hard_promoted`, never M_044-persists, never rides
+    /// never `hard_grew`, never M_044-persists, never rides
     /// promotion-exempt — the I-170/I-173/I-177 surface is closed by
     /// `hard_*()` reason gating, not by skipping the observe). No
     /// `floor_outcome` is threaded to this handler: there is no
