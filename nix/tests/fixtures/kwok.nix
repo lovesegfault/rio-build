@@ -393,8 +393,10 @@ in
 
   # Tag the chart's `buildScheduler.image` should be set to. Exposed
   # so default.nix can wire `extraValues."buildScheduler.image"`
-  # without hardcoding the tag in two places.
-  kubeSchedulerRef = "registry.k8s.io/kube-scheduler:v1.35.4";
+  # without hardcoding the tag in two places. DERIVED from the
+  # kubeSchedulerImage FOD's imageName/imageTag passthru (no drift
+  # window — cf5c597ae bumped the FOD but not this literal).
+  kubeSchedulerRef = "${kubeSchedulerImage.imageName}:${kubeSchedulerImage.imageTag}";
 
   # k3s `services.k3s.manifests` entries. `00b-` prefix sorts after
   # `00-rio-crds` (so the NodeClaim CRD lands alongside the rio CRDs
