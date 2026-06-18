@@ -112,6 +112,35 @@
 // `none` for PDF targets so `_chapter-nav()` returns the empty stub.
 #let _current-route = state("rio-current-route", none)
 
+// Per-route heading-slug occurrence counts, for the html-mode
+// `show heading:` rule below. Bundle mode shares one typst state space
+// across every `document()` call, so the dedup key is route-qualified
+// — the SAME heading text in two chapters yields the unsuffixed slug
+// in each output file, while a repeat WITHIN one chapter gets `-2`.
+#let _heading-slugs = state("rio-heading-slugs", (:))
+
+// Flatten typst content to a plain string (best-effort; drops styling
+// and any leaf without `.text`/`.body`/`.child`/`.children`). Used for
+// slug derivation only — the rendered heading keeps the original
+// `it.body` content.
+#let _to-string(c) = {
+  if type(c) == str { c } else if type(c) != content { "" } else if (
+    c.has("text")
+  ) { c.text } else if c.has("children") {
+    c.children.map(_to-string).join("")
+  } else if c.has("body") { _to-string(c.body) } else if c.has("child") {
+    _to-string(c.child)
+  } else if c == [ ] { " " } else { "" }
+}
+
+// kebab-case slug: lowercase, non-alnum runs → `-`, trim `-`. Falls
+// back to "section" when the body stringifies to nothing (e.g. a
+// heading whose only child is a non-text element).
+#let _slug(body) = {
+  let s = lower(_to-string(body)).replace(regex("[^a-z0-9]+"), "-").trim("-")
+  if s == "" { "section" } else { s }
+}
+
 // Locate the current route in the flattened chapter manifest. Returns
 // (title: str, prev: (title,path,depth)|none, next: …|none). QA #6 +
 // #9 share this — title for <title>/<h1>, prev/next for the nav
@@ -565,6 +594,51 @@
         attrs: (class: "rio-footnote"),
         [ (#it.body)],
       )
+      // Headings: typst's default html export emits `<hN>NUM  Text</hN>`
+      // with no id and no anchor. Emit explicitly so every heading gets
+      // a stable kebab-slug id (route-scoped dedup via _heading-slugs)
+      // and a hover-reveal ¶ permalink. Level is shifted +1 to match
+      // typst's own export convention — page-shell already owns the
+      // sole <h1>. The target() guard keeps html.elem out of any
+      // html.frame() paged sub-context.
+      show heading: it => context if target() == "html" {
+        let base = _slug(it.body)
+        let route = _current-route.get()
+        let key = if route == none { base } else { route + "::" + base }
+        let n = _heading-slugs.get().at(key, default: 0)
+        let id = if it.has("label") and it.label != none {
+          // honour an explicit `= Title <slug>` so cross-link and
+          // #fragment agree.
+          str(it.label)
+        } else if n == 0 { base } else { base + "-" + str(n + 1) }
+        // state.update() yields placeable content (not a side-effect),
+        // so it must sit in the output sequence — NOT inside the
+        // `let id = …` block, where it would join into the binding and
+        // turn `id` into content.
+        _heading-slugs.update(d => {
+          d.insert(key, d.at(key, default: 0) + 1)
+          d
+        })
+        html.elem("h" + str(calc.min(it.level + 1, 6)), attrs: (id: id), {
+          if it.numbering != none {
+            html.elem(
+              "span",
+              attrs: (class: "hnum"),
+              numbering(it.numbering, ..counter(heading).at(here())),
+            )
+          }
+          it.body
+          html.elem(
+            "a",
+            attrs: (
+              class: "anchor",
+              href: "#" + id,
+              aria-label: "Permalink to this section",
+            ),
+            [¶],
+          )
+        })
+      } else { it }
       // Chapters do NOT carry a leading `= <Title>` heading — the
       // page-shell wrapper (lib/html/page.typ) emits the manifest
       // title as the sole <h1>; chapter body starts at level-1

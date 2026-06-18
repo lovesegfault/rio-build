@@ -120,6 +120,18 @@ math[display="block"] { margin-block: 1.1em; }
 .rio-figure::-webkit-scrollbar-thumb,
 .rio-table::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 4px; }
 .rio-footnote { color: var(--muted); font-size: 0.875em; }
+/* Heading anchors (lib/rio.typ html-mode `show heading:` rule). The
+   number prefix is muted; the ¶ permalink is invisible until the
+   heading is hovered or the link itself is focused. */
+.rio-main h2, .rio-main h3, .rio-main h4,
+.rio-main h5, .rio-main h6 { position: relative; }
+.hnum { color: var(--muted); font-weight: 400; margin-right: .4em; }
+.rio-main a.anchor { margin-left: .4em; color: var(--muted);
+  text-decoration: none; opacity: 0; transition: opacity .1s;
+  font-weight: 400; }
+h2:hover .anchor, h3:hover .anchor, h4:hover .anchor,
+h5:hover .anchor, h6:hover .anchor,
+.rio-main a.anchor:focus { opacity: 1; }
 /* Anchor scroll-offset so #r-… fragment targets aren't flush to the top. */
 [id^="r-"], [id^="label-"], h2[id], h3[id], h4[id] { scroll-margin-top: 1.5em; }
 /* Prev/next chapter nav (lib/rio.typ _chapter-nav) — footer bar. */
