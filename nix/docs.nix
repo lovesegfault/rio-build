@@ -63,8 +63,7 @@ let
     );
 
   fonts = [
-    pkgs.libertinus
-    pkgs.dejavu_fonts
+    pkgs.newcomputermodern
   ];
 
   # Wrapped typst binary: TYPST_PACKAGE_CACHE_PATH + TYPST_FONT_PATHS
@@ -250,12 +249,13 @@ let
         typst compile --features bundle,html --format bundle \
           --root . ${mkInputArgs ghSha} --input x-target=html \
           --font-path "$TYPST_FONT_PATHS" book.typ $out/
-        # MathML webfont: typst emits Plane-1 math glyphs (U+1D400–) that
-        # system-ui doesn't cover, and system-ui has no OpenType MATH
-        # table. Ship NewCMMath so style.css's `math { font-family:… }`
-        # has a real math font to resolve to (matches typst.app/docs).
+        # Webfonts: ship the NCM faces style.css references — body text
+        # (NewCM10 regular/bold/italic/bold-italic), mono (NewCMMono10
+        # regular/bold), and math (NewCMMath-Regular for the Plane-1
+        # glyphs typst emits, U+1D400–, which need an OpenType MATH
+        # table). Matches the @font-face set in docs/assets/style.css.
         mkdir -p $out/assets/fonts
-        cp ${pkgs.newcomputermodern}/share/fonts/opentype/public/NewCMMath-Regular.otf \
+        cp ${pkgs.newcomputermodern}/share/fonts/opentype/public/{NewCMMath-Regular,NewCM10-{Regular,Bold,Italic,BoldItalic},NewCMMono10-{Regular,Bold}}.otf \
           $out/assets/fonts/
         # Static search index over the emitted HTML.
         pagefind --site $out --output-subdir pagefind

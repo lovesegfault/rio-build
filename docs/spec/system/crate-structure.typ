@@ -66,7 +66,7 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
   // deps near centre, consumers on the rim) — the only autograph-
   // reachable engine that fits the 750px column.
   let crate(name) = text(
-    font: "DejaVu Sans Mono",
+    font: "New Computer Modern Mono",
     weight: 600,
     size: 0.75em,
     name,

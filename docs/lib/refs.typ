@@ -53,7 +53,7 @@
 )
 #let _gh-sha = sys.inputs.at("gh-sha", default: "main")
 #let _src(p) = text(
-  font: "DejaVu Sans Mono",
+  font: "New Computer Modern Mono",
   size: 0.85em,
   fill: rgb("#656d76"),
 )[#p]

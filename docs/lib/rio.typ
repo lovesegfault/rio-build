@@ -144,7 +144,11 @@
 // Inline reference to a source location. With url, wraps in a permalink;
 // without, renders as muted mono (for refs that can't be linkified).
 #let src(path, url: none) = {
-  let body = text(font: "DejaVu Sans Mono", size: 0.85em, fill: muted)[#path]
+  let body = text(
+    font: "New Computer Modern Mono",
+    size: 0.85em,
+    fill: muted,
+  )[#path]
   if url != none { link(url, body) } else { body }
 }
 
@@ -335,7 +339,7 @@
             fill: rgb("#f6f8fa"),
             radius: 3pt,
             inset: (x: 0.5em, y: 0.15em),
-            text(font: "DejaVu Sans Mono", size: 0.85em)[r\[#id\]],
+            text(font: "New Computer Modern Mono", size: 0.85em)[r\[#id\]],
           )
           [ ]
           body.pos().join()
@@ -350,7 +354,7 @@
 #let rref(id) = context {
   let lbl = label(_rid(id))
   let body = text(
-    font: "DejaVu Sans Mono",
+    font: "New Computer Modern Mono",
     size: 0.85em,
     fill: muted,
   )[r\[#id\]]
@@ -378,10 +382,10 @@
   _domains.update(domains)
 
   // common typography (target-neutral)
-  set text(font: "Libertinus Serif", size: 10.5pt, lang: "en")
+  set text(font: "New Computer Modern", size: 10.5pt, lang: "en")
   set par(justify: true, leading: 0.7em, spacing: 1.05em)
 
-  show raw: set text(font: "DejaVu Sans Mono", size: 0.85em)
+  show raw: set text(font: "New Computer Modern Mono", size: 0.85em)
   show raw.where(block: true): it => block(
     fill: rgb("#f6f8fa"),
     inset: (x: 1em, y: 0.8em),

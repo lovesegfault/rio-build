@@ -12,9 +12,10 @@
 * { box-sizing: border-box; }
 body {
   margin: 0; display: grid; grid-template-columns: var(--nav-w) 1fr;
-  font: 16px/1.6 ui-sans-serif, system-ui, sans-serif;
+  font: 16px/1.6 "NewComputerModern", serif;
   color: var(--fg); background: var(--bg);
 }
+code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
 .rio-nav {
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
   padding: 1rem; border-right: 1px solid var(--rule);
@@ -37,6 +38,42 @@ body {
 /* html.frame() SVGs: invert in dark mode (see lib/rio.typ theming note) */
 .rio-frame svg { max-width: 100%; height: auto; }
 :root[data-theme="dark"] .rio-frame svg { filter: invert(0.93) hue-rotate(180deg); }
+@font-face {
+  font-family: "NewComputerModern"; font-weight: 400; font-style: normal;
+  font-display: swap;
+  src: local("NewCM10-Regular"),
+       url("/assets/fonts/NewCM10-Regular.otf") format("opentype");
+}
+@font-face {
+  font-family: "NewComputerModern"; font-weight: 700; font-style: normal;
+  font-display: swap;
+  src: local("NewCM10-Bold"),
+       url("/assets/fonts/NewCM10-Bold.otf") format("opentype");
+}
+@font-face {
+  font-family: "NewComputerModern"; font-weight: 400; font-style: italic;
+  font-display: swap;
+  src: local("NewCM10-Italic"),
+       url("/assets/fonts/NewCM10-Italic.otf") format("opentype");
+}
+@font-face {
+  font-family: "NewComputerModern"; font-weight: 700; font-style: italic;
+  font-display: swap;
+  src: local("NewCM10-BoldItalic"),
+       url("/assets/fonts/NewCM10-BoldItalic.otf") format("opentype");
+}
+@font-face {
+  font-family: "NewComputerModernMono"; font-weight: 400; font-style: normal;
+  font-display: swap;
+  src: local("NewCMMono10-Regular"),
+       url("/assets/fonts/NewCMMono10-Regular.otf") format("opentype");
+}
+@font-face {
+  font-family: "NewComputerModernMono"; font-weight: 700; font-style: normal;
+  font-display: swap;
+  src: local("NewCMMono10-Bold"),
+       url("/assets/fonts/NewCMMono10-Bold.otf") format("opentype");
+}
 @font-face {
   font-family: "NewComputerModernMath";
   font-display: swap;
