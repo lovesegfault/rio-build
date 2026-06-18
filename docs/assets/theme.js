@@ -11,11 +11,28 @@
     el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
 
   addEventListener("DOMContentLoaded", () => {
-    if (window.PagefindUI && document.querySelector("#search")) {
-      new PagefindUI({ element: "#search", showSubResults: true });
-      document
-        .querySelector("#search input")
-        ?.setAttribute("aria-label", "Search documentation");
+    const searchEl = document.querySelector("#search");
+    if (searchEl) {
+      const fallback = (msg) => {
+        const p = document.createElement("p");
+        p.className = "rio-search-unavailable";
+        p.textContent = msg;
+        searchEl.replaceChildren(p);
+      };
+      if (typeof WebAssembly === "undefined") {
+        fallback("Search unavailable (WebAssembly disabled)");
+      } else if (!window.PagefindUI) {
+        fallback("Search unavailable");
+      } else {
+        try {
+          new PagefindUI({ element: "#search", showSubResults: true });
+          document
+            .querySelector("#search input")
+            ?.setAttribute("aria-label", "Search documentation");
+        } catch (e) {
+          fallback("Search failed to initialize");
+        }
+      }
     }
     const btn = document.querySelector(".rio-theme-toggle");
     if (btn) {

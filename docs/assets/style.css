@@ -175,6 +175,7 @@ h5:hover .anchor, h6:hover .anchor,
   border-radius: 4px; text-decoration: none; color: var(--fg); }
 .mobile-nav-chapters:hover { border-color: var(--accent); color: var(--accent); }
 .mobile-nav-chapters.next { margin-left: auto; }
+.rio-search-unavailable { font-size: .85em; color: var(--muted); padding: .5rem; }
 /* pagefind UI inherits theme via vars */
 .pagefind-ui { --pagefind-ui-primary: var(--accent); --pagefind-ui-text: var(--fg);
   --pagefind-ui-background: var(--bg); --pagefind-ui-border: var(--rule); }
