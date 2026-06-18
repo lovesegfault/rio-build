@@ -91,7 +91,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 uuid = { version = "1", features = ["v4", "v7"] }
 
 # S3
-aws-sdk-s3 = { version = "1.133", default-features = false, features = [
+aws-sdk-s3 = { version = "1.137", default-features = false, features = [
   "sigv4a",
   "http-1x",
   "default-https-client",
@@ -285,7 +285,7 @@ ordered-float = "5"
 # workspace links a single CryptoProvider (sqlx, tonic, aws-sdk, russh and
 # the direct `rustls` dep below are all aws-lc-rs already). xtask adds
 # `ws` on top (port-forward/exec).
-kube = { version = "3.1", default-features = false, features = [
+kube = { version = "4.0", default-features = false, features = [
   "runtime",
   "derive",
   "client",
@@ -304,7 +304,7 @@ rustls = { version = "0.23", default-features = false, features = [
 # k8s-openapi types are feature-gated by K8s API version. v1_35 is the
 # highest this release supports. The feature pins which struct fields
 # exist (e.g., ephemeralContainers moved GA in different versions).
-k8s-openapi = { version = "0.27", features = ["v1_35"] }
+k8s-openapi = { version = "0.28", features = ["v1_35"] }
 # schemars 1.x NOT 0.8 — kube 3.0 requires the major break. CRD JSON
 # schema generation for #[derive(JsonSchema)].
 schemars = "1"
@@ -314,7 +314,7 @@ schemars = "1"
 # kubeconfig parsing to serde-saphyr too, so the tree converges on one
 # YAML stack once that lands; until then kube still pulls serde_yaml
 # transitively.
-serde-saphyr = "0.0.26"
+serde-saphyr = "0.0.27"
 
 # --- phase3a: health + streaming ---
 # grpc.health.v1.Health service. K8s readiness probes hit this.
@@ -325,7 +325,7 @@ tonic-health = "0.14"
 tonic-web = "0.14"
 # CORS for the gRPC-Web listener — configurable allow-origins so the
 # dashboard SPA (different origin) can call the scheduler directly.
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 # Streaming decode for upstream-substituter NAR fetch
 # (rio-store::substitute). O(chunk) pipeline, never buffers whole NAR.
 # Feature set matches reference Nix's libutil/compression.cc so any
@@ -403,7 +403,7 @@ parking_lot = "0.12"
 # Dense linear algebra for the NNLS (non-negative least squares) solver
 # that fits mem=M(cores) per (pname,system) key. default-features off drops
 # rand/serde/macros — we only need DMatrix/DVector + decompositions.
-nalgebra = { version = "0.34", default-features = false, features = ["std"] }
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 # Normal/Student-t CDF + quantile functions (Φ, Φ⁻¹, t.ppf) for the SLA
 # quantile bounds. Replaces statrs (no release since 2024; its default
 # features dragged a second nalgebra plus rand 0.8 for multivariate/
@@ -456,7 +456,7 @@ xshell = "0.2"
 # detection for the ECR image tag. status/dirwalk covers both tracked
 # changes and untracked files (the push script hashes `git diff HEAD` +
 # `git status --porcelain`).
-gix = { version = "0.83", default-features = false, features = [
+gix = { version = "0.84", default-features = false, features = [
   "basic",
   "dirwalk",
   "revision",

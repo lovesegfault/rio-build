@@ -60,9 +60,9 @@
     },
     "aead": {
       "crateName": "aead",
-      "version": "0.6.0-rc.10",
+      "version": "0.6.1",
       "edition": "2024",
-      "sha256": "1zj3j31wxvpf0pd6f6bdq5kdik2ql1k7p2ga613v1ill4xvpwrbb",
+      "sha256": "16acx2vq8lfwr6v8yhg1q7cggrr8ih41ykp7a3srrbrd3aycywqr",
       "source": {
         "type": "crates-io"
       },
@@ -74,7 +74,7 @@
         },
         {
           "name": "inout",
-          "packageId": "inout 0.2.2"
+          "packageId": "inout"
         }
       ],
       "libCrateTypes": [
@@ -86,9 +86,9 @@
     },
     "aes": {
       "crateName": "aes",
-      "version": "0.9.0",
+      "version": "0.9.1",
       "edition": "2024",
-      "sha256": "1y5fmmr0ifj7cx5ck04vsw1r51wps1qg6h313i1w0i5n6akjkgb6",
+      "sha256": "0f71l2rwx3jdghbrgvjppz2x1jcfvpzx8rn40r2idjf4xbm7dz7i",
       "source": {
         "type": "crates-io"
       },
@@ -123,9 +123,9 @@
     },
     "aes-gcm": {
       "crateName": "aes-gcm",
-      "version": "0.11.0-rc.3",
+      "version": "0.11.0-rc.4",
       "edition": "2024",
-      "sha256": "0wprf41k43wx8n4ylz0zzkb850qz3bjappd97iyggm78pf80qb72",
+      "sha256": "1y52c8f6sb9wngchbml0al3ss15q4ns79bgcmm2g224126f9336s",
       "source": {
         "type": "crates-io"
       },
@@ -258,9 +258,9 @@
     },
     "alloc-stdlib": {
       "crateName": "alloc-stdlib",
-      "version": "0.2.2",
+      "version": "0.2.4",
       "edition": "2015",
-      "sha256": "1kkfbld20ab4165p29v172h8g0wvq8i06z8vnng14whw0isq5ywl",
+      "sha256": "159iyap790nflvdhl1gbkxp9l5w4x7qp5ybg01wx490jx4cs0xhf",
       "source": {
         "type": "crates-io"
       },
@@ -915,9 +915,9 @@
     },
     "aws-config": {
       "crateName": "aws-config",
-      "version": "1.8.17",
+      "version": "1.8.18",
       "edition": "2021",
-      "sha256": "18ipmp36k6xyq72fdr6s5x0jh8rpq7hsbnnn4gp1b45xv1ia0yji",
+      "sha256": "0x92d2l341y1il88srz9vhqg4raq5r9l7mc0nc1rr2d3fddq2gz3",
       "source": {
         "type": "crates-io"
       },
@@ -988,7 +988,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "sha1",
@@ -1144,9 +1144,9 @@
     },
     "aws-runtime": {
       "crateName": "aws-runtime",
-      "version": "1.7.4",
+      "version": "1.7.5",
       "edition": "2021",
-      "sha256": "0rhmf8r3m0mv1wcjq9mlh2bixxv3wrzn85czmn827p6jaa68xvbp",
+      "sha256": "0ffb1kx742a74i2sx0k79zp4rqfgc1v2ma2lnxadv2592vi9v6vc",
       "source": {
         "type": "crates-io"
       },
@@ -1206,7 +1206,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -1251,13 +1251,17 @@
     },
     "aws-sdk-ec2": {
       "crateName": "aws-sdk-ec2",
-      "version": "1.227.0",
+      "version": "1.232.1",
       "edition": "2021",
-      "sha256": "01a5d5wvglv1bfhvkc71l9j32pp6xxc5p1xbzf8pnh47y7w2swjy",
+      "sha256": "084gcpli7cwic94s57hgdsi6s3jjgm2hc5zyghy2mzjmhhvsjcjr",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
         {
           "name": "aws-credential-types",
           "packageId": "aws-credential-types"
@@ -1316,7 +1320,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -1343,13 +1347,17 @@
     },
     "aws-sdk-ecr": {
       "crateName": "aws-sdk-ecr",
-      "version": "1.116.0",
+      "version": "1.120.0",
       "edition": "2021",
-      "sha256": "0aypr6db2ahrzn487lcsahd54yv4agzwrhwalcbjfz3p5l8d27p7",
+      "sha256": "1frkn5ifiq88c131w59ivf3g0zfy60grk2llmnnxl2xzj056xvd3",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
         {
           "name": "aws-credential-types",
           "packageId": "aws-credential-types"
@@ -1404,7 +1412,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -1430,13 +1438,17 @@
     },
     "aws-sdk-elasticloadbalancingv2": {
       "crateName": "aws-sdk-elasticloadbalancingv2",
-      "version": "1.112.0",
+      "version": "1.116.0",
       "edition": "2021",
-      "sha256": "050d7v65ylbic7xzsm54zf7k34syjrqyfwcr9mbpmmm811b4bhi5",
+      "sha256": "1jg5756z9f2nq2db5ayz0i4d1yd9xxrs881mw764xr6hidvp165b",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
         {
           "name": "aws-credential-types",
           "packageId": "aws-credential-types"
@@ -1495,7 +1507,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -1521,13 +1533,17 @@
     },
     "aws-sdk-s3": {
       "crateName": "aws-sdk-s3",
-      "version": "1.133.0",
+      "version": "1.137.0",
       "edition": "2021",
-      "sha256": "08lry6cn2bwk007ig65wfnc5jv51cjdamiww34zaih73hllvlyi3",
+      "sha256": "0x28bi5akhqx1nfzmn7wrms1n3f3g0xl007i5wwgjbsfk49p5pf2",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
         {
           "name": "aws-credential-types",
           "packageId": "aws-credential-types"
@@ -1606,7 +1622,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -1656,13 +1672,17 @@
     },
     "aws-sdk-sso": {
       "crateName": "aws-sdk-sso",
-      "version": "1.99.0",
+      "version": "1.102.0",
       "edition": "2021",
-      "sha256": "0iabn2h7jisrc747b4l004b6qc6fzyzrn3fwmdjc4blv17k5ah4z",
+      "sha256": "0fs9zlvfxgwkd2bj3ppxdcl3wqvl2r9sgqxcyxa1hhzi36nb70lc",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
         {
           "name": "aws-credential-types",
           "packageId": "aws-credential-types"
@@ -1717,7 +1737,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -1739,13 +1759,17 @@
     },
     "aws-sdk-ssooidc": {
       "crateName": "aws-sdk-ssooidc",
-      "version": "1.101.0",
+      "version": "1.104.0",
       "edition": "2021",
-      "sha256": "166md0xcpbjdg6jvfha0dxrgb2diqpfb9msz8abddic40ax0kw02",
+      "sha256": "04qrgx1g0y8rmmlnkcnr4a9k5mzg2bv6fcgpfgjrwlf5nk90041j",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
         {
           "name": "aws-credential-types",
           "packageId": "aws-credential-types"
@@ -1800,7 +1824,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -1822,13 +1846,17 @@
     },
     "aws-sdk-sts": {
       "crateName": "aws-sdk-sts",
-      "version": "1.104.0",
+      "version": "1.107.0",
       "edition": "2021",
-      "sha256": "114z5hpsxd1slmj38d28rlvcfwa7vn2j0mlhnrv6m7p1k0kn59ka",
+      "sha256": "0q55z0igasvss49pz391z8jy6d9xinwj77rwzbn27bv2m65k439x",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
         {
           "name": "aws-credential-types",
           "packageId": "aws-credential-types"
@@ -1887,7 +1915,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -1914,9 +1942,9 @@
     },
     "aws-sigv4": {
       "crateName": "aws-sigv4",
-      "version": "1.4.4",
+      "version": "1.4.5",
       "edition": "2021",
-      "sha256": "19g9xxhyqfmlcwb5zb7lg5ld74l7zilqmgzzcnn7915k32wky25p",
+      "sha256": "0wfw30j8i97xh0gachpgvzpm6g0ji9x4xhhg07kzw3xfpq98bqxs",
       "source": {
         "type": "crates-io"
       },
@@ -1968,7 +1996,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "p256",
@@ -2079,7 +2107,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -2122,9 +2150,9 @@
     },
     "aws-smithy-eventstream": {
       "crateName": "aws-smithy-eventstream",
-      "version": "0.60.20",
+      "version": "0.60.21",
       "edition": "2021",
-      "sha256": "0j3m3n6alyrqjmrack36g8v3wc2rrnihb99dfsw7cbz3wms9vw7s",
+      "sha256": "01mpwv1wx02fljvwdchjn4aqdcvky50ilbm2hv2lgspwclg3kn3q",
       "source": {
         "type": "crates-io"
       },
@@ -2189,7 +2217,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -2232,9 +2260,9 @@
     },
     "aws-smithy-http-client": {
       "crateName": "aws-smithy-http-client",
-      "version": "1.1.12",
+      "version": "1.1.13",
       "edition": "2021",
-      "sha256": "0sgpqnkznfd468d439krf7xg91qr3059v2cb09iz5rpfgxd1cbva",
+      "sha256": "1lyjbnn2qs7a87fy0i4qh68604gk8zw5chjvlnk8mjfi3a9zhgjw",
       "source": {
         "type": "crates-io"
       },
@@ -2266,7 +2294,7 @@
         },
         {
           "name": "h2",
-          "packageId": "h2 0.4.14"
+          "packageId": "h2 0.4.15"
         },
         {
           "name": "http",
@@ -2275,7 +2303,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -2295,7 +2323,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-rustls",
@@ -2351,6 +2379,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "__rustls",
         "default-client",
         "hyper-014",
         "legacy-test-util",
@@ -2366,9 +2395,9 @@
     },
     "aws-smithy-json": {
       "crateName": "aws-smithy-json",
-      "version": "0.62.6",
+      "version": "0.62.7",
       "edition": "2021",
-      "sha256": "1xgazg8jas91jvrwksk8w6rbpfrrn668h0iybbf4maqqbwh8jw2i",
+      "sha256": "1yigf0gp5cypmg8vnrx4xsgw6in7cy38jjhi3s8jmrcp8xzr86kh",
       "source": {
         "type": "crates-io"
       },
@@ -2417,7 +2446,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         }
       ],
       "libCrateTypes": [
@@ -2593,7 +2622,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -2649,9 +2678,9 @@
     },
     "aws-smithy-runtime-api": {
       "crateName": "aws-smithy-runtime-api",
-      "version": "1.12.1",
+      "version": "1.12.3",
       "edition": "2021",
-      "sha256": "0ckcfypk6fgqk5wifwnignnsf9mcx40gcj9z18macffgkqbpq4fw",
+      "sha256": "130fzrbh0y4j3bhlwfay0r9czaq7r54gbz5fw6ggp2mslvd7gccx",
       "source": {
         "type": "crates-io"
       },
@@ -2679,7 +2708,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -2761,7 +2790,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         }
       ],
       "libCrateTypes": [
@@ -2773,9 +2802,9 @@
     },
     "aws-smithy-types": {
       "crateName": "aws-smithy-types",
-      "version": "1.4.8",
+      "version": "1.5.0",
       "edition": "2021",
-      "sha256": "02q5lklvlnyxz876b7a760sqm3xm5r0bn19b3q6cr09grvdncsq5",
+      "sha256": "11dbbyl72fxw8n7a2mb93ilyra28chprmb0gl5fdhn8j6k7jzd1j",
       "source": {
         "type": "crates-io"
       },
@@ -2802,7 +2831,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0",
+          "packageId": "http 1.4.2",
           "rename": "http_1x"
         },
         {
@@ -2969,7 +2998,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -2981,7 +3010,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-util",
@@ -3088,7 +3117,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -3422,9 +3451,9 @@
     },
     "bitflags": {
       "crateName": "bitflags",
-      "version": "2.11.1",
+      "version": "2.13.0",
       "edition": "2021",
-      "sha256": "1cvqijg3rvwgis20a66vfdxannjsxfy5fgjqkaq3l13gyfcj4lf4",
+      "sha256": "1y239gpvl061rfvav7jds8mjs42kmwi39is7yx5d1qw3hvp8nf5l",
       "source": {
         "type": "crates-io"
       },
@@ -3537,11 +3566,11 @@
         "RustCrypto Developers"
       ]
     },
-    "block-buffer 0.12.0": {
+    "block-buffer 0.12.1": {
       "crateName": "block-buffer",
-      "version": "0.12.0",
+      "version": "0.12.1",
       "edition": "2024",
-      "sha256": "1glh8w49a7cj0wlkalyn9j605jzf2ss0lg8dqq5xh8cr2q451lyd",
+      "sha256": "1ak0cvmxz3yifqmzv6aba9606brsz7d5g3piv5xdcvjsx7dwgxnj",
       "source": {
         "type": "crates-io"
       },
@@ -3565,31 +3594,7 @@
         "RustCrypto Developers"
       ]
     },
-    "block-padding 0.3.3": {
-      "crateName": "block-padding",
-      "version": "0.3.3",
-      "edition": "2021",
-      "sha256": "14wdad0r1qk5gmszxqd8cky6vx8qg7c153jv981mixzrpzmlz2d8",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "generic-array",
-          "packageId": "generic-array 0.14.9"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "block-padding 0.4.2": {
+    "block-padding": {
       "crateName": "block-padding",
       "version": "0.4.2",
       "edition": "2024",
@@ -3640,9 +3645,9 @@
     },
     "brotli": {
       "crateName": "brotli",
-      "version": "8.0.2",
+      "version": "8.0.4",
       "edition": "2015",
-      "sha256": "0q25r00z3gm5wzvv4vfxvlx5zjb8i4jwyznrvdcp7abs7ihbkn2b",
+      "sha256": "1cv6f4hdivllg34slvbwy645p1zidbxwpp1vh8jiwyha0sn1mjaw",
       "source": {
         "type": "crates-io"
       },
@@ -3675,9 +3680,9 @@
     },
     "brotli-decompressor": {
       "crateName": "brotli-decompressor",
-      "version": "5.0.0",
+      "version": "5.0.3",
       "edition": "2015",
-      "sha256": "00yyswj1rj20ma4wr4wcci4r9ywlgvxa87nqsv5rik5y588vhjw7",
+      "sha256": "10rm4pyqnznh192nzsjl4dh6bjgzglsadcl676y6f6gy2nnaqcis",
       "source": {
         "type": "crates-io"
       },
@@ -3804,9 +3809,9 @@
     },
     "bytes": {
       "crateName": "bytes",
-      "version": "1.11.1",
+      "version": "1.12.0",
       "edition": "2021",
-      "sha256": "0czwlhbq8z29wq0ia87yass2mzy1y0jcasjb8ghriiybnwrqfx0y",
+      "sha256": "14xmxm8imyvw675bsgyadmzm9k63js1sdqh7099p0hlj2p9zbqwa",
       "source": {
         "type": "crates-io"
       },
@@ -3957,9 +3962,9 @@
     },
     "cc": {
       "crateName": "cc",
-      "version": "1.2.62",
+      "version": "1.2.64",
       "edition": "2018",
-      "sha256": "164zsxcy2zzvbbh1qpbrsssz8kmria41j4agih47sal3y1cyip51",
+      "sha256": "07shcd8faxw7csz13m3cg2mj6i8z07pqs960k181pscbjpyqgn6s",
       "source": {
         "type": "crates-io"
       },
@@ -4068,9 +4073,9 @@
     },
     "chrono": {
       "crateName": "chrono",
-      "version": "0.4.44",
+      "version": "0.4.45",
       "edition": "2021",
-      "sha256": "1c64mk9a235271j5g3v4zrzqqmd43vp9vki7vqfllpqf5rd0fwy6",
+      "sha256": "09rkcgk6is2sdhqs9142zv8xqnj8ryx8m9hknllqwyv9wxi9x9qs",
       "source": {
         "type": "crates-io"
       },
@@ -4211,7 +4216,7 @@
       "dependencies": [
         {
           "name": "block-buffer",
-          "packageId": "block-buffer 0.12.0"
+          "packageId": "block-buffer 0.12.1"
         },
         {
           "name": "crypto-common",
@@ -4220,7 +4225,7 @@
         },
         {
           "name": "inout",
-          "packageId": "inout 0.2.2"
+          "packageId": "inout"
         },
         {
           "name": "zeroize",
@@ -4427,9 +4432,9 @@
     },
     "cmov": {
       "crateName": "cmov",
-      "version": "0.5.3",
+      "version": "0.5.4",
       "edition": "2024",
-      "sha256": "0ipp2fzpcz2z9l4ywks98bd1viwpw81lfd5pdj3sdi0z04ys921z",
+      "sha256": "0yh22sqdvcdrfbhvnja4kaq5dyklpb4s70w5r6rplfdw4jna17hc",
       "source": {
         "type": "crates-io"
       },
@@ -4634,9 +4639,9 @@
     },
     "config": {
       "crateName": "config",
-      "version": "0.15.23",
+      "version": "0.15.24",
       "edition": "2024",
-      "sha256": "1n3j5b3y572d8ji994q7f0js6v2ci8k1bkcyjihvwf1dgciwc5pk",
+      "sha256": "1w44gzn6kjvyj4ixicli5hzgs3lm2rfzf94pp203bws5f4ix0d0b",
       "source": {
         "type": "crates-io"
       },
@@ -5186,11 +5191,11 @@
         "RustCrypto Developers"
       ]
     },
-    "crypto-bigint 0.7.3": {
+    "crypto-bigint 0.7.4": {
       "crateName": "crypto-bigint",
-      "version": "0.7.3",
+      "version": "0.7.4",
       "edition": "2024",
-      "sha256": "1hr7gmly24lxiz48ds7d8v63sxkn2ia4868j1kxbwj2k4imx5822",
+      "sha256": "0lb4d2n55zbkjznp6zzbnykzkdqxw1ymm2by9r6gh41vbs2lmfwp",
       "source": {
         "type": "crates-io"
       },
@@ -5205,7 +5210,7 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2"
+          "packageId": "getrandom 0.4.3"
         },
         {
           "name": "hybrid-array",
@@ -5283,7 +5288,7 @@
       "dependencies": [
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2"
+          "packageId": "getrandom 0.4.3"
         },
         {
           "name": "hybrid-array",
@@ -5308,20 +5313,16 @@
     },
     "crypto-primes": {
       "crateName": "crypto-primes",
-      "version": "0.7.0",
+      "version": "0.7.2",
       "edition": "2024",
-      "sha256": "0npygycghyljq7jk1vsqnb7a968z6p0dki7hlyyws93xvqiizx11",
+      "sha256": "13ygy2rrp7dicc4lmj01744y8hfjhfyr99pa9ymbp7n674daacrn",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
         {
           "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3"
-        },
-        {
-          "name": "libm",
-          "packageId": "libm"
+          "packageId": "crypto-bigint 0.7.4"
         },
         {
           "name": "rand_core",
@@ -5383,9 +5384,9 @@
     },
     "curve25519-dalek": {
       "crateName": "curve25519-dalek",
-      "version": "5.0.0-pre.6",
+      "version": "5.0.0-rc.0",
       "edition": "2024",
-      "sha256": "1hwzbl3xay0nrgrd6wcxkkifv98qb765lvvb20a7l4s1y93ijprk",
+      "sha256": "1gr414mq4zww4l7bm3qaqrj1in6c5gzk7n8zkrsvvrw5r849wdag",
       "source": {
         "type": "crates-io"
       },
@@ -5396,7 +5397,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures 0.2.17",
+          "packageId": "cpufeatures 0.3.0",
           "target": "cfg(target_arch = \"x86_64\")"
         },
         {
@@ -5805,17 +5806,12 @@
       },
       "dependencies": [
         {
-          "name": "powerfmt",
-          "packageId": "powerfmt"
-        },
-        {
           "name": "serde_core",
           "packageId": "serde_core"
         }
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "powerfmt",
         "serde"
       ],
       "libCrateTypes": [
@@ -5982,7 +5978,7 @@
       "dependencies": [
         {
           "name": "block-buffer",
-          "packageId": "block-buffer 0.12.0"
+          "packageId": "block-buffer 0.12.1"
         },
         {
           "name": "const-oid",
@@ -6014,9 +6010,9 @@
     },
     "displaydoc": {
       "crateName": "displaydoc",
-      "version": "0.2.5",
+      "version": "0.2.6",
       "edition": "2021",
-      "sha256": "1q0alair462j21iiqwrr21iabkfnb13d6x5w95lkdg21q2xrqdlp",
+      "sha256": "0kyxwfbdmagd8afzb2pzja7wj8dhah7smxdsgw00iq8pa2jhmiqs",
       "source": {
         "type": "crates-io"
       },
@@ -6180,7 +6176,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.33"
         },
         {
           "name": "rfc6979",
@@ -6250,9 +6246,9 @@
     },
     "ed25519-dalek": {
       "crateName": "ed25519-dalek",
-      "version": "3.0.0-pre.7",
+      "version": "3.0.0-rc.0",
       "edition": "2024",
-      "sha256": "1djb9l1sn3s00z2qx8rp5rgz5rqzdnsvr8nawld9hq5nak6rli10",
+      "sha256": "0q3xw8k3viqwp2skx3r7zzzyjkvpcvpsy421bdb6aiphwh7if4dh",
       "source": {
         "type": "crates-io"
       },
@@ -6388,7 +6384,7 @@
         },
         {
           "name": "ff",
-          "packageId": "ff"
+          "packageId": "ff 0.13.1"
         },
         {
           "name": "generic-array",
@@ -6396,7 +6392,7 @@
         },
         {
           "name": "group",
-          "packageId": "group"
+          "packageId": "group 0.13.0"
         },
         {
           "name": "pem-rfc7468",
@@ -6442,11 +6438,11 @@
         "RustCrypto Developers"
       ]
     },
-    "elliptic-curve 0.14.0-rc.32": {
+    "elliptic-curve 0.14.0-rc.33": {
       "crateName": "elliptic-curve",
-      "version": "0.14.0-rc.32",
+      "version": "0.14.0-rc.33",
       "edition": "2024",
-      "sha256": "1ajplymdl6nqwfc5m4acj0pyw3b5y2vcppkaf3lpahjw68qlzafd",
+      "sha256": "0df9mxzyz8nsi3f8q9zvzybra68phgbcwp1wc5cvbn0dsd1kcb8h",
       "source": {
         "type": "crates-io"
       },
@@ -6457,7 +6453,7 @@
         },
         {
           "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3",
+          "packageId": "crypto-bigint 0.7.4",
           "rename": "bigint"
         },
         {
@@ -6468,6 +6464,14 @@
         {
           "name": "digest",
           "packageId": "digest 0.11.3"
+        },
+        {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
+        },
+        {
+          "name": "group",
+          "packageId": "group 0.14.0"
         },
         {
           "name": "hkdf",
@@ -6489,16 +6493,6 @@
         {
           "name": "rand_core",
           "packageId": "rand_core 0.10.1"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff",
-          "rename": "ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group",
-          "rename": "group"
         },
         {
           "name": "sec1",
@@ -6959,7 +6953,7 @@
         "Stjepan Glavina <stjepang@gmail.com>"
       ]
     },
-    "ff": {
+    "ff 0.13.1": {
       "crateName": "ff",
       "version": "0.13.1",
       "edition": "2021",
@@ -6971,6 +6965,35 @@
         {
           "name": "rand_core",
           "packageId": "rand_core 0.6.4"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sean Bowe <ewillbefull@gmail.com>",
+        "Jack Grigg <thestr4d@gmail.com>"
+      ]
+    },
+    "ff 0.14.0": {
+      "crateName": "ff",
+      "version": "0.14.0",
+      "edition": "2021",
+      "sha256": "17s889wpzi2dp924bnxhznkbm44lp23nqv4g32phxyx9jamqdxm1",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "rand_core",
+          "packageId": "rand_core 0.10.1"
         },
         {
           "name": "subtle",
@@ -7629,9 +7652,9 @@
     },
     "generator": {
       "crateName": "generator",
-      "version": "0.8.8",
+      "version": "0.8.9",
       "edition": "2021",
-      "sha256": "1ybcxxz9vdh7nyh9q5654zv5q790b63a83w0zrv0r8id2pj4mw2j",
+      "sha256": "1bhk2m8alf9nfmmq2y2whyriigppgjnzrchq7yix3sl4wnq59f5k",
       "source": {
         "type": "crates-io"
       },
@@ -7713,11 +7736,11 @@
         "Aaron Trent <novacrazy@gmail.com>"
       ]
     },
-    "generic-array 1.4.1": {
+    "generic-array 1.4.3": {
       "crateName": "generic-array",
-      "version": "1.4.1",
+      "version": "1.4.3",
       "edition": "2021",
-      "sha256": "0jd6ml1i630hb2k5q13dli2jn7l53d05cyzyw5v35acpiqcfkffs",
+      "sha256": "0lcklxh41rkri8pwjaxmcrq8xjazwkzmbrp2zc7c1sghvhb5zrf2",
       "source": {
         "type": "crates-io"
       },
@@ -7879,11 +7902,11 @@
         "The Rand Project Developers"
       ]
     },
-    "getrandom 0.4.2": {
+    "getrandom 0.4.3": {
       "crateName": "getrandom",
-      "version": "0.4.2",
+      "version": "0.4.3",
       "edition": "2024",
-      "sha256": "0mb5833hf9pvn9dhvxjgfg5dx0m77g8wavvjdpvpnkp9fil1xr8d",
+      "sha256": "16b0202fkdwz3p2cyll82dv24ljbn0wiyy829v4lwbkbflyqh3ih",
       "source": {
         "type": "crates-io"
       },
@@ -7891,6 +7914,11 @@
         {
           "name": "cfg-if",
           "packageId": "cfg-if"
+        },
+        {
+          "name": "js-sys",
+          "packageId": "js-sys",
+          "target": "cfg(all(target_family = \"wasm\", any(target_os = \"unknown\", target_os = \"none\"), target_feature = \"atomics\"))"
         },
         {
           "name": "libc",
@@ -7942,19 +7970,15 @@
           "packageId": "rand_core 0.10.1"
         },
         {
-          "name": "wasip2",
-          "packageId": "wasip2",
-          "target": "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p2\"))"
-        },
-        {
-          "name": "wasip3",
-          "packageId": "wasip3",
-          "target": "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p3\"))"
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen",
+          "target": "cfg(all(target_family = \"wasm\", any(target_os = \"unknown\", target_os = \"none\")))"
         }
       ],
       "resolvedDefaultFeatures": [
         "std",
-        "sys_rng"
+        "sys_rng",
+        "wasm_js"
       ],
       "libCrateTypes": [
         "lib"
@@ -8002,9 +8026,9 @@
     },
     "gix": {
       "crateName": "gix",
-      "version": "0.83.0",
-      "edition": "2021",
-      "sha256": "0ry5p6q7fra7nq6lc4yhlkwc6ah41bgi2c0dbnfj99j6p40j1rbc",
+      "version": "0.84.0",
+      "edition": "2024",
+      "sha256": "1kprx2yxg5qsh09mwn7xkgnlygz6lrf3ppcmilzkqnhspl7awm5f",
       "source": {
         "type": "crates-io"
       },
@@ -8205,9 +8229,9 @@
     },
     "gix-actor": {
       "crateName": "gix-actor",
-      "version": "0.41.0",
-      "edition": "2021",
-      "sha256": "1n3ygfmw35qb8d4gb3zabyqxvk7inp4g6kjxn4s4fwc37dkica97",
+      "version": "0.41.1",
+      "edition": "2024",
+      "sha256": "03w2lz39wy827zns29wcblbdkkljnxiqml2haibaipa6yyw9ijcb",
       "source": {
         "type": "crates-io"
       },
@@ -8224,46 +8248,6 @@
           "name": "gix-error",
           "packageId": "gix-error"
         }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sebastian Thiel <sebastian.thiel@icloud.com>"
-      ]
-    },
-    "gix-archive": {
-      "crateName": "gix-archive",
-      "version": "0.32.0",
-      "edition": "2021",
-      "sha256": "0hlk25mkkafss6qlg5k8rizsn3bhmigf1rb0rga3hcvk9cjfq84s",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "bstr",
-          "packageId": "bstr"
-        },
-        {
-          "name": "gix-date",
-          "packageId": "gix-date"
-        },
-        {
-          "name": "gix-error",
-          "packageId": "gix-error"
-        },
-        {
-          "name": "gix-object",
-          "packageId": "gix-object"
-        },
-        {
-          "name": "gix-worktree-stream",
-          "packageId": "gix-worktree-stream"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "sha1"
       ],
       "libCrateTypes": [
         "lib"
@@ -8274,9 +8258,9 @@
     },
     "gix-attributes": {
       "crateName": "gix-attributes",
-      "version": "0.33.0",
-      "edition": "2021",
-      "sha256": "00300iwf1hxzb0x625l0c1kzzkahx8i347dafqafzwmnq2hwa5zy",
+      "version": "0.33.1",
+      "edition": "2024",
+      "sha256": "00lx9kw0pjg65fw6qn3g9iy2pdm4qidc33sccbngffvd4hpg2hwd",
       "source": {
         "type": "crates-io"
       },
@@ -8327,9 +8311,9 @@
     },
     "gix-bitmap": {
       "crateName": "gix-bitmap",
-      "version": "0.3.1",
-      "edition": "2021",
-      "sha256": "150qmgf9jl6sxxwjv93c7s0z4n8b95d31k0y6i72jlk8xivzrjqy",
+      "version": "0.3.2",
+      "edition": "2024",
+      "sha256": "10qjqn9nzzvdiylcxdsffl87jyvasny7nwlyci3mfc5d4q6fzssj",
       "source": {
         "type": "crates-io"
       },
@@ -8343,83 +8327,14 @@
         "lib"
       ],
       "authors": [
-        "Sebastian Thiel <sebastian.thiel@icloud.com>"
-      ]
-    },
-    "gix-blame": {
-      "crateName": "gix-blame",
-      "version": "0.13.0",
-      "edition": "2021",
-      "sha256": "02na0bgcpkvm1pdr8i59mzkp8wljpz1rfwzd3mkajm5b8alvknhl",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "gix-commitgraph",
-          "packageId": "gix-commitgraph"
-        },
-        {
-          "name": "gix-date",
-          "packageId": "gix-date"
-        },
-        {
-          "name": "gix-diff",
-          "packageId": "gix-diff"
-        },
-        {
-          "name": "gix-error",
-          "packageId": "gix-error"
-        },
-        {
-          "name": "gix-hash",
-          "packageId": "gix-hash"
-        },
-        {
-          "name": "gix-object",
-          "packageId": "gix-object"
-        },
-        {
-          "name": "gix-revwalk",
-          "packageId": "gix-revwalk"
-        },
-        {
-          "name": "gix-trace",
-          "packageId": "gix-trace"
-        },
-        {
-          "name": "gix-traverse",
-          "packageId": "gix-traverse"
-        },
-        {
-          "name": "gix-worktree",
-          "packageId": "gix-worktree"
-        },
-        {
-          "name": "smallvec",
-          "packageId": "smallvec"
-        },
-        {
-          "name": "thiserror",
-          "packageId": "thiserror"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Christoph Rüßler <christoph.ruessler@mailbox.org>",
         "Sebastian Thiel <sebastian.thiel@icloud.com>"
       ]
     },
     "gix-chunk": {
       "crateName": "gix-chunk",
-      "version": "0.7.1",
-      "edition": "2021",
-      "sha256": "0823fs8izb9kgrr6hvvqhhylkq9b56m1yxq3vqqp5zk0kfz8iwpd",
+      "version": "0.7.2",
+      "edition": "2024",
+      "sha256": "1yraqlp07fcas4dx9wc4hmn4ngmd0r4ml9syvn6yaf5n8dwy9blz",
       "source": {
         "type": "crates-io"
       },
@@ -8438,9 +8353,9 @@
     },
     "gix-command": {
       "crateName": "gix-command",
-      "version": "0.9.0",
-      "edition": "2021",
-      "sha256": "1n44fcz36dj067hl7kgd0bi2z4wh7lglnvc6bkbl7ghsa4356cw6",
+      "version": "0.9.1",
+      "edition": "2024",
+      "sha256": "1xhqj78qgj6bjr18cyv9my5xl374ds623mc02sqg8phkxx7nsw00",
       "source": {
         "type": "crates-io"
       },
@@ -8475,9 +8390,9 @@
     },
     "gix-commitgraph": {
       "crateName": "gix-commitgraph",
-      "version": "0.37.0",
-      "edition": "2021",
-      "sha256": "1srjkpy20ihq2p62246pxd9amjmgxpp9l8hx4s6046afyah5lfzy",
+      "version": "0.37.1",
+      "edition": "2024",
+      "sha256": "1frafvbz653dydj0afrjq13xk2gl38qnzgb4gsjgd9w4yh6msrvz",
       "source": {
         "type": "crates-io"
       },
@@ -8507,9 +8422,6 @@
           "packageId": "nonempty"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -8520,9 +8432,9 @@
     },
     "gix-config": {
       "crateName": "gix-config",
-      "version": "0.56.0",
-      "edition": "2021",
-      "sha256": "046l2kjif5cy7i59a0gh47grdbj6zn7dxwa1pbv6f76jxf5880cc",
+      "version": "0.57.0",
+      "edition": "2024",
+      "sha256": "1pk3krwwf5z9n1zdajqqy281ip2ysawwll6iwwqq98lwnka748sg",
       "source": {
         "type": "crates-io"
       },
@@ -8568,9 +8480,6 @@
           "packageId": "unicode-bom"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -8580,9 +8489,9 @@
     },
     "gix-config-value": {
       "crateName": "gix-config-value",
-      "version": "0.18.0",
-      "edition": "2021",
-      "sha256": "1cn42rs1hv7fgp7z00b2wpwdk640mi5vk7vz2lxhmhg4kv9rxcqk",
+      "version": "0.18.1",
+      "edition": "2024",
+      "sha256": "1axsw5zvajcaff1kddgd9gc4b78r0k0nb5phblp6qbsm561ichpd",
       "source": {
         "type": "crates-io"
       },
@@ -8618,9 +8527,9 @@
     },
     "gix-date": {
       "crateName": "gix-date",
-      "version": "0.15.3",
-      "edition": "2021",
-      "sha256": "0hqmsj3dz8mfcc9b6dmnp5dzng6h5hnsmcyrwcv423sbxgjdlk5r",
+      "version": "0.15.4",
+      "edition": "2024",
+      "sha256": "135llqpx4jnr1bbjnpxr95ylm5rwbvmak419w3wckflbm5japv53",
       "source": {
         "type": "crates-io"
       },
@@ -8640,10 +8549,6 @@
         {
           "name": "jiff",
           "packageId": "jiff"
-        },
-        {
-          "name": "smallvec",
-          "packageId": "smallvec"
         }
       ],
       "libCrateTypes": [
@@ -8655,9 +8560,9 @@
     },
     "gix-diff": {
       "crateName": "gix-diff",
-      "version": "0.63.0",
-      "edition": "2021",
-      "sha256": "0alqll7bb0kvvq5r21703mg68ml034phbazymwj5zzwi3bxf026w",
+      "version": "0.64.0",
+      "edition": "2024",
+      "sha256": "0arhqd3n14wr83jdj65vvm2gr8753z01m6pkxprcx51dycl9av9v",
       "source": {
         "type": "crates-io"
       },
@@ -8730,8 +8635,7 @@
       ],
       "resolvedDefaultFeatures": [
         "blob",
-        "index",
-        "sha1"
+        "index"
       ],
       "libCrateTypes": [
         "lib"
@@ -8742,9 +8646,9 @@
     },
     "gix-dir": {
       "crateName": "gix-dir",
-      "version": "0.25.0",
-      "edition": "2021",
-      "sha256": "0v13yn59pai70hr2ar8s8qpq43yrfrlnc4x3y35k1r71x43gr81j",
+      "version": "0.26.0",
+      "edition": "2024",
+      "sha256": "1wd9963r71y9lz77s6brplapmpl7d1dzn2zdk727x4gxlr9jmfr1",
       "source": {
         "type": "crates-io"
       },
@@ -8798,9 +8702,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -8810,9 +8711,9 @@
     },
     "gix-discover": {
       "crateName": "gix-discover",
-      "version": "0.51.0",
-      "edition": "2021",
-      "sha256": "0d5dpicvic1qkz99z1mwana73m316xdvwkmj08bqls0ya1m2x18p",
+      "version": "0.52.0",
+      "edition": "2024",
+      "sha256": "1xr4p098lp0y33ij6yhs9rjy95cr64pqric0i8bx4ybq5g8wvfkp",
       "source": {
         "type": "crates-io"
       },
@@ -8847,9 +8748,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -8859,9 +8757,9 @@
     },
     "gix-error": {
       "crateName": "gix-error",
-      "version": "0.2.3",
-      "edition": "2021",
-      "sha256": "04q6265dm3xasfah2jlh25378m783572xvgwrpy29dvafiqvj1z2",
+      "version": "0.2.4",
+      "edition": "2024",
+      "sha256": "0sxhk12wb9kwiz6f59n9kv0798fqpsd4aznd1pwhlj5yk7hk2y75",
       "source": {
         "type": "crates-io"
       },
@@ -8880,9 +8778,9 @@
     },
     "gix-features": {
       "crateName": "gix-features",
-      "version": "0.48.0",
-      "edition": "2021",
-      "sha256": "0kywgwq14b74997g52wf9zikik4wpqn5nk3bqsid0cskmn9mcdxg",
+      "version": "0.48.1",
+      "edition": "2024",
+      "sha256": "1g1dlpxvkz87waa5v1q6wqzckqrq3s3zl55yhlql1g1q9laswj8q",
       "source": {
         "type": "crates-io"
       },
@@ -8962,9 +8860,9 @@
     },
     "gix-filter": {
       "crateName": "gix-filter",
-      "version": "0.30.0",
-      "edition": "2021",
-      "sha256": "021srvpgvnd9aysf3jahjxvvsrd30wcvk394bmhrng35x7digjfs",
+      "version": "0.31.0",
+      "edition": "2024",
+      "sha256": "1yh9rrnvs1qqczqp8dkl0mqriiz03g279404lgj4qsgn2rylpxzc",
       "source": {
         "type": "crates-io"
       },
@@ -9022,9 +8920,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -9034,9 +8929,9 @@
     },
     "gix-fs": {
       "crateName": "gix-fs",
-      "version": "0.21.1",
-      "edition": "2021",
-      "sha256": "11kcadm2igs9h9vmkxa7ff4imp6agg2z1bn28xy7aj4qmkd6f68y",
+      "version": "0.21.2",
+      "edition": "2024",
+      "sha256": "1zki0xj5szadpc3hp79xvp9svidag69lpn17yzi4g3krp1nz9pvc",
       "source": {
         "type": "crates-io"
       },
@@ -9075,9 +8970,9 @@
     },
     "gix-glob": {
       "crateName": "gix-glob",
-      "version": "0.26.0",
-      "edition": "2021",
-      "sha256": "1363wadnnwi7cpb4i8qf696i6yzkjw4zhr2rgx8g56q6k8j2kgq8",
+      "version": "0.26.1",
+      "edition": "2024",
+      "sha256": "0mip7w7hmwsi861anrykfv49611wpf58vdp9mdsgig0nbgpviz6i",
       "source": {
         "type": "crates-io"
       },
@@ -9108,9 +9003,9 @@
     },
     "gix-hash": {
       "crateName": "gix-hash",
-      "version": "0.25.0",
-      "edition": "2021",
-      "sha256": "1lh3ww6l52z3kjrm8ydbivjyqr8qnzmviy30cg8ywdr34lg0vxxw",
+      "version": "0.25.1",
+      "edition": "2024",
+      "sha256": "1kpd9vninaiplr9hfscvij5zcwqyj1a7fg70ni87g0wwh79jc2fb",
       "source": {
         "type": "crates-io"
       },
@@ -9145,9 +9040,9 @@
     },
     "gix-hashtable": {
       "crateName": "gix-hashtable",
-      "version": "0.15.0",
-      "edition": "2021",
-      "sha256": "12xhs0gjlk2xyn717q9xcn5bzz6ss8w7pg7f5qxnvhdk0xg4afyk",
+      "version": "0.15.1",
+      "edition": "2024",
+      "sha256": "0qq5pvqbc08wkz09g07ipdsn34p272wzqlw1gnpqnwd8xs9hpqxh",
       "source": {
         "type": "crates-io"
       },
@@ -9158,15 +9053,12 @@
         },
         {
           "name": "hashbrown",
-          "packageId": "hashbrown 0.16.1"
+          "packageId": "hashbrown 0.17.1"
         },
         {
           "name": "parking_lot",
           "packageId": "parking_lot"
         }
-      ],
-      "resolvedDefaultFeatures": [
-        "sha1"
       ],
       "libCrateTypes": [
         "lib"
@@ -9177,9 +9069,9 @@
     },
     "gix-ignore": {
       "crateName": "gix-ignore",
-      "version": "0.21.0",
-      "edition": "2021",
-      "sha256": "1idybfi8y8cgvh64s35gzi9a9xnxvy4cq7xna8z99vmgxsxkzcbb",
+      "version": "0.21.1",
+      "edition": "2024",
+      "sha256": "13bxm6nfw79fp1kj2c8mlsn66gsx3p1jbx2lqwfk97rcpywvm4fl",
       "source": {
         "type": "crates-io"
       },
@@ -9214,9 +9106,9 @@
     },
     "gix-imara-diff": {
       "crateName": "gix-imara-diff",
-      "version": "0.2.1",
-      "edition": "2021",
-      "sha256": "10lc700nx081rid6pcqmnziimpgs92g9asnf08ybhk2yw4ihdsrr",
+      "version": "0.2.2",
+      "edition": "2024",
+      "sha256": "069c9v042ich1mrr4ybz5pxr0yh9d6wywl27c10yrl2kv903sx8r",
       "source": {
         "type": "crates-io"
       },
@@ -9227,7 +9119,7 @@
         },
         {
           "name": "hashbrown",
-          "packageId": "hashbrown 0.16.1"
+          "packageId": "hashbrown 0.17.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -9243,9 +9135,9 @@
     },
     "gix-index": {
       "crateName": "gix-index",
-      "version": "0.51.0",
-      "edition": "2021",
-      "sha256": "1nwi27adjmj3vnylhvcpdcy9wszd7zb6n8m64x1iw4h8mnbyzhsl",
+      "version": "0.52.0",
+      "edition": "2024",
+      "sha256": "03d89zvvz1yzlixcggm3j7jjwhaflqabn0l3nnnm7irdb762hssf",
       "source": {
         "type": "crates-io"
       },
@@ -9304,7 +9196,7 @@
         },
         {
           "name": "hashbrown",
-          "packageId": "hashbrown 0.16.1"
+          "packageId": "hashbrown 0.17.1"
         },
         {
           "name": "itoa",
@@ -9333,9 +9225,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -9345,9 +9234,9 @@
     },
     "gix-lock": {
       "crateName": "gix-lock",
-      "version": "23.0.0",
-      "edition": "2021",
-      "sha256": "1hc6l6jbnbqps09fhv9gfi9lm04mknwrmk9d91xh48sp9q3vrcq9",
+      "version": "23.0.1",
+      "edition": "2024",
+      "sha256": "0b1wbxszxwg5nywqfkin310jj2af74fj9vfj4ivd9c4hkvfxxjb5",
       "source": {
         "type": "crates-io"
       },
@@ -9372,148 +9261,11 @@
         "Sebastian Thiel <sebastian.thiel@icloud.com>"
       ]
     },
-    "gix-merge": {
-      "crateName": "gix-merge",
-      "version": "0.16.0",
-      "edition": "2021",
-      "sha256": "10d8kvczjnkk7r8dj04gwipgbz6hz7gj9c2il7q342mpab6cvfvl",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "bstr",
-          "packageId": "bstr"
-        },
-        {
-          "name": "gix-command",
-          "packageId": "gix-command"
-        },
-        {
-          "name": "gix-diff",
-          "packageId": "gix-diff"
-        },
-        {
-          "name": "gix-filter",
-          "packageId": "gix-filter"
-        },
-        {
-          "name": "gix-fs",
-          "packageId": "gix-fs"
-        },
-        {
-          "name": "gix-hash",
-          "packageId": "gix-hash"
-        },
-        {
-          "name": "gix-imara-diff",
-          "packageId": "gix-imara-diff",
-          "rename": "imara_diff"
-        },
-        {
-          "name": "gix-index",
-          "packageId": "gix-index"
-        },
-        {
-          "name": "gix-object",
-          "packageId": "gix-object"
-        },
-        {
-          "name": "gix-path",
-          "packageId": "gix-path"
-        },
-        {
-          "name": "gix-quote",
-          "packageId": "gix-quote"
-        },
-        {
-          "name": "gix-revision",
-          "packageId": "gix-revision"
-        },
-        {
-          "name": "gix-revwalk",
-          "packageId": "gix-revwalk"
-        },
-        {
-          "name": "gix-tempfile",
-          "packageId": "gix-tempfile"
-        },
-        {
-          "name": "gix-trace",
-          "packageId": "gix-trace"
-        },
-        {
-          "name": "gix-worktree",
-          "packageId": "gix-worktree"
-        },
-        {
-          "name": "nonempty",
-          "packageId": "nonempty"
-        },
-        {
-          "name": "thiserror",
-          "packageId": "thiserror"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sebastian Thiel <sebastian.thiel@icloud.com>"
-      ]
-    },
-    "gix-negotiate": {
-      "crateName": "gix-negotiate",
-      "version": "0.31.0",
-      "edition": "2021",
-      "sha256": "033q1pr3zaid5hml54ldb3763m6sgc936n80lmnakf71mnzl4g8h",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "bitflags",
-          "packageId": "bitflags"
-        },
-        {
-          "name": "gix-commitgraph",
-          "packageId": "gix-commitgraph"
-        },
-        {
-          "name": "gix-date",
-          "packageId": "gix-date"
-        },
-        {
-          "name": "gix-hash",
-          "packageId": "gix-hash"
-        },
-        {
-          "name": "gix-object",
-          "packageId": "gix-object"
-        },
-        {
-          "name": "gix-revwalk",
-          "packageId": "gix-revwalk"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sebastian Thiel <sebastian.thiel@icloud.com>"
-      ]
-    },
     "gix-object": {
       "crateName": "gix-object",
-      "version": "0.60.0",
-      "edition": "2021",
-      "sha256": "1mxljfzkynpmlwh42yi0a9llbh96f1hjrrrqzn5dzibwbnlpb053",
+      "version": "0.61.0",
+      "edition": "2024",
+      "sha256": "09fmsqcd41qngg9f12pyfi3i5k7qhgpmlgzgpl9p572255z8bkfm",
       "source": {
         "type": "crates-io"
       },
@@ -9563,9 +9315,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -9575,9 +9324,9 @@
     },
     "gix-odb": {
       "crateName": "gix-odb",
-      "version": "0.80.0",
-      "edition": "2021",
-      "sha256": "1fhn2wrq3a826ixy802pww5spvh61ljw3kayfcc084k3jqma3vdf",
+      "version": "0.81.0",
+      "edition": "2024",
+      "sha256": "0zcahpi7w1xvaxysislvq27wfzf9ngnhai47szr5c5cbhlr4q03x",
       "source": {
         "type": "crates-io"
       },
@@ -9635,9 +9384,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -9647,9 +9393,9 @@
     },
     "gix-pack": {
       "crateName": "gix-pack",
-      "version": "0.70.0",
-      "edition": "2021",
-      "sha256": "1yml0a8b8hcrr4fhk1j0v9m8a54v1ps4alpar5ls01wgbipjxw6s",
+      "version": "0.71.0",
+      "edition": "2024",
+      "sha256": "0x5iavzlac0k3kidajfrpgk32hk18nw9d8f19rkk643xlbr2cdp4",
       "source": {
         "type": "crates-io"
       },
@@ -9712,9 +9458,9 @@
     },
     "gix-packetline": {
       "crateName": "gix-packetline",
-      "version": "0.21.3",
-      "edition": "2021",
-      "sha256": "1rjnas71kr4mpqi44wxngm3wwvka03vwnr06kxlr3rhf8kglc8in",
+      "version": "0.21.5",
+      "edition": "2024",
+      "sha256": "1mwir05dq8v28vfg6r9p7xgd302g3fdm2jls2v7iw0n4w07ds5xj",
       "source": {
         "type": "crates-io"
       },
@@ -9749,9 +9495,9 @@
     },
     "gix-path": {
       "crateName": "gix-path",
-      "version": "0.12.0",
-      "edition": "2021",
-      "sha256": "0vilxvz5w8pgb4cznxh80rp958zgki4iciz20vsbghd4x1cn06k7",
+      "version": "0.12.1",
+      "edition": "2024",
+      "sha256": "19lk1y6rqvzwkiz7b12vkz012rda1m3ffv299alrx4qlrlaar9mg",
       "source": {
         "type": "crates-io"
       },
@@ -9782,9 +9528,9 @@
     },
     "gix-pathspec": {
       "crateName": "gix-pathspec",
-      "version": "0.18.0",
-      "edition": "2021",
-      "sha256": "0mc8gvy324zzsr4mqw0wmbdg43frlspi6zipyi4znw6xhgqa911a",
+      "version": "0.18.1",
+      "edition": "2024",
+      "sha256": "17wcg713gsj89zqra0q3yja63041vwimdcwg3qg524gf84xphl1h",
       "source": {
         "type": "crates-io"
       },
@@ -9827,9 +9573,9 @@
     },
     "gix-protocol": {
       "crateName": "gix-protocol",
-      "version": "0.61.0",
-      "edition": "2021",
-      "sha256": "1zf44r524ws331baad1zz9aw2rzl3kkzlvmrjrcn7v33vf1fwjxa",
+      "version": "0.62.0",
+      "edition": "2024",
+      "sha256": "1vlm6lq7vr38czlzmvwxhrfvk7j4317miygid2w7lw4hnfna7pji",
       "source": {
         "type": "crates-io"
       },
@@ -9879,9 +9625,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -9891,9 +9634,9 @@
     },
     "gix-quote": {
       "crateName": "gix-quote",
-      "version": "0.7.1",
-      "edition": "2021",
-      "sha256": "1gpqp9yplb4m3knpdf2hfzwiaq8ka7jv7ifjgpxc0jx6j4vvg5vf",
+      "version": "0.7.2",
+      "edition": "2024",
+      "sha256": "1vz6db830hm89kmgmj27lzna51hcb920s13rg4xphayc6gy43rd6",
       "source": {
         "type": "crates-io"
       },
@@ -9920,9 +9663,9 @@
     },
     "gix-ref": {
       "crateName": "gix-ref",
-      "version": "0.63.0",
-      "edition": "2021",
-      "sha256": "0rv1f8xb9fwbf7lzsa08crck9j2y1w9q76rlk562g2smbz0rrfnq",
+      "version": "0.64.0",
+      "edition": "2024",
+      "sha256": "12rfdfl4ig2hsjzljcnmwmfwr0gkqs6hy1n7fgmnyzpb6x6gc12c",
       "source": {
         "type": "crates-io"
       },
@@ -9976,9 +9719,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -9988,9 +9728,9 @@
     },
     "gix-refspec": {
       "crateName": "gix-refspec",
-      "version": "0.41.0",
-      "edition": "2021",
-      "sha256": "0qdplsr9xnpybf6yv89dq3jai32lc663qndil508kp3yslkmnxb1",
+      "version": "0.42.0",
+      "edition": "2024",
+      "sha256": "1lx6qpkg1hvgc70zkshhfidr62pvjyljc80ls15g5dblxh3aw5mj",
       "source": {
         "type": "crates-io"
       },
@@ -10028,9 +9768,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -10040,9 +9777,9 @@
     },
     "gix-revision": {
       "crateName": "gix-revision",
-      "version": "0.45.0",
-      "edition": "2021",
-      "sha256": "1s5pdbyrqaa2nf6f28pl0a63nx3qig1rxfp2wjikwvbhmj7jid8z",
+      "version": "0.46.0",
+      "edition": "2024",
+      "sha256": "03rlfhblm0kfkf38dp5a14lfmk8z4489v8cxlccilg6xhj4chiqb",
       "source": {
         "type": "crates-io"
       },
@@ -10094,8 +9831,7 @@
       ],
       "resolvedDefaultFeatures": [
         "describe",
-        "merge_base",
-        "sha1"
+        "merge_base"
       ],
       "libCrateTypes": [
         "lib"
@@ -10106,9 +9842,9 @@
     },
     "gix-revwalk": {
       "crateName": "gix-revwalk",
-      "version": "0.31.0",
-      "edition": "2021",
-      "sha256": "1w39a1q28iqi40cppjgvgjncs1357szrca4vgzzi4fh7ddq16f1i",
+      "version": "0.32.0",
+      "edition": "2024",
+      "sha256": "1rpr3rlb0yglp3ws33rrpisrinafd09kns5cga11f2gypxm7bxc5",
       "source": {
         "type": "crates-io"
       },
@@ -10146,9 +9882,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -10158,9 +9891,9 @@
     },
     "gix-sec": {
       "crateName": "gix-sec",
-      "version": "0.14.0",
-      "edition": "2021",
-      "sha256": "1ih76iirh15zfjcylr7al2324998q2k4drjicw9ki8h4wp9s58zm",
+      "version": "0.14.1",
+      "edition": "2024",
+      "sha256": "1cq1bl9a3kwlglvx22xqg43r8dwz6q0582klf1i4hzjcdsbik1db",
       "source": {
         "type": "crates-io"
       },
@@ -10194,9 +9927,9 @@
     },
     "gix-shallow": {
       "crateName": "gix-shallow",
-      "version": "0.12.0",
-      "edition": "2021",
-      "sha256": "09wch2jvmc8kscyyd99rpm5bg7zsvclap16jxx5czyhva82p6619",
+      "version": "0.12.1",
+      "edition": "2024",
+      "sha256": "15ydacjzi1nkmv3gxwan5zfz3pdh8ns1d7a7fnjxzia8wlpzr4m2",
       "source": {
         "type": "crates-io"
       },
@@ -10222,9 +9955,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -10234,9 +9964,9 @@
     },
     "gix-status": {
       "crateName": "gix-status",
-      "version": "0.30.0",
-      "edition": "2021",
-      "sha256": "0rabkb1gsab1mc8cl9nqgjiqndyiws18q9kyzq2s5zr1qnld5ik8",
+      "version": "0.31.0",
+      "edition": "2024",
+      "sha256": "0047xpr26yc9r9c3c1xr2jz4al18f14qzn99w1sl58r8blw2w112",
       "source": {
         "type": "crates-io"
       },
@@ -10304,7 +10034,6 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "sha1",
         "worktree-rewrites"
       ],
       "libCrateTypes": [
@@ -10317,9 +10046,9 @@
     },
     "gix-submodule": {
       "crateName": "gix-submodule",
-      "version": "0.30.0",
-      "edition": "2021",
-      "sha256": "14adxgiy3rmxvspfmi42m874dy34qga0ym3fb4ddf2w9ja3grmcz",
+      "version": "0.31.0",
+      "edition": "2024",
+      "sha256": "10a7i24gv0spksya0c6nvjp0dn50mcz6mz2bm4i6q1jly078jn9h",
       "source": {
         "type": "crates-io"
       },
@@ -10353,9 +10082,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -10365,9 +10091,9 @@
     },
     "gix-tempfile": {
       "crateName": "gix-tempfile",
-      "version": "23.0.0",
-      "edition": "2021",
-      "sha256": "1yzp1a7rv4r3qwmm3kradg28550d3jfyq1a7s3afgirm2kis27k9",
+      "version": "23.0.1",
+      "edition": "2024",
+      "sha256": "08nv9866jl4lmfmjsxr74ybhw0lxkighzb8ddbs1b5gzw6bh1197",
       "source": {
         "type": "crates-io"
       },
@@ -10407,9 +10133,9 @@
     },
     "gix-trace": {
       "crateName": "gix-trace",
-      "version": "0.1.19",
-      "edition": "2021",
-      "sha256": "03i7s9zj3z1ybsmfwff435y2mmd76jbknd8phsaszzzjang5c8vg",
+      "version": "0.1.20",
+      "edition": "2024",
+      "sha256": "0y6n39aay8pd7ad9k9mn8m6wyk92dqp1a3ry2wafph45wzm4bp24",
       "source": {
         "type": "crates-io"
       },
@@ -10425,9 +10151,9 @@
     },
     "gix-transport": {
       "crateName": "gix-transport",
-      "version": "0.57.0",
-      "edition": "2021",
-      "sha256": "061h180sr76aj1h7p6fwkv3dw5a408sjjassbynlwbdrfv3abmpz",
+      "version": "0.57.1",
+      "edition": "2024",
+      "sha256": "1zz78r02cqs4c0197j0rw79zl2vafbdzhapzipxb1amijm4y7l3w",
       "source": {
         "type": "crates-io"
       },
@@ -10477,9 +10203,9 @@
     },
     "gix-traverse": {
       "crateName": "gix-traverse",
-      "version": "0.57.0",
-      "edition": "2021",
-      "sha256": "0p6fn8cqg6dkdgn5qav4dqqyiy7hszkzvz3i7v07crkqq1970jx1",
+      "version": "0.58.0",
+      "edition": "2024",
+      "sha256": "1vbs3z6q3p8g0972vz67fa37z7zs4j1jiwk50s3v58w6rh75kpp8",
       "source": {
         "type": "crates-io"
       },
@@ -10521,9 +10247,6 @@
           "packageId": "thiserror"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "sha1"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -10533,9 +10256,9 @@
     },
     "gix-url": {
       "crateName": "gix-url",
-      "version": "0.36.0",
-      "edition": "2021",
-      "sha256": "1khyfa3rh9aj550pm6zp7nf18wh5cza8i7jjp9mnygw1kq4jv11m",
+      "version": "0.36.1",
+      "edition": "2024",
+      "sha256": "1cksnqmy50fxpz7ahqw4qfmfdm7a052jd7m1nz684pnmd7n03fv5",
       "source": {
         "type": "crates-io"
       },
@@ -10566,9 +10289,9 @@
     },
     "gix-utils": {
       "crateName": "gix-utils",
-      "version": "0.3.2",
-      "edition": "2021",
-      "sha256": "0b6v9awxa410jfcz2w0dqq1rg582h62kricilx5xms560x7pnisf",
+      "version": "0.3.3",
+      "edition": "2024",
+      "sha256": "0wdpn67c6rlmw67ypz67y6bqb1qs0cl4x9pzh3swl8s131k0kib6",
       "source": {
         "type": "crates-io"
       },
@@ -10598,9 +10321,9 @@
     },
     "gix-validate": {
       "crateName": "gix-validate",
-      "version": "0.11.1",
-      "edition": "2021",
-      "sha256": "1mfsh2nh3icgxzgcqr4z7hm1ci0r6k9q22snl3fdzsj35dhc4sp2",
+      "version": "0.11.2",
+      "edition": "2024",
+      "sha256": "1qzs9bzb0x48ggzbfr1vh9m1q9bnc3xr2yzls9yblqs03ivzrikv",
       "source": {
         "type": "crates-io"
       },
@@ -10619,9 +10342,9 @@
     },
     "gix-worktree": {
       "crateName": "gix-worktree",
-      "version": "0.52.0",
-      "edition": "2021",
-      "sha256": "1z86sj7wbzjynph3g4jpvpd03vlyh15rchfhi0pq6419bvmmb6fn",
+      "version": "0.53.0",
+      "edition": "2024",
+      "sha256": "1ld2aks5hys16hj9v19zvnq015z17gl03lskbp6hg12y4zni9x6f",
       "source": {
         "type": "crates-io"
       },
@@ -10668,68 +10391,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "attributes",
-        "sha1"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sebastian Thiel <sebastian.thiel@icloud.com>"
-      ]
-    },
-    "gix-worktree-state": {
-      "crateName": "gix-worktree-state",
-      "version": "0.30.0",
-      "edition": "2021",
-      "sha256": "0008sz3grvj1ymv14cf1j7kb5swkv846xw2m3hly13wyrz5xr5la",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "bstr",
-          "packageId": "bstr"
-        },
-        {
-          "name": "gix-features",
-          "packageId": "gix-features"
-        },
-        {
-          "name": "gix-filter",
-          "packageId": "gix-filter"
-        },
-        {
-          "name": "gix-fs",
-          "packageId": "gix-fs"
-        },
-        {
-          "name": "gix-index",
-          "packageId": "gix-index"
-        },
-        {
-          "name": "gix-object",
-          "packageId": "gix-object"
-        },
-        {
-          "name": "gix-path",
-          "packageId": "gix-path"
-        },
-        {
-          "name": "gix-worktree",
-          "packageId": "gix-worktree"
-        },
-        {
-          "name": "io-close",
-          "packageId": "io-close"
-        },
-        {
-          "name": "thiserror",
-          "packageId": "thiserror"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "sha1"
+        "attributes"
       ],
       "libCrateTypes": [
         "lib"
@@ -10740,9 +10402,9 @@
     },
     "gix-worktree-stream": {
       "crateName": "gix-worktree-stream",
-      "version": "0.32.0",
-      "edition": "2021",
-      "sha256": "04s2b4z644h3wl0j4qxjpfhh203357dcwgkzr6hf2qj6xnw4914s",
+      "version": "0.33.0",
+      "edition": "2024",
+      "sha256": "0my5vkvhg73k8ni7kah67sjk3xskbqi1qn5wj1skzih0079rwpnj",
       "source": {
         "type": "crates-io"
       },
@@ -10798,276 +10460,6 @@
         "Sebastian Thiel <sebastian.thiel@icloud.com>"
       ]
     },
-    "glam 0.14.0": {
-      "crateName": "glam",
-      "version": "0.14.0",
-      "edition": "2018",
-      "sha256": "1njk0cskaspc62ywxlzpiszbcb9hhh1yqg2ka105sg0hxgajhf9k",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.15.2": {
-      "crateName": "glam",
-      "version": "0.15.2",
-      "edition": "2018",
-      "sha256": "0jx587lxz9v9m0ph4dlshfgy0abax1zhlbjj5nvkchz4ir7mbfrs",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.16.0": {
-      "crateName": "glam",
-      "version": "0.16.0",
-      "edition": "2018",
-      "sha256": "05izbgx93hnjk200144h9yxhy51cbygp2bbaqdj8czngki3w09j1",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.17.3": {
-      "crateName": "glam",
-      "version": "0.17.3",
-      "edition": "2018",
-      "sha256": "0xm7jdygbxchdvk6k1l1pdag843nkwdm8fikwgp0i1gxgawk45z0",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.18.0": {
-      "crateName": "glam",
-      "version": "0.18.0",
-      "edition": "2018",
-      "sha256": "0d7f7f7cdbahxk677k6l8h7r4bxxni24nzdndwr8wyx71d4kwnjj",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.19.0": {
-      "crateName": "glam",
-      "version": "0.19.0",
-      "edition": "2018",
-      "sha256": "1jjia0nva5p7ca3dma8jhzxd4dmczgbhn3b338ffh5hmg7k0k19b",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.20.5": {
-      "crateName": "glam",
-      "version": "0.20.5",
-      "edition": "2018",
-      "sha256": "0pv7n634vw2hn9fmi915pzgangyljgsp4m5505c3zq2bfiz9agpl",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.21.3": {
-      "crateName": "glam",
-      "version": "0.21.3",
-      "edition": "2021",
-      "sha256": "05c8r639hz3ydlhbhv6d9z6193iivi8276zz2fq3hqw6ci8am3si",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.22.0": {
-      "crateName": "glam",
-      "version": "0.22.0",
-      "edition": "2021",
-      "sha256": "0x57gyrxyfs409b3f5i64yy2pbcgkr2qkq8v3a0mmm8vdkargx8j",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.23.0": {
-      "crateName": "glam",
-      "version": "0.23.0",
-      "edition": "2021",
-      "sha256": "076mdgmy38lhlvgng74iy2sr3iih58gx5qcz20g0hmamv6dgsjlf",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.24.2": {
-      "crateName": "glam",
-      "version": "0.24.2",
-      "edition": "2021",
-      "sha256": "0ibrq68ldg1gyynb5ss5hx0gr6p3397cfclh1xrl5prba4bqqhdm",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.25.0": {
-      "crateName": "glam",
-      "version": "0.25.0",
-      "edition": "2021",
-      "sha256": "1cr80mz1qyc73fvp2d93d4g2svv675fmcrkrzi0bpyajpvcna5hm",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.27.0": {
-      "crateName": "glam",
-      "version": "0.27.0",
-      "edition": "2021",
-      "sha256": "1fawkrkbivdds5lzczk1rx37b7s3apl2cywch7s5ad1yfbkff1cy",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.28.0": {
-      "crateName": "glam",
-      "version": "0.28.0",
-      "edition": "2021",
-      "sha256": "152sjv2ffb84a28zb4yklkxn5f20idz4xdmkq28wy8c4gszy96kp",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
-    "glam 0.29.3": {
-      "crateName": "glam",
-      "version": "0.29.3",
-      "edition": "2021",
-      "sha256": "1vmkzrpsz3ay9c1cabs5ns149z3dyxkf8ywzmkg9578w9inz9awb",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Cameron Hart <cameron.hart@gmail.com>"
-      ]
-    },
     "glam 0.30.10": {
       "crateName": "glam",
       "version": "0.30.10",
@@ -11114,6 +10506,27 @@
       },
       "resolvedDefaultFeatures": [
         "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Cameron Hart <cameron.hart@gmail.com>"
+      ]
+    },
+    "glam 0.33.1": {
+      "crateName": "glam",
+      "version": "0.33.1",
+      "edition": "2021",
+      "sha256": "0cw9fmi4bfsp65adkilgqnypvfbl62lm1alc1xn9p644i9b5m3w9",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "f64",
+        "i32",
+        "std",
+        "u32"
       ],
       "libCrateTypes": [
         "lib"
@@ -11262,9 +10675,9 @@
     },
     "granit-parser": {
       "crateName": "granit-parser",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "edition": "2021",
-      "sha256": "0y6pi7pbjvllf2c2yy0id7zdkl02haqmws70vjkm6748wggkdrxp",
+      "sha256": "14bwwc8swz8h0v8d7qybmmq25czv5aipd1v1vbariq7rchhs62zm",
       "source": {
         "type": "crates-io"
       },
@@ -11288,7 +10701,7 @@
         "Bourumir Wyngs <bourumir-wyngs@gmail.com>"
       ]
     },
-    "group": {
+    "group 0.13.0": {
       "crateName": "group",
       "version": "0.13.0",
       "edition": "2021",
@@ -11299,11 +10712,44 @@
       "dependencies": [
         {
           "name": "ff",
-          "packageId": "ff"
+          "packageId": "ff 0.13.1"
         },
         {
           "name": "rand_core",
           "packageId": "rand_core 0.6.4"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sean Bowe <ewillbefull@gmail.com>",
+        "Jack Grigg <jack@z.cash>"
+      ]
+    },
+    "group 0.14.0": {
+      "crateName": "group",
+      "version": "0.14.0",
+      "edition": "2021",
+      "sha256": "1x7m980b0m82d012mmika67hqpgq7z6pq3as7xx5nv10lp3s3lbz",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
+        },
+        {
+          "name": "rand_core",
+          "packageId": "rand_core 0.10.1"
         },
         {
           "name": "subtle",
@@ -11383,11 +10829,11 @@
         "Sean McArthur <sean@seanmonstar.com>"
       ]
     },
-    "h2 0.4.14": {
+    "h2 0.4.15": {
       "crateName": "h2",
-      "version": "0.4.14",
+      "version": "0.4.15",
       "edition": "2021",
-      "sha256": "0cw7jk7kn2vn6f8w8ssh6gis1mljnfjxd606gvi4sjpyjayfy7qp",
+      "sha256": "0mgilh1g8gydcchqi6acs5l6j0gwg5jwpa64sj4b3ncb9v497c3c",
       "source": {
         "type": "crates-io"
       },
@@ -11414,7 +10860,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "indexmap",
@@ -11666,9 +11112,9 @@
     },
     "hashlink": {
       "crateName": "hashlink",
-      "version": "0.11.0",
-      "edition": "2018",
-      "sha256": "0c6jpsyb9f3j5yrlbw8rnr5kpkar08z02b1h3b5sf14w39b242za",
+      "version": "0.11.1",
+      "edition": "2021",
+      "sha256": "0pxkfi2jrcs9a3y05hdnvslpr9h32j0yqjr6db8js0gkqhd00kl2",
       "source": {
         "type": "crates-io"
       },
@@ -12000,11 +11446,11 @@
         "Sean McArthur <sean@seanmonstar.com>"
       ]
     },
-    "http 1.4.0": {
+    "http 1.4.2": {
       "crateName": "http",
-      "version": "1.4.0",
+      "version": "1.4.2",
       "edition": "2021",
-      "sha256": "06iind4cwsj1d6q8c2xgq8i2wka4ps74kmws24gsi1bzdlw2mfp3",
+      "sha256": "09b4p8fiivkg7wm0b59fyrn1jkm7px298ci7zb9igz6n647gaw39",
       "source": {
         "type": "crates-io"
       },
@@ -12077,7 +11523,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         }
       ],
       "libCrateTypes": [
@@ -12108,7 +11554,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -12345,11 +11791,11 @@
         "Sean McArthur <sean@seanmonstar.com>"
       ]
     },
-    "hyper 1.9.0": {
+    "hyper 1.10.1": {
       "crateName": "hyper",
-      "version": "1.9.0",
+      "version": "1.10.1",
       "edition": "2021",
-      "sha256": "1jmwbwqcaficskg76kq402gbymbnh2z4v99xwq3l5aa6n8bg16b2",
+      "sha256": "1624nwrh1ci34psqcl3q8q266kha8kd6fmqjj14qck49l59iqa2m",
       "source": {
         "type": "crates-io"
       },
@@ -12372,11 +11818,11 @@
         },
         {
           "name": "h2",
-          "packageId": "h2 0.4.14"
+          "packageId": "h2 0.4.15"
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -12436,11 +11882,11 @@
       "dependencies": [
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-util",
@@ -12496,7 +11942,7 @@
       "dependencies": [
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-util",
@@ -12549,7 +11995,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -12557,7 +12003,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "ipnet",
@@ -12577,7 +12023,7 @@
         },
         {
           "name": "socket2",
-          "packageId": "socket2 0.6.3"
+          "packageId": "socket2 0.6.4"
         },
         {
           "name": "tokio",
@@ -12602,8 +12048,7 @@
         "server",
         "server-auto",
         "service",
-        "tokio",
-        "tracing"
+        "tokio"
       ],
       "libCrateTypes": [
         "lib"
@@ -12933,26 +12378,6 @@
         "The ICU4X Project Developers"
       ]
     },
-    "id-arena": {
-      "crateName": "id-arena",
-      "version": "2.3.0",
-      "edition": "2021",
-      "sha256": "0m6rs0jcaj4mg33gkv98d71w3hridghp5c4yr928hplpkgbnfc1x",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "default",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Nick Fitzgerald <fitzgen@gmail.com>",
-        "Aleksey Kladov <aleksey.kladov@gmail.com>"
-      ]
-    },
     "ident_case": {
       "crateName": "ident_case",
       "version": "1.0.1",
@@ -13099,36 +12524,7 @@
         "lib"
       ]
     },
-    "inout 0.1.4": {
-      "crateName": "inout",
-      "version": "0.1.4",
-      "edition": "2021",
-      "sha256": "008xfl1jn9rxsq19phnhbimccf4p64880jmnpg59wqi07kk117w7",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "block-padding",
-          "packageId": "block-padding 0.3.3"
-        },
-        {
-          "name": "generic-array",
-          "packageId": "generic-array 0.14.9"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "block-padding",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "RustCrypto Developers"
-      ]
-    },
-    "inout 0.2.2": {
+    "inout": {
       "crateName": "inout",
       "version": "0.2.2",
       "edition": "2024",
@@ -13139,7 +12535,7 @@
       "dependencies": [
         {
           "name": "block-padding",
-          "packageId": "block-padding 0.4.2"
+          "packageId": "block-padding"
         },
         {
           "name": "hybrid-array",
@@ -13241,33 +12637,6 @@
       ],
       "authors": [
         "The Rust Project Developers"
-      ]
-    },
-    "io-close": {
-      "crateName": "io-close",
-      "version": "0.3.7",
-      "edition": "2018",
-      "sha256": "1g4hldfn436rkrx3jlm4az1y5gdmkcixdlhkwy64yx06gx2czbcw",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "libc",
-          "packageId": "libc",
-          "target": "cfg(unix)"
-        },
-        {
-          "name": "winapi",
-          "packageId": "winapi",
-          "target": "cfg(windows)"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "wufz"
       ]
     },
     "ipnet": {
@@ -13380,9 +12749,9 @@
     },
     "jiff": {
       "crateName": "jiff",
-      "version": "0.2.24",
+      "version": "0.2.28",
       "edition": "2021",
-      "sha256": "0g87al8yqp05m63dhqzi359xgsslc0grqz00nvfdyq8dcayms2zh",
+      "sha256": "00lixngcc7amh2fcsxfr0z38j06lllhapz192biv1qj97q1x60s6",
       "source": {
         "type": "crates-io"
       },
@@ -13412,8 +12781,8 @@
           "packageId": "serde_core"
         },
         {
-          "name": "windows-sys",
-          "packageId": "windows-sys 0.61.2",
+          "name": "windows-link",
+          "packageId": "windows-link",
           "target": "cfg(windows)"
         }
       ],
@@ -13438,9 +12807,9 @@
     },
     "jiff-static": {
       "crateName": "jiff-static",
-      "version": "0.2.24",
+      "version": "0.2.28",
       "edition": "2021",
-      "sha256": "1mz6v0d1hd8wjgfzccgda5g9z01s1yxnyiizvahjw0pq1w1xw070",
+      "sha256": "0irbhfh2f4i9w5l53jcmh6ssnhdd92wfy76978chgwnxilvk4bbq",
       "source": {
         "type": "crates-io"
       },
@@ -13669,9 +13038,9 @@
     },
     "js-sys": {
       "crateName": "js-sys",
-      "version": "0.3.99",
+      "version": "0.3.102",
       "edition": "2021",
-      "sha256": "04azrzsz91gr5s3z0ij36lz0kj9ry4lw3jz0mmbiwb251rsc8aql",
+      "sha256": "0cgxklnyrfpzvf32cvdl3x5d070kfsv7ykdxfl3yizwdjqq4rl03",
       "source": {
         "type": "crates-io"
       },
@@ -13683,10 +13052,6 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
-        },
-        {
-          "name": "once_cell",
-          "packageId": "once_cell"
         },
         {
           "name": "wasm-bindgen",
@@ -13872,9 +13237,9 @@
     },
     "k8s-openapi": {
       "crateName": "k8s-openapi",
-      "version": "0.27.1",
+      "version": "0.28.0",
       "edition": "2021",
-      "sha256": "0pldsxbxd4ckq94p8rkck4s862w33gfns6rclxr5imcx47sjdcsi",
+      "sha256": "1fsabg1708vmp44zz00p6x65hd0dbnpii601ss6l307yd8pr5inr",
       "source": {
         "type": "crates-io"
       },
@@ -13904,7 +13269,7 @@
       "libCrateTypes": [
         "lib"
       ],
-      "links": "k8s-openapi-0.27.1",
+      "links": "k8s-openapi-0.28.0",
       "authors": [
         "Arnav Singh <me@arnavion.dev>"
       ]
@@ -13989,9 +13354,9 @@
     },
     "kube": {
       "crateName": "kube",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "0hc7x38zdjdphmkx1b9pdyv3kiwwzkfbamjxjbcmx5x2knkadidc",
+      "sha256": "0ip1qc9kvgyp735rmxdjq75dspf737sazvhzs6b70siljn011fab",
       "source": {
         "type": "crates-io"
       },
@@ -14040,9 +13405,9 @@
     },
     "kube-client": {
       "crateName": "kube-client",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "0h6xlwrjg07npsdr0rgxiyp6f9q27hryi0ndsh2ih7m9y78z5jhg",
+      "sha256": "0yskaybnf8m2c9rb0kxzlczb9jbx25sxdlqhzqhlq9n2bgh2ixnh",
       "source": {
         "type": "crates-io"
       },
@@ -14065,7 +13430,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -14077,7 +13442,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-rustls",
@@ -14124,12 +13489,12 @@
           "packageId": "serde"
         },
         {
-          "name": "serde_json",
-          "packageId": "serde_json"
+          "name": "serde-saphyr",
+          "packageId": "serde-saphyr"
         },
         {
-          "name": "serde_yaml",
-          "packageId": "serde_yaml"
+          "name": "serde_json",
+          "packageId": "serde_json"
         },
         {
           "name": "thiserror",
@@ -14153,7 +13518,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
+          "packageId": "tower-http 0.6.11"
         },
         {
           "name": "tracing",
@@ -14181,7 +13546,7 @@
         "pem",
         "rustls",
         "rustls-tls",
-        "serde_yaml",
+        "serde-saphyr",
         "tokio",
         "tokio-tungstenite",
         "tokio-util",
@@ -14201,9 +13566,9 @@
     },
     "kube-core": {
       "crateName": "kube-core",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "17ki1s0smv4vj8zkrk56phxxr1943sky5v1rv30jwlwbgbdx49pi",
+      "sha256": "1a7a3n4mwiqywajlld3axii0k7ridizp5mn7b06i81ms6dcjzc61",
       "source": {
         "type": "crates-io"
       },
@@ -14218,7 +13583,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "jiff",
@@ -14271,9 +13636,9 @@
     },
     "kube-derive": {
       "crateName": "kube-derive",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "1yj9z0niwdh9djvr0cdh7ac7chmw999xmimgkizrbkhz29zbkffn",
+      "sha256": "1an7av9xlif02klbk1xsz7nvggpnazpq2kpris0z3bbxf2c1h5zy",
       "source": {
         "type": "crates-io"
       },
@@ -14312,9 +13677,9 @@
     },
     "kube-runtime": {
       "crateName": "kube-runtime",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "1whmdwnq5nnzgkpldyql7p51grj19qrq0pk17r6yfvl2fmq76wn0",
+      "sha256": "08db3c5bg185y2yh6vilbkwqfdm5aykf87xllllwzis0qmkfrpcr",
       "source": {
         "type": "crates-io"
       },
@@ -14418,21 +13783,6 @@
       ],
       "authors": [
         "Marvin Löbel <loebel.marvin@gmail.com>"
-      ]
-    },
-    "leb128fmt": {
-      "crateName": "leb128fmt",
-      "version": "0.1.0",
-      "edition": "2021",
-      "sha256": "1chxm1484a0bly6anh6bd7a99sn355ymlagnwj3yajafnpldkv89",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Bryant Luk <code@bryantluk.com>"
       ]
     },
     "left-right": {
@@ -14562,27 +13912,6 @@
         "Portable-Network-Archive Developers"
       ]
     },
-    "libm": {
-      "crateName": "libm",
-      "version": "0.2.16",
-      "edition": "2021",
-      "sha256": "10brh0a3qjmbzkr5mf5xqi887nhs5y9layvnki89ykz9xb1wxlmn",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "arch"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Alex Crichton <alex@alexcrichton.com>",
-        "Amanieu d'Antras <amanieu@gmail.com>",
-        "Jorge Aparicio <japaricious@gmail.com>",
-        "Trevor Gross <tg@trevorgross.com>"
-      ]
-    },
     "libsqlite3-sys": {
       "crateName": "libsqlite3-sys",
       "version": "0.30.1",
@@ -14686,9 +14015,9 @@
     },
     "log": {
       "crateName": "log",
-      "version": "0.4.29",
+      "version": "0.4.32",
       "edition": "2021",
-      "sha256": "15q8j9c8g5zpkcw0hnd6cf2z7fxqnvsjh3rw5mv5q10r83i34l2y",
+      "sha256": "0fmdg0cxig7i4fwf1sw7fmg4d1gdbfzniawcfpwydy1q7320fgwm",
       "source": {
         "type": "crates-io"
       },
@@ -14941,9 +14270,9 @@
     },
     "md5": {
       "crateName": "md5",
-      "version": "0.7.0",
-      "edition": "2015",
-      "sha256": "0wcps37hrhz59fkhf8di1ppdnqld6l1w5sdy7jp7p51z0i4c8329",
+      "version": "0.8.0",
+      "edition": "2021",
+      "sha256": "1q6jfsa5w3993dzymxkv9jxpp7vyhgga6z35g6c0c8rk50w0i5mf",
       "source": {
         "type": "crates-io"
       },
@@ -14968,9 +14297,9 @@
     },
     "memchr": {
       "crateName": "memchr",
-      "version": "2.8.0",
+      "version": "2.8.2",
       "edition": "2021",
-      "sha256": "0y9zzxcqxvdqg6wyag7vc3h0blhdn7hkq164bxyx2vph8zs5ijpq",
+      "sha256": "1i33wr49pcz2sbd12nds3n9fszay8kq5bk78gwciz462mcs49448",
       "source": {
         "type": "crates-io"
       },
@@ -15084,7 +14413,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-util",
@@ -15298,9 +14627,9 @@
     },
     "mio": {
       "crateName": "mio",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "edition": "2021",
-      "sha256": "1hanrh4fwsfkdqdaqfidz48zz1wdix23zwn3r2x78am0garfbdsh",
+      "sha256": "1nkggmrlnjs93w8rja4lvjj4aml1xqahgimv1h0p7d373kvhmg82",
       "source": {
         "type": "crates-io"
       },
@@ -15488,9 +14817,9 @@
     },
     "nalgebra": {
       "crateName": "nalgebra",
-      "version": "0.34.2",
+      "version": "0.35.0",
       "edition": "2024",
-      "sha256": "02m7102xrslyxf55pjp5kpdhvv9d2gb08n08i63birn7yl7ylxnz",
+      "sha256": "0ij3kbcp1qv7iikazqcbb8p8vb8m228jczz48vzwdc0pq9h3mi5d",
       "source": {
         "type": "crates-io"
       },
@@ -16262,7 +15591,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "opentelemetry",
@@ -16292,7 +15621,7 @@
       "dependencies": [
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "opentelemetry",
@@ -16402,9 +15731,9 @@
     },
     "opentelemetry_sdk": {
       "crateName": "opentelemetry_sdk",
-      "version": "0.32.0",
+      "version": "0.32.1",
       "edition": "2021",
-      "sha256": "0mn9a0k7qj1jxycifa1bppwrhbf59gjzpf4v2w5z84216knzm2in",
+      "sha256": "1ycl11syranrinhgn4c2hlzhyzyvpa06ryxq5mxgzmf4387ghncv",
       "source": {
         "type": "crates-io"
       },
@@ -16579,11 +15908,11 @@
         "RustCrypto Developers"
       ]
     },
-    "p256 0.14.0-rc.9": {
+    "p256 0.14.0-rc.10": {
       "crateName": "p256",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.10",
       "edition": "2024",
-      "sha256": "16jzlqkslny2fjgqr1r4i5hvlqhkxgdm5zvm17lpl5b50jzy75wb",
+      "sha256": "0gh9jchvr38pcvs0s07n0xmawckylzbydh4cga1li7g9zwzcdba1",
       "source": {
         "type": "crates-io"
       },
@@ -16595,7 +15924,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.33"
         },
         {
           "name": "primefield",
@@ -16603,7 +15932,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.10"
         },
         {
           "name": "sha2",
@@ -16635,9 +15964,9 @@
     },
     "p384": {
       "crateName": "p384",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.10",
       "edition": "2024",
-      "sha256": "00xbpyh1bhzmias7ns114k4dpg4zss5z1mgami4gy5hyrgmk0zs3",
+      "sha256": "00mgrjs221dxamazwwgxhcal7njmq74z587675zk9q2sz8x37mcv",
       "source": {
         "type": "crates-io"
       },
@@ -16649,7 +15978,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.33"
         },
         {
           "name": "fiat-crypto",
@@ -16662,7 +15991,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.10"
         },
         {
           "name": "sha2",
@@ -16695,9 +16024,9 @@
     },
     "p521": {
       "crateName": "p521",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.10",
       "edition": "2024",
-      "sha256": "1ms36waabgab0pfhfwc8k7wi2da1bbxm45sn95icyvmqpa9dg7sf",
+      "sha256": "1bnfy3apjm9jzxry40czh3l6fy7z5h1s62q615cx65nwadzjk9d3",
       "source": {
         "type": "crates-io"
       },
@@ -16713,7 +16042,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.33"
         },
         {
           "name": "primefield",
@@ -16721,7 +16050,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.10"
         },
         {
           "name": "sha2",
@@ -16965,19 +16294,6 @@
       ],
       "authors": [
         "RustCrypto Developers"
-      ]
-    },
-    "paste": {
-      "crateName": "paste",
-      "version": "1.0.15",
-      "edition": "2018",
-      "sha256": "02pxffpdqkapy292harq6asfjvadgp1s005fip9ljfsn9fvxgh2p",
-      "source": {
-        "type": "crates-io"
-      },
-      "procMacro": true,
-      "authors": [
-        "David Tolnay <dtolnay@gmail.com>"
       ]
     },
     "pathdiff": {
@@ -17807,16 +17123,16 @@
     },
     "primefield": {
       "crateName": "primefield",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.12",
       "edition": "2024",
-      "sha256": "1dhcc30nk9a5lhzy9z0y3lbk21klr5iv88jnm5w26ffv8bpfclhv",
+      "sha256": "182wc17zv12yaxamhfqpgcy9cywikgl06svimyh6jbx6f53mcxc6",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
         {
           "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3",
+          "packageId": "crypto-bigint 0.7.4",
           "rename": "bigint"
         },
         {
@@ -17825,13 +17141,12 @@
           "rename": "common"
         },
         {
-          "name": "rand_core",
-          "packageId": "rand_core 0.10.1"
+          "name": "ff",
+          "packageId": "ff 0.14.0"
         },
         {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff",
-          "rename": "ff"
+          "name": "rand_core",
+          "packageId": "rand_core 0.10.1"
         },
         {
           "name": "subtle",
@@ -17870,18 +17185,18 @@
         "RustCrypto Developers"
       ]
     },
-    "primeorder 0.14.0-rc.9": {
+    "primeorder 0.14.0-rc.10": {
       "crateName": "primeorder",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.10",
       "edition": "2024",
-      "sha256": "0sm3lv10zmg1b97vadzr87p079c7fqda3b1jsbsk76618875hmh5",
+      "sha256": "1gwhzm42fp3084ip0s297rcp699w02zmj7dcycgd2vwv5gr969vx",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.33"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -18042,9 +17357,9 @@
     },
     "prost": {
       "crateName": "prost",
-      "version": "0.14.3",
+      "version": "0.14.4",
       "edition": "2021",
-      "sha256": "0s057z9nzggzy7x4bbsiar852hg7zb81f4z4phcdb0ig99971snj",
+      "sha256": "1qas5v5rap45f43v3ja0jngxrrafrkcwl0iw5a3ld1pz2rscd2jj",
       "source": {
         "type": "crates-io"
       },
@@ -18075,9 +17390,9 @@
     },
     "prost-build": {
       "crateName": "prost-build",
-      "version": "0.14.3",
+      "version": "0.14.4",
       "edition": "2021",
-      "sha256": "1rrf4rs74schd38jyaxglymi66vxzzg6hki00fdq7nkf0pbkng9l",
+      "sha256": "0hmh8nqxa0r6h7rv5rhl2yw0pmszq1h4hza09mmbni7z05w09nh3",
       "source": {
         "type": "crates-io"
       },
@@ -18152,9 +17467,9 @@
     },
     "prost-derive": {
       "crateName": "prost-derive",
-      "version": "0.14.3",
+      "version": "0.14.4",
       "edition": "2021",
-      "sha256": "02zvva6kb0pfvlyc4nac6gd37ncjrs8jq5scxcq4nbqkc8wh5ii7",
+      "sha256": "1pqa77d7da5pf6ba3kjj7510m5cynz6902ax01ckvr0pfrgv4w5m",
       "source": {
         "type": "crates-io"
       },
@@ -18190,9 +17505,9 @@
     },
     "prost-types": {
       "crateName": "prost-types",
-      "version": "0.14.3",
+      "version": "0.14.4",
       "edition": "2021",
-      "sha256": "1mrxrciryfgi6a0vmrgyj3g27r9hdhlgwkq71cgv3icbvg5w94c9",
+      "sha256": "02ivjvc4cwl5bfgjs3l00hwlrk74z8zlg1xcgx60bww8fvf6fjgr",
       "source": {
         "type": "crates-io"
       },
@@ -18383,7 +17698,7 @@
         },
         {
           "name": "socket2",
-          "packageId": "socket2 0.6.3",
+          "packageId": "socket2 0.6.4",
           "target": "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))"
         },
         {
@@ -18517,7 +17832,7 @@
         },
         {
           "name": "socket2",
-          "packageId": "socket2 0.6.3",
+          "packageId": "socket2 0.6.4",
           "target": "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))"
         },
         {
@@ -18718,7 +18033,7 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2"
+          "packageId": "getrandom 0.4.3"
         },
         {
           "name": "rand_core",
@@ -19095,9 +18410,9 @@
     },
     "regex": {
       "crateName": "regex",
-      "version": "1.12.3",
+      "version": "1.12.4",
       "edition": "2021",
-      "sha256": "0xp2q0x7ybmpa5zlgaz00p8zswcirj9h8nry3rxxsdwi9fhm81z1",
+      "sha256": "1fm6si2xpmhwqflabdqsakc0qkq718wx2ljl37nbj75fb5vjnagi",
       "source": {
         "type": "crates-io"
       },
@@ -19225,9 +18540,9 @@
     },
     "regex-syntax": {
       "crateName": "regex-syntax",
-      "version": "0.8.10",
+      "version": "0.8.11",
       "edition": "2021",
-      "sha256": "02jx311ka0daxxc7v45ikzhcl3iydjbbb0mdrpc1xgg8v7c7v2fw",
+      "sha256": "1m25h5q2wp976fb9gc3dsc9l99svcvd5cri8lncb51c46ydgzxnn",
       "source": {
         "type": "crates-io"
       },
@@ -19271,9 +18586,9 @@
     },
     "reqwest": {
       "crateName": "reqwest",
-      "version": "0.13.3",
+      "version": "0.13.4",
       "edition": "2021",
-      "sha256": "1h7fgnllk7ihw7836b7z73h9fb5vk90y3irvcm0ysan2l8g05q32",
+      "sha256": "1hy1plns9krbh3h1dy2sdjygsfkdcnxm6pbxdi0ya9b5vq8mi711",
       "source": {
         "type": "crates-io"
       },
@@ -19301,7 +18616,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -19315,7 +18630,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0",
+          "packageId": "hyper 1.10.1",
           "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
         },
         {
@@ -19397,7 +18712,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.11",
           "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
         },
         {
@@ -20034,7 +19349,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "metrics",
@@ -20102,7 +19417,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
+          "packageId": "tower-http 0.7.0"
         },
         {
           "name": "tracing",
@@ -20287,7 +19602,7 @@
       "devDependencies": [
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "metrics-util",
@@ -20627,7 +19942,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "itf",
@@ -21016,7 +20331,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "lru",
@@ -21140,7 +20455,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
+          "packageId": "tower-http 0.7.0"
         },
         {
           "name": "tracing",
@@ -21170,7 +20485,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "itf",
@@ -21313,7 +20628,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "httpdate",
@@ -21433,7 +20748,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
+          "packageId": "tower-http 0.7.0"
         },
         {
           "name": "tracing",
@@ -21572,7 +20887,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body-util",
@@ -21739,7 +21054,7 @@
         },
         {
           "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3"
+          "packageId": "crypto-bigint 0.7.4"
         },
         {
           "name": "crypto-primes",
@@ -21868,9 +21183,9 @@
     },
     "russh": {
       "crateName": "russh",
-      "version": "0.61.0",
+      "version": "0.61.2",
       "edition": "2024",
-      "sha256": "1lvx3ixwfsn2h3j8zxaqlv9n0aldh32rk1085wwr9q75zk8l38zv",
+      "sha256": "1c6hlw3pf9pyf1bm2k174q149w0w9plaamldlsl8vrc48vv97y5v",
       "source": {
         "type": "crates-io"
       },
@@ -21889,7 +21204,7 @@
         },
         {
           "name": "block-padding",
-          "packageId": "block-padding 0.4.2"
+          "packageId": "block-padding"
         },
         {
           "name": "byteorder",
@@ -21909,7 +21224,7 @@
         },
         {
           "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3"
+          "packageId": "crypto-bigint 0.7.4"
         },
         {
           "name": "ctr",
@@ -21945,7 +21260,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.33"
         },
         {
           "name": "enum_dispatch",
@@ -21961,11 +21276,11 @@
         },
         {
           "name": "generic-array",
-          "packageId": "generic-array 1.4.1"
+          "packageId": "generic-array 1.4.3"
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.2.17"
+          "packageId": "getrandom 0.4.3"
         },
         {
           "name": "ghash",
@@ -21976,16 +21291,12 @@
           "packageId": "hex-literal"
         },
         {
-          "name": "hkdf",
-          "packageId": "hkdf"
-        },
-        {
           "name": "hmac",
           "packageId": "hmac 0.13.0"
         },
         {
           "name": "inout",
-          "packageId": "inout 0.1.4"
+          "packageId": "inout"
         },
         {
           "name": "internal-russh-num-bigint",
@@ -22019,7 +21330,7 @@
         },
         {
           "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
+          "packageId": "p256 0.14.0-rc.10"
         },
         {
           "name": "p384",
@@ -22286,69 +21597,6 @@
         "lib"
       ]
     },
-    "rustcrypto-ff": {
-      "crateName": "rustcrypto-ff",
-      "version": "0.14.0-rc.1",
-      "edition": "2021",
-      "sha256": "1xjzqqg2kr41p4bjnrx5n2ljvik69f6223dss8y6jivl6kdqlapx",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.10.1"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sean Bowe <ewillbefull@gmail.com>",
-        "Jack Grigg <thestr4d@gmail.com>"
-      ]
-    },
-    "rustcrypto-group": {
-      "crateName": "rustcrypto-group",
-      "version": "0.14.0-rc.1",
-      "edition": "2021",
-      "sha256": "1vc57ys41cak4s0d6gd8xj3hcwdba0y5qswz5h33r4s5m9hrp7rn",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.10.1"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff",
-          "rename": "ff"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sean Bowe <ewillbefull@gmail.com>",
-        "Jack Grigg <jack@z.cash>"
-      ]
-    },
     "rustix": {
       "crateName": "rustix",
       "version": "1.1.4",
@@ -22464,9 +21712,9 @@
     },
     "rustls-native-certs": {
       "crateName": "rustls-native-certs",
-      "version": "0.8.3",
+      "version": "0.8.4",
       "edition": "2021",
-      "sha256": "0qrajg2n90bcr3bcq6j95gjm7a9lirfkkdmjj32419dyyzan0931",
+      "sha256": "0kgazl8zc1sv63qg179bz96ilzh56lzfa5k92ji7d265f4kibdfs",
       "source": {
         "type": "crates-io"
       },
@@ -22729,9 +21977,9 @@
     },
     "safe_arch": {
       "crateName": "safe_arch",
-      "version": "0.7.4",
-      "edition": "2018",
-      "sha256": "08sk47n1kcm5w2di6bpgi2hsw8r2caz2230pwqvbdqfv5pl2vc4n",
+      "version": "1.0.0",
+      "edition": "2024",
+      "sha256": "1vgg8l61kqpg3wsrb29k3xfiyg0cf9576rylpicihmmxjk8alz0z",
       "source": {
         "type": "crates-io"
       },
@@ -23267,9 +22515,9 @@
     },
     "serde-saphyr": {
       "crateName": "serde-saphyr",
-      "version": "0.0.26",
+      "version": "0.0.27",
       "edition": "2024",
-      "sha256": "1w7a4acvdyyf958wpakyqki7z975j65kn9g6r1xsj0jdwd4gxiyw",
+      "sha256": "1crx4kmmm88y4dbaramdsn0w8fqzchaz12b6vdgx7bddzb1v95sq",
       "source": {
         "type": "crates-io"
       },
@@ -23297,8 +22545,7 @@
         },
         {
           "name": "granit-parser",
-          "packageId": "granit-parser",
-          "rename": "saphyr_parser"
+          "packageId": "granit-parser"
         },
         {
           "name": "nohash-hasher",
@@ -23647,43 +22894,6 @@
         "Jonas Bushart"
       ]
     },
-    "serde_yaml": {
-      "crateName": "serde_yaml",
-      "version": "0.9.34+deprecated",
-      "edition": "2021",
-      "sha256": "0isba1fjyg3l6rxk156k600ilzr8fp7crv82rhal0rxz5qd1m2va",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
-        },
-        {
-          "name": "itoa",
-          "packageId": "itoa"
-        },
-        {
-          "name": "ryu",
-          "packageId": "ryu"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "unsafe-libyaml",
-          "packageId": "unsafe-libyaml"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "David Tolnay <dtolnay@gmail.com>"
-      ]
-    },
     "serdect": {
       "crateName": "serdect",
       "version": "0.4.3",
@@ -23948,9 +23158,9 @@
     },
     "shlex": {
       "crateName": "shlex",
-      "version": "1.3.0",
-      "edition": "2015",
-      "sha256": "0r1y6bv26c1scpxvhg2cabimrmwgbp4p3wy6syj9n0c4s3q2znhg",
+      "version": "2.0.1",
+      "edition": "2018",
+      "sha256": "1fjsll1cd7d2bcpdij9kd6w62rpbc7qqzvydvs021vsmr1cxvypq",
       "source": {
         "type": "crates-io"
       },
@@ -24059,9 +23269,9 @@
     },
     "simba": {
       "crateName": "simba",
-      "version": "0.9.1",
+      "version": "0.10.0",
       "edition": "2018",
-      "sha256": "15gxgwcm6vs2wbbc5z4x8zsi1rhjl3nvqnxpl95hjrhnnaz894n9",
+      "sha256": "1clwklcpyv2is0sxydvsy2nf36g9q7qdj9c653wqd8zkm52ccicg",
       "source": {
         "type": "crates-io"
       },
@@ -24077,10 +23287,6 @@
         {
           "name": "num-traits",
           "packageId": "num-traits"
-        },
-        {
-          "name": "paste",
-          "packageId": "paste"
         },
         {
           "name": "wide",
@@ -24219,9 +23425,9 @@
     },
     "smallvec": {
       "crateName": "smallvec",
-      "version": "1.15.1",
+      "version": "1.15.2",
       "edition": "2018",
-      "sha256": "00xxdxxpgyq5vjnpljvkmy99xij5rxgh913ii1v16kzynnivgcb7",
+      "sha256": "143wzbqf6vgapdp2z4qpl0yvlqcn17s8cnk8m28rqly808zsdmlf",
       "source": {
         "type": "crates-io"
       },
@@ -24275,11 +23481,11 @@
         "Thomas de Zeeuw <thomasdezeeuw@gmail.com>"
       ]
     },
-    "socket2 0.6.3": {
+    "socket2 0.6.4": {
       "crateName": "socket2",
-      "version": "0.6.3",
+      "version": "0.6.4",
       "edition": "2021",
-      "sha256": "0gkjjcyn69hqhhlh5kl8byk5m0d7hyrp2aqwzbs3d33q208nwxis",
+      "sha256": "0ldyp5rhba15spwxj1n94xh7sjks1398c3vwpwkxkd1087nwzlaj",
       "source": {
         "type": "crates-io"
       },
@@ -25234,7 +24440,7 @@
         },
         {
           "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3",
+          "packageId": "crypto-bigint 0.7.4",
           "rename": "bigint"
         },
         {
@@ -25306,7 +24512,7 @@
         },
         {
           "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
+          "packageId": "p256 0.14.0-rc.10"
         },
         {
           "name": "p384",
@@ -25549,9 +24755,9 @@
     },
     "syn": {
       "crateName": "syn",
-      "version": "2.0.117",
+      "version": "2.0.118",
       "edition": "2021",
-      "sha256": "16cv7c0wbn8amxc54n4w15kxlx5ypdmla8s0gxr2l7bv7s0bhrg6",
+      "sha256": "08hlbc32lqd5d67p26ck7chg0rkclsw9as6f96vfn4s2j1zyb6hv",
       "source": {
         "type": "crates-io"
       },
@@ -25729,7 +24935,7 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
+          "packageId": "getrandom 0.4.3",
           "target": "cfg(any(unix, windows, target_os = \"wasi\"))"
         },
         {
@@ -25836,9 +25042,9 @@
     },
     "time": {
       "crateName": "time",
-      "version": "0.3.47",
+      "version": "0.3.49",
       "edition": "2024",
-      "sha256": "0b7g9ly2iabrlgizliz6v5x23yq5d6bpp0mqz6407z1s526d8fvl",
+      "sha256": "0sc4dgw6g187gvz5qj9iqqk2ashqzvdwi664b2183gbvsk1566ki",
       "source": {
         "type": "crates-io"
       },
@@ -25846,10 +25052,6 @@
         {
           "name": "deranged",
           "packageId": "deranged"
-        },
-        {
-          "name": "itoa",
-          "packageId": "itoa"
         },
         {
           "name": "num-conv",
@@ -25887,9 +25089,9 @@
     },
     "time-core": {
       "crateName": "time-core",
-      "version": "0.1.8",
+      "version": "0.1.9",
       "edition": "2024",
-      "sha256": "1jidl426mw48i7hjj4hs9vxgd9lwqq4vyalm4q8d7y4iwz7y353n",
+      "sha256": "028ix0ax7ixp1h1k5zsqwgw85w6y1q32irslma7ci6ddd5kr074y",
       "source": {
         "type": "crates-io"
       },
@@ -25903,9 +25105,9 @@
     },
     "time-macros": {
       "crateName": "time-macros",
-      "version": "0.2.27",
+      "version": "0.2.29",
       "edition": "2024",
-      "sha256": "058ja265waq275wxvnfwavbz9r1hd4dgwpfn7a1a9a70l32y8w1f",
+      "sha256": "0zf1ycfikg93ijf00qnprk801khqnqqga1zp0adbp73sfaim5iki",
       "source": {
         "type": "crates-io"
       },
@@ -26053,7 +25255,7 @@
         },
         {
           "name": "socket2",
-          "packageId": "socket2 0.6.3",
+          "packageId": "socket2 0.6.4",
           "target": "cfg(any(not(target_family = \"wasm\"), all(target_os = \"wasi\", not(target_env = \"p1\"))))"
         },
         {
@@ -26224,9 +25426,9 @@
     },
     "tokio-tungstenite": {
       "crateName": "tokio-tungstenite",
-      "version": "0.28.0",
+      "version": "0.29.0",
       "edition": "2018",
-      "sha256": "0mzqgc94csy5ai6kx5yxj548shppq2kwdbyrsdsilhycvmn40nnj",
+      "sha256": "0p4i0a9fwhn92y4ybc0z75pc8hn2hjjgnlymminqb1c5h9ga0wlg",
       "source": {
         "type": "crates-io"
       },
@@ -26381,9 +25583,9 @@
     },
     "toml_edit": {
       "crateName": "toml_edit",
-      "version": "0.25.11+spec-1.1.0",
+      "version": "0.25.12+spec-1.1.0",
       "edition": "2024",
-      "sha256": "0awzffbkx33v9x4h19b5mfrwp3sn4ifr16y58sbk6j6l5v9c8n8b",
+      "sha256": "1mx5paq837rjw7w51zprrjynk1vaig9yzxfqz9ac79jmd7f3w5fj",
       "source": {
         "type": "crates-io"
       },
@@ -26478,11 +25680,11 @@
         },
         {
           "name": "h2",
-          "packageId": "h2 0.4.14"
+          "packageId": "h2 0.4.15"
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -26494,7 +25696,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-timeout",
@@ -26514,7 +25716,7 @@
         },
         {
           "name": "socket2",
-          "packageId": "socket2 0.6.3"
+          "packageId": "socket2 0.6.4"
         },
         {
           "name": "sync_wrapper",
@@ -26765,7 +25967,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -26888,7 +26090,7 @@
         "Tower Maintainers <team@tower-rs.com>"
       ]
     },
-    "tower-http": {
+    "tower-http 0.6.11": {
       "crateName": "tower-http",
       "version": "0.6.11",
       "edition": "2018",
@@ -26915,7 +26117,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "http-body",
@@ -26953,7 +26155,6 @@
       "resolvedDefaultFeatures": [
         "auth",
         "base64",
-        "cors",
         "default",
         "follow-redirect",
         "futures-util",
@@ -26964,6 +26165,55 @@
         "tracing",
         "util",
         "validate-request"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Tower Maintainers <team@tower-rs.com>"
+      ]
+    },
+    "tower-http 0.7.0": {
+      "crateName": "tower-http",
+      "version": "0.7.0",
+      "edition": "2018",
+      "sha256": "0cz2k1a6gj54lcqx9cxb6k7rfgwcgc2zi31xnq0vxhmh2blpa7xi",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.2"
+        },
+        {
+          "name": "percent-encoding",
+          "packageId": "percent-encoding"
+        },
+        {
+          "name": "pin-project-lite",
+          "packageId": "pin-project-lite"
+        },
+        {
+          "name": "tower-layer",
+          "packageId": "tower-layer"
+        },
+        {
+          "name": "tower-service",
+          "packageId": "tower-service"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "cors",
+        "default"
       ],
       "libCrateTypes": [
         "lib"
@@ -27450,9 +26700,9 @@
     },
     "tungstenite": {
       "crateName": "tungstenite",
-      "version": "0.28.0",
+      "version": "0.29.0",
       "edition": "2021",
-      "sha256": "0hll4l62lk77zqzgps04689skpk555lcpmi3hhyyn2as9v4dqa46",
+      "sha256": "1f7673dhqbfxc0f2ccyiyqhv882nkialnzm5qb3vkbwky8m1a0bc",
       "source": {
         "type": "crates-io"
       },
@@ -27467,7 +26717,7 @@
         },
         {
           "name": "http",
-          "packageId": "http 1.4.0"
+          "packageId": "http 1.4.2"
         },
         {
           "name": "httparse",
@@ -27488,10 +26738,6 @@
         {
           "name": "thiserror",
           "packageId": "thiserror"
-        },
-        {
-          "name": "utf-8",
-          "packageId": "utf-8"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -27511,9 +26757,9 @@
     },
     "typenum": {
       "crateName": "typenum",
-      "version": "1.20.0",
+      "version": "1.20.1",
       "edition": "2018",
-      "sha256": "1pj35y6q11d3y55gdl6g1h2dfhmybjming0jdi9bh0bpnqm11kj0",
+      "sha256": "086s9ly0906kw5yw41249fba97w5zfxf03pyfwdkffvcprqfixdn",
       "source": {
         "type": "crates-io"
       },
@@ -27522,10 +26768,6 @@
       ],
       "libCrateTypes": [
         "lib"
-      ],
-      "authors": [
-        "Paho Lurie-Gregg <paho@paholg.com>",
-        "Andre Bogus <bogusandre@gmail.com>"
       ]
     },
     "ucd-trie": {
@@ -27672,9 +26914,9 @@
     },
     "unicode-segmentation": {
       "crateName": "unicode-segmentation",
-      "version": "1.13.2",
+      "version": "1.13.3",
       "edition": "2018",
-      "sha256": "135a26m4a0wj319gcw28j6a5aqvz00jmgwgmcs6szgxjf942facn",
+      "sha256": "1a47zaq83p386r3baq4m018xd5q4q0grdg56i1x042dzn71x7xf6",
       "source": {
         "type": "crates-io"
       },
@@ -27706,26 +26948,6 @@
         "Manish Goregaokar <manishsmail@gmail.com>"
       ]
     },
-    "unicode-xid": {
-      "crateName": "unicode-xid",
-      "version": "0.2.6",
-      "edition": "2015",
-      "sha256": "0lzqaky89fq0bcrh6jj6bhlz37scfd8c7dsj5dq7y32if56c1hgb",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "default"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "erick.tryzelaar <erick.tryzelaar@gmail.com>",
-        "kwantam <kwantam@gmail.com>",
-        "Manish Goregaokar <manishsmail@gmail.com>"
-      ]
-    },
     "universal-hash": {
       "crateName": "universal-hash",
       "version": "0.6.1",
@@ -27750,21 +26972,6 @@
       ],
       "authors": [
         "RustCrypto Developers"
-      ]
-    },
-    "unsafe-libyaml": {
-      "crateName": "unsafe-libyaml",
-      "version": "0.2.11",
-      "edition": "2021",
-      "sha256": "0qdq69ffl3v5pzx9kzxbghzn0fzn266i1xn70y88maybz9csqfk7",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "David Tolnay <dtolnay@gmail.com>"
       ]
     },
     "untrusted 0.7.1": {
@@ -27847,22 +27054,6 @@
         "Bertram Truong <b@bertramtruong.com>"
       ]
     },
-    "utf-8": {
-      "crateName": "utf-8",
-      "version": "0.7.6",
-      "edition": "2015",
-      "sha256": "1a9ns3fvgird0snjkd3wbdhwd3zdpc2h5gpyybrfr6ra5pkqxk09",
-      "source": {
-        "type": "crates-io"
-      },
-      "libName": "utf8",
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Simon Sapin <simon.sapin@exyr.org>"
-      ]
-    },
     "utf8_iter": {
       "crateName": "utf8_iter",
       "version": "1.0.4",
@@ -27899,16 +27090,16 @@
     },
     "uuid": {
       "crateName": "uuid",
-      "version": "1.23.1",
+      "version": "1.23.3",
       "edition": "2021",
-      "sha256": "0xlwg23rmsfl3gx98qsyzpl24pf4bs9wi3mqx5c6i319hyb4mmyx",
+      "sha256": "1drddl03gi12vl1s3l2h371dw39plhn9wappp00v707g7h96nk8l",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
+          "packageId": "getrandom 0.4.3",
           "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
         },
         {
@@ -28086,34 +27277,16 @@
     },
     "wasip2": {
       "crateName": "wasip2",
-      "version": "1.0.3+wasi-0.2.9",
+      "version": "1.0.4+wasi-0.2.12",
       "edition": "2021",
-      "sha256": "1mi3w855dz99xzjqc4aa8c9q5b6z1y5c963pkk4cvmr6vdr4c1i0",
+      "sha256": "11wl7lqwq4pbmlmzr6n7bwz0hzy1z6sxc4554bkmrr86w4vznzmn",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
         {
           "name": "wit-bindgen",
-          "packageId": "wit-bindgen 0.57.1"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "wasip3": {
-      "crateName": "wasip3",
-      "version": "0.4.0+wasi-0.3.0-rc-2026-01-06",
-      "edition": "2021",
-      "sha256": "19dc8p0y2mfrvgk3qw3c3240nfbylv22mvyxz84dqpgai2zzha2l",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "wit-bindgen",
-          "packageId": "wit-bindgen 0.51.0"
+          "packageId": "wit-bindgen"
         }
       ],
       "libCrateTypes": [
@@ -28122,9 +27295,9 @@
     },
     "wasm-bindgen": {
       "crateName": "wasm-bindgen",
-      "version": "0.2.122",
+      "version": "0.2.125",
       "edition": "2021",
-      "sha256": "02flix96brsb2r1i3grnikii302iqpdm337kl3xv5lklz5v4bl1y",
+      "sha256": "06nakz7nfy0ymyp7a27wfbjwx69659i12117hkgddkiv2iwkznwd",
       "source": {
         "type": "crates-io"
       },
@@ -28166,9 +27339,9 @@
     },
     "wasm-bindgen-futures": {
       "crateName": "wasm-bindgen-futures",
-      "version": "0.4.72",
+      "version": "0.4.75",
       "edition": "2021",
-      "sha256": "03qb24gfr072rk8hb69glfdc8yhqqqq2rhy3j5i0ps8sk79dnwwl",
+      "sha256": "104jssshr6cm5hmkn6c66mbkyxgaaphng6c17g0dmj7jhk918fsh",
       "source": {
         "type": "crates-io"
       },
@@ -28195,9 +27368,9 @@
     },
     "wasm-bindgen-macro": {
       "crateName": "wasm-bindgen-macro",
-      "version": "0.2.122",
+      "version": "0.2.125",
       "edition": "2021",
-      "sha256": "1inyl55bvdifx7l60q9wl0ivmw7236jg7jqmcqpxhsx3knq52qci",
+      "sha256": "0g9w68dwcs4ylm5kxf7schi0kjdfarhc9qlnf8arxc9zn62a28af",
       "source": {
         "type": "crates-io"
       },
@@ -28218,9 +27391,9 @@
     },
     "wasm-bindgen-macro-support": {
       "crateName": "wasm-bindgen-macro-support",
-      "version": "0.2.122",
+      "version": "0.2.125",
       "edition": "2021",
-      "sha256": "0pjw5kc2mbfz59agk5l21kh4hxzp94rygdvsnr4f3z6b5hv4g419",
+      "sha256": "1gayzdx5iwl8gllh7ys79wg9cf4iyasl9hrzzhh5m4xx6nfgvkpy",
       "source": {
         "type": "crates-io"
       },
@@ -28255,9 +27428,9 @@
     },
     "wasm-bindgen-shared": {
       "crateName": "wasm-bindgen-shared",
-      "version": "0.2.122",
+      "version": "0.2.125",
       "edition": "2021",
-      "sha256": "0ds4mmfqvxwc5fp33hn0jblf0f6b4lghrd9mpkls66zic4n9p4ls",
+      "sha256": "07w7fy5qa14ys3p8v2p84h98yqinw713smibz9v7apcspd29x4r3",
       "source": {
         "type": "crates-io"
       },
@@ -28273,66 +27446,6 @@
       "links": "wasm_bindgen",
       "authors": [
         "The wasm-bindgen Developers"
-      ]
-    },
-    "wasm-encoder": {
-      "crateName": "wasm-encoder",
-      "version": "0.244.0",
-      "edition": "2021",
-      "sha256": "06c35kv4h42vk3k51xjz1x6hn3mqwfswycmr6ziky033zvr6a04r",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "leb128fmt",
-          "packageId": "leb128fmt"
-        },
-        {
-          "name": "wasmparser",
-          "packageId": "wasmparser"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "component-model",
-        "std",
-        "wasmparser"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Nick Fitzgerald <fitzgen@gmail.com>"
-      ]
-    },
-    "wasm-metadata": {
-      "crateName": "wasm-metadata",
-      "version": "0.244.0",
-      "edition": "2021",
-      "sha256": "02f9dhlnryd2l7zf03whlxai5sv26x4spfibjdvc3g9gd8z3a3mv",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
-        },
-        {
-          "name": "wasm-encoder",
-          "packageId": "wasm-encoder"
-        },
-        {
-          "name": "wasmparser",
-          "packageId": "wasmparser"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
       ]
     },
     "wasm-streams": {
@@ -28373,52 +27486,11 @@
         "Mattias Buelens <mattias@buelens.com>"
       ]
     },
-    "wasmparser": {
-      "crateName": "wasmparser",
-      "version": "0.244.0",
-      "edition": "2021",
-      "sha256": "1zi821hrlsxfhn39nqpmgzc0wk7ax3dv6vrs5cw6kb0v5v3hgf27",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "bitflags",
-          "packageId": "bitflags"
-        },
-        {
-          "name": "hashbrown",
-          "packageId": "hashbrown 0.15.5"
-        },
-        {
-          "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
-        },
-        {
-          "name": "semver",
-          "packageId": "semver"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "component-model",
-        "features",
-        "hash-collections",
-        "simd",
-        "std",
-        "validate"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Yury Delendik <ydelendik@mozilla.com>"
-      ]
-    },
     "web-sys": {
       "crateName": "web-sys",
-      "version": "0.3.99",
+      "version": "0.3.102",
       "edition": "2021",
-      "sha256": "0dilfvl9jnyhi4skl6cry9wc300r693j0w82jjbq8yy3rx0i8qkd",
+      "sha256": "0786aybrnwsgdmcynhc2k5ii291a02rq9zk054j35csyvxr0lhx6",
       "source": {
         "type": "crates-io"
       },
@@ -28508,9 +27580,9 @@
     },
     "webpki-root-certs": {
       "crateName": "webpki-root-certs",
-      "version": "1.0.7",
+      "version": "1.0.8",
       "edition": "2021",
-      "sha256": "0b59x5mzsilk42w59nif3lfhc24pgzb0v35pi6p01qy37z7424gk",
+      "sha256": "0ryjnclqn5km921jkff8x8wkj5imygprgblfrpnazxz682hsaihd",
       "source": {
         "type": "crates-io"
       },
@@ -28527,9 +27599,9 @@
     },
     "webpki-roots": {
       "crateName": "webpki-roots",
-      "version": "1.0.7",
+      "version": "1.0.8",
       "edition": "2021",
-      "sha256": "17gblaqmp51znxd2c18c04k8yfnf7s77c04n6hdmzxbcr52fxxaj",
+      "sha256": "1gricxbz1xk561qjflv5q2y4bap5lyspv7c2dxygl0920c3cp1dz",
       "source": {
         "type": "crates-io"
       },
@@ -28558,9 +27630,9 @@
     },
     "wide": {
       "crateName": "wide",
-      "version": "0.7.33",
-      "edition": "2018",
-      "sha256": "00yd2sg83xvfrjjlwndyk49fjx8jlmlrz8byigndig32rf7dmr8c",
+      "version": "1.5.0",
+      "edition": "2024",
+      "sha256": "12dz1l33d44jrhkjrrwi04psqv59m12mi2dqd2rd3wkk56iydpyz",
       "source": {
         "type": "crates-io"
       },
@@ -28571,7 +27643,13 @@
         },
         {
           "name": "safe_arch",
-          "packageId": "safe_arch"
+          "packageId": "safe_arch",
+          "target": "cfg(target_arch = \"x86\")"
+        },
+        {
+          "name": "safe_arch",
+          "packageId": "safe_arch",
+          "target": "cfg(target_arch = \"x86_64\")"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -28607,17 +27685,14 @@
       "resolvedDefaultFeatures": [
         "cfg",
         "evntrace",
-        "handleapi",
         "in6addr",
         "inaddr",
         "minwinbase",
         "ntsecapi",
         "profileapi",
-        "std",
         "sysinfoapi",
         "windef",
-        "winioctl",
-        "winsock2"
+        "winioctl"
       ],
       "libCrateTypes": [
         "lib"
@@ -29066,7 +28141,6 @@
         "Win32_System_SystemInformation",
         "Win32_System_SystemServices",
         "Win32_System_Threading",
-        "Win32_System_Time",
         "Win32_System_WindowsProgramming",
         "Win32_UI",
         "Win32_UI_Input",
@@ -29448,26 +28522,7 @@
         "lib"
       ]
     },
-    "wit-bindgen 0.51.0": {
-      "crateName": "wit-bindgen",
-      "version": "0.51.0",
-      "edition": "2024",
-      "sha256": "19fazgch8sq5cvjv3ynhhfh5d5x08jq2pkw8jfb05vbcyqcr496p",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "async",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Alex Crichton <alex@alexcrichton.com>"
-      ]
-    },
-    "wit-bindgen 0.57.1": {
+    "wit-bindgen": {
       "crateName": "wit-bindgen",
       "version": "0.57.1",
       "edition": "2024",
@@ -29475,254 +28530,6 @@
       "source": {
         "type": "crates-io"
       },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Alex Crichton <alex@alexcrichton.com>"
-      ]
-    },
-    "wit-bindgen-core": {
-      "crateName": "wit-bindgen-core",
-      "version": "0.51.0",
-      "edition": "2024",
-      "sha256": "1p2jszqsqbx8k7y8nwvxg65wqzxjm048ba5phaq8r9iy9ildwqga",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "heck",
-          "packageId": "heck"
-        },
-        {
-          "name": "wit-parser",
-          "packageId": "wit-parser"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Alex Crichton <alex@alexcrichton.com>"
-      ]
-    },
-    "wit-bindgen-rust": {
-      "crateName": "wit-bindgen-rust",
-      "version": "0.51.0",
-      "edition": "2024",
-      "sha256": "08bzn5fsvkb9x9wyvyx98qglknj2075xk1n7c5jxv15jykh6didp",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "heck",
-          "packageId": "heck"
-        },
-        {
-          "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
-        },
-        {
-          "name": "prettyplease",
-          "packageId": "prettyplease"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
-        },
-        {
-          "name": "wasm-metadata",
-          "packageId": "wasm-metadata"
-        },
-        {
-          "name": "wit-bindgen-core",
-          "packageId": "wit-bindgen-core"
-        },
-        {
-          "name": "wit-component",
-          "packageId": "wit-component"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Alex Crichton <alex@alexcrichton.com>"
-      ]
-    },
-    "wit-bindgen-rust-macro": {
-      "crateName": "wit-bindgen-rust-macro",
-      "version": "0.51.0",
-      "edition": "2024",
-      "sha256": "0ymizapzv2id89igxsz2n587y2hlfypf6n8kyp68x976fzyrn3qc",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "prettyplease",
-          "packageId": "prettyplease"
-        },
-        {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
-          "name": "quote",
-          "packageId": "quote"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
-        },
-        {
-          "name": "wit-bindgen-core",
-          "packageId": "wit-bindgen-core"
-        },
-        {
-          "name": "wit-bindgen-rust",
-          "packageId": "wit-bindgen-rust"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "async"
-      ],
-      "procMacro": true,
-      "authors": [
-        "Alex Crichton <alex@alexcrichton.com>"
-      ]
-    },
-    "wit-component": {
-      "crateName": "wit-component",
-      "version": "0.244.0",
-      "edition": "2021",
-      "sha256": "1clwxgsgdns3zj2fqnrjcp8y5gazwfa1k0sy5cbk0fsmx4hflrlx",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "bitflags",
-          "packageId": "bitflags"
-        },
-        {
-          "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
-        },
-        {
-          "name": "log",
-          "packageId": "log"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_derive",
-          "packageId": "serde_derive"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
-          "name": "wasm-encoder",
-          "packageId": "wasm-encoder"
-        },
-        {
-          "name": "wasm-metadata",
-          "packageId": "wasm-metadata"
-        },
-        {
-          "name": "wasmparser",
-          "packageId": "wasmparser"
-        },
-        {
-          "name": "wit-parser",
-          "packageId": "wit-parser"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Peter Huene <peter@huene.dev>"
-      ]
-    },
-    "wit-parser": {
-      "crateName": "wit-parser",
-      "version": "0.244.0",
-      "edition": "2021",
-      "sha256": "0dm7avvdxryxd5b02l0g5h6933z1cw5z0d4wynvq2cywq55srj7c",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "id-arena",
-          "packageId": "id-arena"
-        },
-        {
-          "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
-        },
-        {
-          "name": "log",
-          "packageId": "log"
-        },
-        {
-          "name": "semver",
-          "packageId": "semver"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_derive",
-          "packageId": "serde_derive"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
-          "name": "unicode-xid",
-          "packageId": "unicode-xid"
-        },
-        {
-          "name": "wasmparser",
-          "packageId": "wasmparser"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "decoding",
-        "default",
-        "serde",
-        "serde_json"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -29799,7 +28606,7 @@
         },
         {
           "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3"
+          "packageId": "crypto-bigint 0.7.4"
         },
         {
           "name": "crypto-common",
@@ -29851,7 +28658,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.33"
         },
         {
           "name": "event-listener-strategy",
@@ -29860,6 +28667,10 @@
         {
           "name": "fastrand",
           "packageId": "fastrand"
+        },
+        {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
         },
         {
           "name": "futures",
@@ -29892,15 +28703,12 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "aarch64-unknown-linux-gnu"
+          "packageId": "getrandom 0.4.3",
+          "rename": "getrandom_9fbad63c4bcf4a8f"
         },
         {
-          "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "x86_64-unknown-linux-gnu"
+          "name": "group",
+          "packageId": "group 0.14.0"
         },
         {
           "name": "hashbrown",
@@ -29922,7 +28730,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-rustls",
@@ -29954,7 +28762,7 @@
         },
         {
           "name": "inout",
-          "packageId": "inout 0.2.2"
+          "packageId": "inout"
         },
         {
           "name": "jiff",
@@ -30034,7 +28842,7 @@
         },
         {
           "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
+          "packageId": "p256 0.14.0-rc.10"
         },
         {
           "name": "p384",
@@ -30062,7 +28870,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.10"
         },
         {
           "name": "proc-macro2",
@@ -30113,14 +28921,6 @@
         {
           "name": "rsa",
           "packageId": "rsa"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group"
         },
         {
           "name": "rustls",
@@ -30284,16 +29084,12 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
-        },
-        {
-          "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.11",
           "target": "aarch64-unknown-linux-gnu"
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.11",
           "target": "x86_64-unknown-linux-gnu"
         },
         {
@@ -30390,7 +29186,7 @@
         },
         {
           "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3"
+          "packageId": "crypto-bigint 0.7.4"
         },
         {
           "name": "crypto-common",
@@ -30442,7 +29238,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.33"
         },
         {
           "name": "event-listener-strategy",
@@ -30451,6 +29247,10 @@
         {
           "name": "fastrand",
           "packageId": "fastrand"
+        },
+        {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
         },
         {
           "name": "futures",
@@ -30483,15 +29283,12 @@
         },
         {
           "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "aarch64-unknown-linux-gnu"
+          "packageId": "getrandom 0.4.3",
+          "rename": "getrandom_9fbad63c4bcf4a8f"
         },
         {
-          "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "x86_64-unknown-linux-gnu"
+          "name": "group",
+          "packageId": "group 0.14.0"
         },
         {
           "name": "hashbrown",
@@ -30513,7 +29310,7 @@
         },
         {
           "name": "hyper",
-          "packageId": "hyper 1.9.0"
+          "packageId": "hyper 1.10.1"
         },
         {
           "name": "hyper-rustls",
@@ -30545,7 +29342,7 @@
         },
         {
           "name": "inout",
-          "packageId": "inout 0.2.2"
+          "packageId": "inout"
         },
         {
           "name": "jiff",
@@ -30625,7 +29422,7 @@
         },
         {
           "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
+          "packageId": "p256 0.14.0-rc.10"
         },
         {
           "name": "p384",
@@ -30653,7 +29450,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.10"
         },
         {
           "name": "proc-macro2",
@@ -30704,14 +29501,6 @@
         {
           "name": "rsa",
           "packageId": "rsa"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group"
         },
         {
           "name": "rustls",
@@ -30875,16 +29664,12 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
-        },
-        {
-          "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.11",
           "target": "aarch64-unknown-linux-gnu"
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.11",
           "target": "x86_64-unknown-linux-gnu"
         },
         {
@@ -31243,9 +30028,9 @@
     },
     "yoke": {
       "crateName": "yoke",
-      "version": "0.8.2",
+      "version": "0.8.3",
       "edition": "2021",
-      "sha256": "1jprcs7a98a5whvfs6r3jvfh1nnfp6zyijl7y4ywmn88lzywbs5b",
+      "sha256": "1xgyj6c2lxj2bp891ynmhws87c6z7yyv2li1v0ss9di40hxf57vh",
       "source": {
         "type": "crates-io"
       },
@@ -31307,9 +30092,9 @@
     },
     "zerocopy": {
       "crateName": "zerocopy",
-      "version": "0.8.48",
+      "version": "0.8.52",
       "edition": "2021",
-      "sha256": "1sb8plax8jbrsng1jdval7bdhk7hhrx40dz3hwh074k6knzkgm7f",
+      "sha256": "0gv563swc1yn3k8w3wjj07a8q293rkx99nfp3a25vzzmbycj446f",
       "source": {
         "type": "crates-io"
       },
@@ -31339,9 +30124,9 @@
     },
     "zerocopy-derive": {
       "crateName": "zerocopy-derive",
-      "version": "0.8.48",
+      "version": "0.8.52",
       "edition": "2021",
-      "sha256": "1m5s0g92cxggqc74j83k1priz24k3z93sj5gadppd20p9c4cvqvh",
+      "sha256": "0c3rhsh4sd9kdym4z55zprybjkydy9y2gvw75d72aapcfa5z7rqs",
       "source": {
         "type": "crates-io"
       },
@@ -31422,9 +30207,9 @@
     },
     "zeroize": {
       "crateName": "zeroize",
-      "version": "1.8.2",
-      "edition": "2021",
-      "sha256": "1l48zxgcv34d7kjskr610zqsm6j2b4fcr2vfh9jm9j1jgvk58wdr",
+      "version": "1.9.0",
+      "edition": "2024",
+      "sha256": "0kpnij2v1ig6g2mhc0bnci0lrdfdhiq40afbc0fahajqc9jiag71",
       "source": {
         "type": "crates-io"
       },
@@ -31450,9 +30235,9 @@
     },
     "zeroize_derive": {
       "crateName": "zeroize_derive",
-      "version": "1.4.3",
-      "edition": "2021",
-      "sha256": "0bl5vd1lz27p4z336nximg5wrlw5j7jc8fxh7iv6r1wrhhav99c5",
+      "version": "1.5.0",
+      "edition": "2024",
+      "sha256": "0a7kq8srk81pn23xqn7c9jw1jpnfy41ffn802x1zrqqgpdf6al1w",
       "source": {
         "type": "crates-io"
       },

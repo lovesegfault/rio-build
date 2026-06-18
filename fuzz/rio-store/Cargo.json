@@ -258,6 +258,32 @@
         "Zakarum <zaq.dev@icloud.com>"
       ]
     },
+    "annotate-snippets": {
+      "crateName": "annotate-snippets",
+      "version": "0.12.16",
+      "edition": "2024",
+      "sha256": "1w8kdyj2fh4n666wvd1krj2zcyjls9vlqrmpslx1yr5w0lcaa4gj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "anstream": {
       "crateName": "anstream",
       "version": "1.0.0",
@@ -430,6 +456,27 @@
         "Corey Farwell <coreyf@rwell.org>"
       ]
     },
+    "arc-swap": {
+      "crateName": "arc-swap",
+      "version": "1.9.1",
+      "edition": "2018",
+      "sha256": "01xjlahcya8igdalxmda375lnlhjqwjz0cdqhy0bc1jkyzb1yfka",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "rustversion",
+          "packageId": "rustversion"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Michal 'vorner' Vaner <vorner@vorner.cz>"
+      ]
+    },
     "argon2": {
       "crateName": "argon2",
       "version": "0.6.0-rc.8",
@@ -461,6 +508,21 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "arraydeque": {
+      "crateName": "arraydeque",
+      "version": "0.5.1",
+      "edition": "2021",
+      "sha256": "0dn2xdfg3rkiqsh8a6achnmvf5nf11xk33xgjzpksliab4yjx43x",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "andylokandy"
       ]
     },
     "arrayref": {
@@ -970,9 +1032,9 @@
     },
     "aws-runtime": {
       "crateName": "aws-runtime",
-      "version": "1.7.4",
+      "version": "1.7.5",
       "edition": "2021",
-      "sha256": "0rhmf8r3m0mv1wcjq9mlh2bixxv3wrzn85czmn827p6jaa68xvbp",
+      "sha256": "0ffb1kx742a74i2sx0k79zp4rqfgc1v2ma2lnxadv2592vi9v6vc",
       "source": {
         "type": "crates-io"
       },
@@ -1077,13 +1139,17 @@
     },
     "aws-sdk-s3": {
       "crateName": "aws-sdk-s3",
-      "version": "1.133.0",
+      "version": "1.137.0",
       "edition": "2021",
-      "sha256": "08lry6cn2bwk007ig65wfnc5jv51cjdamiww34zaih73hllvlyi3",
+      "sha256": "0x28bi5akhqx1nfzmn7wrms1n3f3g0xl007i5wwgjbsfk49p5pf2",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
         {
           "name": "aws-credential-types",
           "packageId": "aws-credential-types"
@@ -1464,9 +1530,9 @@
     },
     "aws-sigv4": {
       "crateName": "aws-sigv4",
-      "version": "1.4.4",
+      "version": "1.4.5",
       "edition": "2021",
-      "sha256": "19g9xxhyqfmlcwb5zb7lg5ld74l7zilqmgzzcnn7915k32wky25p",
+      "sha256": "0wfw30j8i97xh0gachpgvzpm6g0ji9x4xhhg07kzw3xfpq98bqxs",
       "source": {
         "type": "crates-io"
       },
@@ -1672,9 +1738,9 @@
     },
     "aws-smithy-eventstream": {
       "crateName": "aws-smithy-eventstream",
-      "version": "0.60.20",
+      "version": "0.60.21",
       "edition": "2021",
-      "sha256": "0j3m3n6alyrqjmrack36g8v3wc2rrnihb99dfsw7cbz3wms9vw7s",
+      "sha256": "01mpwv1wx02fljvwdchjn4aqdcvky50ilbm2hv2lgspwclg3kn3q",
       "source": {
         "type": "crates-io"
       },
@@ -1868,9 +1934,9 @@
     },
     "aws-smithy-json": {
       "crateName": "aws-smithy-json",
-      "version": "0.62.6",
+      "version": "0.62.7",
       "edition": "2021",
-      "sha256": "1xgazg8jas91jvrwksk8w6rbpfrrn668h0iybbf4maqqbwh8jw2i",
+      "sha256": "1yigf0gp5cypmg8vnrx4xsgw6in7cy38jjhi3s8jmrcp8xzr86kh",
       "source": {
         "type": "crates-io"
       },
@@ -2044,9 +2110,9 @@
     },
     "aws-smithy-runtime-api": {
       "crateName": "aws-smithy-runtime-api",
-      "version": "1.12.1",
+      "version": "1.12.3",
       "edition": "2021",
-      "sha256": "0ckcfypk6fgqk5wifwnignnsf9mcx40gcj9z18macffgkqbpq4fw",
+      "sha256": "130fzrbh0y4j3bhlwfay0r9czaq7r54gbz5fw6ggp2mslvd7gccx",
       "source": {
         "type": "crates-io"
       },
@@ -2168,9 +2234,9 @@
     },
     "aws-smithy-types": {
       "crateName": "aws-smithy-types",
-      "version": "1.4.8",
+      "version": "1.5.0",
       "edition": "2021",
-      "sha256": "02q5lklvlnyxz876b7a760sqm3xm5r0bn19b3q6cr09grvdncsq5",
+      "sha256": "11dbbyl72fxw8n7a2mb93ilyra28chprmb0gl5fdhn8j6k7jzd1j",
       "source": {
         "type": "crates-io"
       },
@@ -4240,9 +4306,9 @@
     },
     "curve25519-dalek": {
       "crateName": "curve25519-dalek",
-      "version": "5.0.0-pre.6",
+      "version": "5.0.0-rc.1",
       "edition": "2024",
-      "sha256": "1hwzbl3xay0nrgrd6wcxkkifv98qb765lvvb20a7l4s1y93ijprk",
+      "sha256": "0krq18zhiz5rkhm997m87rp47ic358bfh1ifsyazfvx3adzah1n9",
       "source": {
         "type": "crates-io"
       },
@@ -4253,7 +4319,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures 0.2.17",
+          "packageId": "cpufeatures 0.3.0",
           "target": "cfg(target_arch = \"x86_64\")"
         },
         {
@@ -4904,7 +4970,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.34"
         },
         {
           "name": "rfc6979",
@@ -4974,9 +5040,9 @@
     },
     "ed25519-dalek": {
       "crateName": "ed25519-dalek",
-      "version": "3.0.0-pre.7",
+      "version": "3.0.0-rc.1",
       "edition": "2024",
-      "sha256": "1djb9l1sn3s00z2qx8rp5rgz5rqzdnsvr8nawld9hq5nak6rli10",
+      "sha256": "0jdqs4nbc682fqfniyrdq8rl9zzblqiirjybgm8xhb484cz6d18n",
       "source": {
         "type": "crates-io"
       },
@@ -5115,7 +5181,7 @@
         },
         {
           "name": "ff",
-          "packageId": "ff"
+          "packageId": "ff 0.13.1"
         },
         {
           "name": "generic-array",
@@ -5123,7 +5189,7 @@
         },
         {
           "name": "group",
-          "packageId": "group"
+          "packageId": "group 0.13.0"
         },
         {
           "name": "pem-rfc7468",
@@ -5169,11 +5235,11 @@
         "RustCrypto Developers"
       ]
     },
-    "elliptic-curve 0.14.0-rc.32": {
+    "elliptic-curve 0.14.0-rc.34": {
       "crateName": "elliptic-curve",
-      "version": "0.14.0-rc.32",
+      "version": "0.14.0-rc.34",
       "edition": "2024",
-      "sha256": "1ajplymdl6nqwfc5m4acj0pyw3b5y2vcppkaf3lpahjw68qlzafd",
+      "sha256": "1ljvrbx68q4cxiqf7kaj4qxhp7xqmbspmxqrvi6ljglzgh4lv948",
       "source": {
         "type": "crates-io"
       },
@@ -5197,6 +5263,14 @@
           "packageId": "digest 0.11.2"
         },
         {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
+        },
+        {
+          "name": "group",
+          "packageId": "group 0.14.0"
+        },
+        {
           "name": "hkdf",
           "packageId": "hkdf"
         },
@@ -5218,22 +5292,16 @@
           "packageId": "rand_core 0.10.0"
         },
         {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff",
-          "rename": "ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group",
-          "rename": "group"
-        },
-        {
           "name": "sec1",
           "packageId": "sec1 0.8.1"
         },
         {
           "name": "subtle",
           "packageId": "subtle"
+        },
+        {
+          "name": "wnaf",
+          "packageId": "wnaf"
         },
         {
           "name": "zeroize",
@@ -5253,13 +5321,60 @@
         "pem",
         "pkcs8",
         "sec1",
-        "std"
+        "std",
+        "wnaf"
       ],
       "libCrateTypes": [
         "lib"
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "encoding_rs": {
+      "crateName": "encoding_rs",
+      "version": "0.8.35",
+      "edition": "2018",
+      "sha256": "1wv64xdrr9v37rqqdjsyb8l8wzlcbab80ryxhrszvnj59wy0y0vm",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Henri Sivonen <hsivonen@hsivonen.fi>"
+      ]
+    },
+    "encoding_rs_io": {
+      "crateName": "encoding_rs_io",
+      "version": "0.1.7",
+      "edition": "2015",
+      "sha256": "10ra4l688cdadd8h1lsbahld1zbywnnqv68366mbhamn3xjwbhqw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "encoding_rs",
+          "packageId": "encoding_rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
       ]
     },
     "endian-type": {
@@ -5502,7 +5617,7 @@
         "Stjepan Glavina <stjepang@gmail.com>"
       ]
     },
-    "ff": {
+    "ff 0.13.1": {
       "crateName": "ff",
       "version": "0.13.1",
       "edition": "2021",
@@ -5514,6 +5629,35 @@
         {
           "name": "rand_core",
           "packageId": "rand_core 0.6.4"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sean Bowe <ewillbefull@gmail.com>",
+        "Jack Grigg <thestr4d@gmail.com>"
+      ]
+    },
+    "ff 0.14.0": {
+      "crateName": "ff",
+      "version": "0.14.0",
+      "edition": "2021",
+      "sha256": "17s889wpzi2dp924bnxhznkbm44lp23nqv4g32phxyx9jamqdxm1",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "rand_core",
+          "packageId": "rand_core 0.10.0"
         },
         {
           "name": "subtle",
@@ -6218,6 +6362,11 @@
           "packageId": "cfg-if"
         },
         {
+          "name": "js-sys",
+          "packageId": "js-sys",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"), target_feature = \"atomics\"))"
+        },
+        {
           "name": "libc",
           "packageId": "libc",
           "target": "cfg(all(any(target_os = \"linux\", target_os = \"android\"), not(any(all(target_os = \"linux\", target_env = \"\"), getrandom_backend = \"custom\", getrandom_backend = \"linux_raw\", getrandom_backend = \"rdrand\", getrandom_backend = \"rndr\"))))"
@@ -6275,11 +6424,17 @@
           "name": "wasip3",
           "packageId": "wasip3",
           "target": "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p3\"))"
+        },
+        {
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
         }
       ],
       "resolvedDefaultFeatures": [
         "std",
-        "sys_rng"
+        "sys_rng",
+        "wasm_js"
       ],
       "libCrateTypes": [
         "lib"
@@ -6348,7 +6503,35 @@
         "Rust and WebAssembly Working Group"
       ]
     },
-    "group": {
+    "granit-parser": {
+      "crateName": "granit-parser",
+      "version": "0.0.3",
+      "edition": "2021",
+      "sha256": "14bwwc8swz8h0v8d7qybmmq25czv5aipd1v1vbariq7rchhs62zm",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "arraydeque",
+          "packageId": "arraydeque"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Ethiraric <ethiraric@gmail.com>",
+        "David Aguilar <davvid@gmail.com>",
+        "Yuheng Chen <yuhengchen@sensetime.com>",
+        "Bourumir Wyngs <bourumir-wyngs@gmail.com>"
+      ]
+    },
+    "group 0.13.0": {
       "crateName": "group",
       "version": "0.13.0",
       "edition": "2021",
@@ -6359,11 +6542,44 @@
       "dependencies": [
         {
           "name": "ff",
-          "packageId": "ff"
+          "packageId": "ff 0.13.1"
         },
         {
           "name": "rand_core",
           "packageId": "rand_core 0.6.4"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sean Bowe <ewillbefull@gmail.com>",
+        "Jack Grigg <jack@z.cash>"
+      ]
+    },
+    "group 0.14.0": {
+      "crateName": "group",
+      "version": "0.14.0",
+      "edition": "2021",
+      "sha256": "1x7m980b0m82d012mmika67hqpgq7z6pq3as7xx5nv10lp3s3lbz",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
+        },
+        {
+          "name": "rand_core",
+          "packageId": "rand_core 0.10.0"
         },
         {
           "name": "subtle",
@@ -7206,8 +7422,7 @@
         "server",
         "server-auto",
         "service",
-        "tokio",
-        "tracing"
+        "tokio"
       ],
       "libCrateTypes": [
         "lib"
@@ -8180,9 +8395,9 @@
     },
     "k8s-openapi": {
       "crateName": "k8s-openapi",
-      "version": "0.27.1",
+      "version": "0.28.0",
       "edition": "2021",
-      "sha256": "0pldsxbxd4ckq94p8rkck4s862w33gfns6rclxr5imcx47sjdcsi",
+      "sha256": "1fsabg1708vmp44zz00p6x65hd0dbnpii601ss6l307yd8pr5inr",
       "source": {
         "type": "crates-io"
       },
@@ -8212,16 +8427,16 @@
       "libCrateTypes": [
         "lib"
       ],
-      "links": "k8s-openapi-0.27.1",
+      "links": "k8s-openapi-0.28.0",
       "authors": [
         "Arnav Singh <me@arnavion.dev>"
       ]
     },
     "kube": {
       "crateName": "kube",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "0hc7x38zdjdphmkx1b9pdyv3kiwwzkfbamjxjbcmx5x2knkadidc",
+      "sha256": "0ip1qc9kvgyp735rmxdjq75dspf737sazvhzs6b70siljn011fab",
       "source": {
         "type": "crates-io"
       },
@@ -8270,9 +8485,9 @@
     },
     "kube-client": {
       "crateName": "kube-client",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "0h6xlwrjg07npsdr0rgxiyp6f9q27hryi0ndsh2ih7m9y78z5jhg",
+      "sha256": "0yskaybnf8m2c9rb0kxzlczb9jbx25sxdlqhzqhlq9n2bgh2ixnh",
       "source": {
         "type": "crates-io"
       },
@@ -8354,12 +8569,12 @@
           "packageId": "serde"
         },
         {
-          "name": "serde_json",
-          "packageId": "serde_json"
+          "name": "serde-saphyr",
+          "packageId": "serde-saphyr"
         },
         {
-          "name": "serde_yaml",
-          "packageId": "serde_yaml"
+          "name": "serde_json",
+          "packageId": "serde_json"
         },
         {
           "name": "thiserror",
@@ -8383,7 +8598,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
+          "packageId": "tower-http 0.6.8"
         },
         {
           "name": "tracing",
@@ -8411,7 +8626,7 @@
         "pem",
         "rustls",
         "rustls-tls",
-        "serde_yaml",
+        "serde-saphyr",
         "tokio",
         "tokio-tungstenite",
         "tokio-util",
@@ -8431,9 +8646,9 @@
     },
     "kube-core": {
       "crateName": "kube-core",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "17ki1s0smv4vj8zkrk56phxxr1943sky5v1rv30jwlwbgbdx49pi",
+      "sha256": "1a7a3n4mwiqywajlld3axii0k7ridizp5mn7b06i81ms6dcjzc61",
       "source": {
         "type": "crates-io"
       },
@@ -8501,9 +8716,9 @@
     },
     "kube-derive": {
       "crateName": "kube-derive",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "1yj9z0niwdh9djvr0cdh7ac7chmw999xmimgkizrbkhz29zbkffn",
+      "sha256": "1an7av9xlif02klbk1xsz7nvggpnazpq2kpris0z3bbxf2c1h5zy",
       "source": {
         "type": "crates-io"
       },
@@ -8542,9 +8757,9 @@
     },
     "kube-runtime": {
       "crateName": "kube-runtime",
-      "version": "3.1.0",
+      "version": "4.0.0",
       "edition": "2024",
-      "sha256": "1whmdwnq5nnzgkpldyql7p51grj19qrq0pk17r6yfvl2fmq76wn0",
+      "sha256": "08db3c5bg185y2yh6vilbkwqfdm5aykf87xllllwzis0qmkfrpcr",
       "source": {
         "type": "crates-io"
       },
@@ -9530,6 +9745,25 @@
         "The nix-rust Project Developers"
       ]
     },
+    "nohash-hasher": {
+      "crateName": "nohash-hasher",
+      "version": "0.2.0",
+      "edition": "2018",
+      "sha256": "0lf4p6k01w4wm7zn4grnihzj8s7zd5qczjmzng7wviwxawih5x9b",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Parity Technologies <admin@parity.io>"
+      ]
+    },
     "nu-ansi-term": {
       "crateName": "nu-ansi-term",
       "version": "0.50.3",
@@ -10066,11 +10300,11 @@
         "RustCrypto Developers"
       ]
     },
-    "p256 0.14.0-rc.9": {
+    "p256 0.14.0-rc.10": {
       "crateName": "p256",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.10",
       "edition": "2024",
-      "sha256": "16jzlqkslny2fjgqr1r4i5hvlqhkxgdm5zvm17lpl5b50jzy75wb",
+      "sha256": "0gh9jchvr38pcvs0s07n0xmawckylzbydh4cga1li7g9zwzcdba1",
       "source": {
         "type": "crates-io"
       },
@@ -10082,7 +10316,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.34"
         },
         {
           "name": "primefield",
@@ -10090,7 +10324,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.11"
         },
         {
           "name": "sha2",
@@ -10122,9 +10356,9 @@
     },
     "p384": {
       "crateName": "p384",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.10",
       "edition": "2024",
-      "sha256": "00xbpyh1bhzmias7ns114k4dpg4zss5z1mgami4gy5hyrgmk0zs3",
+      "sha256": "00mgrjs221dxamazwwgxhcal7njmq74z587675zk9q2sz8x37mcv",
       "source": {
         "type": "crates-io"
       },
@@ -10136,7 +10370,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.34"
         },
         {
           "name": "fiat-crypto",
@@ -10149,7 +10383,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.11"
         },
         {
           "name": "sha2",
@@ -10182,9 +10416,9 @@
     },
     "p521": {
       "crateName": "p521",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.10",
       "edition": "2024",
-      "sha256": "1ms36waabgab0pfhfwc8k7wi2da1bbxm45sn95icyvmqpa9dg7sf",
+      "sha256": "1bnfy3apjm9jzxry40czh3l6fy7z5h1s62q615cx65nwadzjk9d3",
       "source": {
         "type": "crates-io"
       },
@@ -10200,7 +10434,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.34"
         },
         {
           "name": "primefield",
@@ -10208,7 +10442,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.11"
         },
         {
           "name": "sha2",
@@ -11106,9 +11340,9 @@
     },
     "primefield": {
       "crateName": "primefield",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.11",
       "edition": "2024",
-      "sha256": "1dhcc30nk9a5lhzy9z0y3lbk21klr5iv88jnm5w26ffv8bpfclhv",
+      "sha256": "13zdabq0lzi8bx8rx2p4mbmmhcs5xrk386k2zcbbr6m28qpy9mxi",
       "source": {
         "type": "crates-io"
       },
@@ -11124,13 +11358,12 @@
           "rename": "common"
         },
         {
-          "name": "rand_core",
-          "packageId": "rand_core 0.10.0"
+          "name": "ff",
+          "packageId": "ff 0.14.0"
         },
         {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff",
-          "rename": "ff"
+          "name": "rand_core",
+          "packageId": "rand_core 0.10.0"
         },
         {
           "name": "subtle",
@@ -11169,18 +11402,18 @@
         "RustCrypto Developers"
       ]
     },
-    "primeorder 0.14.0-rc.9": {
+    "primeorder 0.14.0-rc.11": {
       "crateName": "primeorder",
-      "version": "0.14.0-rc.9",
+      "version": "0.14.0-rc.11",
       "edition": "2024",
-      "sha256": "0sm3lv10zmg1b97vadzr87p079c7fqda3b1jsbsk76618875hmh5",
+      "sha256": "1d7ac824alndi3bh9k8r4p6mrncd4f0z7jl9cfq62787ncrnymx1",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.34"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -12400,7 +12633,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.8",
           "target": "cfg(not(target_arch = \"wasm32\"))"
         },
         {
@@ -12772,7 +13005,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
+          "packageId": "tower-http 0.7.0"
         },
         {
           "name": "tracing",
@@ -13224,7 +13457,7 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
+          "packageId": "tower-http 0.7.0"
         },
         {
           "name": "tracing",
@@ -13406,69 +13639,6 @@
       ],
       "libCrateTypes": [
         "lib"
-      ]
-    },
-    "rustcrypto-ff": {
-      "crateName": "rustcrypto-ff",
-      "version": "0.14.0-rc.1",
-      "edition": "2021",
-      "sha256": "1xjzqqg2kr41p4bjnrx5n2ljvik69f6223dss8y6jivl6kdqlapx",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.10.0"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sean Bowe <ewillbefull@gmail.com>",
-        "Jack Grigg <thestr4d@gmail.com>"
-      ]
-    },
-    "rustcrypto-group": {
-      "crateName": "rustcrypto-group",
-      "version": "0.14.0-rc.1",
-      "edition": "2021",
-      "sha256": "1vc57ys41cak4s0d6gd8xj3hcwdba0y5qswz5h33r4s5m9hrp7rn",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "rand_core",
-          "packageId": "rand_core 0.10.0"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff",
-          "rename": "ff"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Sean Bowe <ewillbefull@gmail.com>",
-        "Jack Grigg <jack@z.cash>"
       ]
     },
     "rustix": {
@@ -14259,6 +14429,70 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
+    "serde-saphyr": {
+      "crateName": "serde-saphyr",
+      "version": "0.0.27",
+      "edition": "2024",
+      "sha256": "1crx4kmmm88y4dbaramdsn0w8fqzchaz12b6vdgx7bddzb1v95sq",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "ahash",
+          "packageId": "ahash"
+        },
+        {
+          "name": "annotate-snippets",
+          "packageId": "annotate-snippets"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "encoding_rs_io",
+          "packageId": "encoding_rs_io"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "granit-parser",
+          "packageId": "granit-parser"
+        },
+        {
+          "name": "nohash-hasher",
+          "packageId": "nohash-hasher"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "zmij",
+          "packageId": "zmij"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "deserialize",
+        "serialize"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "serde-value": {
       "crateName": "serde-value",
       "version": "0.7.0",
@@ -14511,43 +14745,6 @@
       ],
       "authors": [
         "Anthony Ramine <n.oxyde@gmail.com>"
-      ]
-    },
-    "serde_yaml": {
-      "crateName": "serde_yaml",
-      "version": "0.9.34+deprecated",
-      "edition": "2021",
-      "sha256": "0isba1fjyg3l6rxk156k600ilzr8fp7crv82rhal0rxz5qd1m2va",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "indexmap",
-          "packageId": "indexmap"
-        },
-        {
-          "name": "itoa",
-          "packageId": "itoa"
-        },
-        {
-          "name": "ryu",
-          "packageId": "ryu"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "unsafe-libyaml",
-          "packageId": "unsafe-libyaml"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "David Tolnay <dtolnay@gmail.com>"
       ]
     },
     "serdect": {
@@ -15935,7 +16132,7 @@
         },
         {
           "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
+          "packageId": "p256 0.14.0-rc.10"
         },
         {
           "name": "p384",
@@ -16733,9 +16930,9 @@
     },
     "tokio-tungstenite": {
       "crateName": "tokio-tungstenite",
-      "version": "0.28.0",
+      "version": "0.29.0",
       "edition": "2018",
-      "sha256": "0mzqgc94csy5ai6kx5yxj548shppq2kwdbyrsdsilhycvmn40nnj",
+      "sha256": "0p4i0a9fwhn92y4ybc0z75pc8hn2hjjgnlymminqb1c5h9ga0wlg",
       "source": {
         "type": "crates-io"
       },
@@ -17364,7 +17561,7 @@
         "Tower Maintainers <team@tower-rs.com>"
       ]
     },
-    "tower-http": {
+    "tower-http 0.6.8": {
       "crateName": "tower-http",
       "version": "0.6.8",
       "edition": "2018",
@@ -17429,7 +17626,6 @@
       "resolvedDefaultFeatures": [
         "auth",
         "base64",
-        "cors",
         "default",
         "follow-redirect",
         "futures-util",
@@ -17441,6 +17637,55 @@
         "tracing",
         "util",
         "validate-request"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Tower Maintainers <team@tower-rs.com>"
+      ]
+    },
+    "tower-http 0.7.0": {
+      "crateName": "tower-http",
+      "version": "0.7.0",
+      "edition": "2018",
+      "sha256": "0cz2k1a6gj54lcqx9cxb6k7rfgwcgc2zi31xnq0vxhmh2blpa7xi",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
+          "name": "percent-encoding",
+          "packageId": "percent-encoding"
+        },
+        {
+          "name": "pin-project-lite",
+          "packageId": "pin-project-lite"
+        },
+        {
+          "name": "tower-layer",
+          "packageId": "tower-layer"
+        },
+        {
+          "name": "tower-service",
+          "packageId": "tower-service"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "cors",
+        "default"
       ],
       "libCrateTypes": [
         "lib"
@@ -17834,9 +18079,9 @@
     },
     "tungstenite": {
       "crateName": "tungstenite",
-      "version": "0.28.0",
+      "version": "0.29.0",
       "edition": "2021",
-      "sha256": "0hll4l62lk77zqzgps04689skpk555lcpmi3hhyyn2as9v4dqa46",
+      "sha256": "1f7673dhqbfxc0f2ccyiyqhv882nkialnzm5qb3vkbwky8m1a0bc",
       "source": {
         "type": "crates-io"
       },
@@ -17872,10 +18117,6 @@
         {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
-        },
-        {
-          "name": "utf-8",
-          "packageId": "utf-8"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -18027,6 +18268,26 @@
         "Manish Goregaokar <manishsmail@gmail.com>"
       ]
     },
+    "unicode-width": {
+      "crateName": "unicode-width",
+      "version": "0.2.2",
+      "edition": "2021",
+      "sha256": "0m7jjzlcccw716dy9423xxh0clys8pfpllc5smvfxrzdf66h9b5l",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "cjk",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "kwantam <kwantam@gmail.com>",
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
     "unicode-xid": {
       "crateName": "unicode-xid",
       "version": "0.2.6",
@@ -18071,21 +18332,6 @@
       ],
       "authors": [
         "RustCrypto Developers"
-      ]
-    },
-    "unsafe-libyaml": {
-      "crateName": "unsafe-libyaml",
-      "version": "0.2.11",
-      "edition": "2021",
-      "sha256": "0qdq69ffl3v5pzx9kzxbghzn0fzn266i1xn70y88maybz9csqfk7",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "David Tolnay <dtolnay@gmail.com>"
       ]
     },
     "untrusted 0.7.1": {
@@ -18166,22 +18412,6 @@
       "authors": [
         "Kornel <kornel@geekhood.net>",
         "Bertram Truong <b@bertramtruong.com>"
-      ]
-    },
-    "utf-8": {
-      "crateName": "utf-8",
-      "version": "0.7.6",
-      "edition": "2015",
-      "sha256": "1a9ns3fvgird0snjkd3wbdhwd3zdpc2h5gpyybrfr6ra5pkqxk09",
-      "source": {
-        "type": "crates-io"
-      },
-      "libName": "utf8",
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Simon Sapin <simon.sapin@exyr.org>"
       ]
     },
     "utf8_iter": {
@@ -19729,6 +19959,31 @@
         "Alex Crichton <alex@alexcrichton.com>"
       ]
     },
+    "wnaf": {
+      "crateName": "wnaf",
+      "version": "0.14.0-pre.0",
+      "edition": "2024",
+      "sha256": "16c1a2xxk07x1m80ac875ar27mx9a4p7038k4sz8ydx4dy9zkf41",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
+        },
+        {
+          "name": "group",
+          "packageId": "group 0.14.0"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
     "workspace-hack": {
       "crateName": "workspace-hack",
       "version": "0.1.0",
@@ -19850,7 +20105,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.34"
         },
         {
           "name": "event-listener-strategy",
@@ -19859,6 +20114,10 @@
         {
           "name": "fastrand",
           "packageId": "fastrand"
+        },
+        {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
         },
         {
           "name": "futures",
@@ -19892,14 +20151,11 @@
         {
           "name": "getrandom",
           "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "aarch64-unknown-linux-gnu"
+          "rename": "getrandom_9fbad63c4bcf4a8f"
         },
         {
-          "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "x86_64-unknown-linux-gnu"
+          "name": "group",
+          "packageId": "group 0.14.0"
         },
         {
           "name": "hashbrown",
@@ -20033,7 +20289,7 @@
         },
         {
           "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
+          "packageId": "p256 0.14.0-rc.10"
         },
         {
           "name": "p384",
@@ -20061,7 +20317,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.11"
         },
         {
           "name": "proc-macro2",
@@ -20112,14 +20368,6 @@
         {
           "name": "rsa",
           "packageId": "rsa"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group"
         },
         {
           "name": "rustls",
@@ -20283,16 +20531,12 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
-        },
-        {
-          "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.8",
           "target": "aarch64-unknown-linux-gnu"
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.8",
           "target": "x86_64-unknown-linux-gnu"
         },
         {
@@ -20441,7 +20685,7 @@
         },
         {
           "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
+          "packageId": "elliptic-curve 0.14.0-rc.34"
         },
         {
           "name": "event-listener-strategy",
@@ -20450,6 +20694,10 @@
         {
           "name": "fastrand",
           "packageId": "fastrand"
+        },
+        {
+          "name": "ff",
+          "packageId": "ff 0.14.0"
         },
         {
           "name": "futures",
@@ -20483,14 +20731,11 @@
         {
           "name": "getrandom",
           "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "aarch64-unknown-linux-gnu"
+          "rename": "getrandom_9fbad63c4bcf4a8f"
         },
         {
-          "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "x86_64-unknown-linux-gnu"
+          "name": "group",
+          "packageId": "group 0.14.0"
         },
         {
           "name": "hashbrown",
@@ -20624,7 +20869,7 @@
         },
         {
           "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
+          "packageId": "p256 0.14.0-rc.10"
         },
         {
           "name": "p384",
@@ -20652,7 +20897,7 @@
         },
         {
           "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
+          "packageId": "primeorder 0.14.0-rc.11"
         },
         {
           "name": "proc-macro2",
@@ -20703,14 +20948,6 @@
         {
           "name": "rsa",
           "packageId": "rsa"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group"
         },
         {
           "name": "rustls",
@@ -20874,16 +21111,12 @@
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http"
-        },
-        {
-          "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.8",
           "target": "aarch64-unknown-linux-gnu"
         },
         {
           "name": "tower-http",
-          "packageId": "tower-http",
+          "packageId": "tower-http 0.6.8",
           "target": "x86_64-unknown-linux-gnu"
         },
         {

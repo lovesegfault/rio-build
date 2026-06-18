@@ -60,7 +60,9 @@ spec:
                 default:
                   high: 0.8
                   low: 0.3
-                description: "Load thresholds for ratio correction. Defaults `{high: 0.8,\nlow: 0.3}`."
+                description: |-
+                  Load thresholds for ratio correction. Defaults `{high: 0.8,
+                  low: 0.3}`.
                 properties:
                   high:
                     default: 0.8
@@ -134,7 +136,9 @@ spec:
                     description: "`Deployment`. CEL-enforced."
                     type: string
                   name:
-                    description: "`metadata.name` of the Deployment in the SAME namespace as\nthis ComponentScaler."
+                    description: |-
+                      `metadata.name` of the Deployment in the SAME namespace as
+                      this ComponentScaler.
                     type: string
                 required:
                 - kind
