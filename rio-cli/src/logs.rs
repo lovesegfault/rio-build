@@ -58,6 +58,8 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
     // (plus the live in-memory buffer if the execution is still
     // ingesting). A `--follow` tail would set this true and re-open
     // on premature end; not yet exposed.
+    let pinned_exec = a.exec_id.is_some();
+    let token_set = a.tenant_token.is_some();
     let mut request = tonic::Request::new(TailLogRequest {
         derivation: a.drv_path,
         exec_id: a.exec_id.unwrap_or_default(),
@@ -72,10 +74,32 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
                 .map_err(|e| anyhow!("--tenant-token is not a valid header value: {e}"))?,
         );
     }
-    let mut stream =
-        rio_common::grpc::with_timeout("TailLog", RPC_TIMEOUT, client.tail_log(request))
-            .await?
-            .into_inner();
+    let mut stream = match rio_common::grpc::with_timeout_status(
+        "TailLog",
+        RPC_TIMEOUT,
+        client.tail_log(request),
+    )
+    .await
+    {
+        Ok(r) => r.into_inner(),
+        // sh-042 side-finding: `xtask k8s cli` (`with_cli_tunnel`)
+        // does NOT thread `RIO_TENANT_TOKEN`, so a pinned-exec read
+        // against a JWT-gated store returns the absence-shaped
+        // `not_found` (tail.rs `lookup_exec_id` — foreign and
+        // nonexistent are deliberately indistinguishable) instead of
+        // the log. Surface the missing-token hint so the (a)-tier
+        // `rio-cli logs <drv> --exec-id <old>` pointer is actionable.
+        Err(e) if pinned_exec && !token_set && e.code() == tonic::Code::NotFound => {
+            return Err(anyhow::Error::from(e).context(
+                "the store reports no log for this --exec-id, but no \
+                 --tenant-token / RIO_TENANT_TOKEN was supplied — a \
+                 JWT-gated store returns the same not_found for an \
+                 execution your tenant does not own. Re-run with \
+                 --tenant-token (the gateway-issued session JWT).",
+            ));
+        }
+        Err(e) => return Err(anyhow!("TailLog: {e}")),
+    };
 
     // Drain. `lines` is `repeated bytes` — may be non-UTF-8
     // (build output can be arbitrary). Write raw bytes to
@@ -338,5 +362,28 @@ mod tests {
         drain_log_chunks(&mut Vec::new(), &mut s)
             .await
             .expect_err("a pre-sentinel transport error still fails the drain");
+    }
+
+    /// sh-042 side-finding (the logs.rs:172 candidate): the kernel
+    /// guarantees `[yield_from, yield_until)` lies inside `[first,
+    /// first+len)` for both `Serve` and `GapThenServe`, so the
+    /// `chunk.lines[n - first]` index can neither underflow nor
+    /// out-of-bounds. Pin the boundary cells (overlapping resend with
+    /// `cursor > first`; gap-then-serve with `first > cursor`) so a
+    /// future kernel refactor that breaks the bound is caught here,
+    /// not by a live-cluster panic.
+    #[test]
+    fn emit_chunk_index_is_kernel_bounded() {
+        // Serve with cursor inside the chunk (yield_from > first).
+        let (out, _) = drain(&[chunk(0, &["a", "b", "c"]), chunk(0, &["a", "b", "c", "d"])]);
+        assert_eq!(out, "a\nb\nc\nd\n");
+        // GapThenServe with first > cursor (yield_from == first).
+        let (out, gap) = drain(&[chunk(5, &["x", "y"])]);
+        assert_eq!(out, "≡ rio: lines 0-4 missing from stored log ≡\nx\ny\n");
+        assert!(gap);
+        // High first_line_number (the --exec-id replay shape: a stored
+        // execution's chunks start past zero only on a re-served
+        // tail) — never panics, the gap is named.
+        let (_, _) = drain(&[chunk(u32::MAX as u64, &["z"])]);
     }
 }
