@@ -1282,8 +1282,8 @@ impl DagActor {
             .collect()
     }
 
-    // r[impl sched.sla.reactive-floor+6]
-    // r[impl sched.trust.report-corroboration+5]
+    // r[impl sched.sla.reactive-floor+7]
+    // r[impl sched.trust.report-corroboration+6]
     /// sh-041u — the unified peak-observe wrapper for `drv_hash`.
     /// Thin wrapper around [`super::floor::observe_peaks`] that
     /// handles the dag-node lookup, metric, log, and best-effort PG
@@ -1837,7 +1837,7 @@ impl DagActor {
     ///
     /// [`SchedulerDb::paths_with_production_evidence`]: crate::db::SchedulerDb::paths_with_production_evidence
     /// [`StampProvenance::BuiltLocallyEvidenced`]: crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced
-    // r[impl sched.trust.report-corroboration+5]
+    // r[impl sched.trust.report-corroboration+6]
     pub(super) async fn ca_production_evidence(
         &self,
         executor_id: &str,
@@ -2386,7 +2386,7 @@ impl DagActor {
             return;
         }
 
-        // r[impl sched.sla.reactive-floor+6]
+        // r[impl sched.sla.reactive-floor+7]
         // sh-041u chokepoint #2: ONE peak-observe call on every
         // non-success worker close, BEFORE the per-status fan-out.
         // The per-handler floor mints (the retired

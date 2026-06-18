@@ -3208,7 +3208,7 @@ impl DagActor {
                 (c, m, d, cells, None)
             }
         };
-        // r[impl sched.sla.reactive-floor+6]
+        // r[impl sched.sla.reactive-floor+7]
         // D4: floor AND ceiling at the single post-solve chokepoint.
         // Floor: a derivation that OOM'd at its solved mem had
         // `observe_peaks` double `floor.mem`; the next solve

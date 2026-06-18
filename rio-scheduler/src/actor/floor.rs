@@ -228,7 +228,7 @@ impl ObservedPeaks {
     }
 }
 
-// r[impl sched.trust.report-corroboration+5]
+// r[impl sched.trust.report-corroboration+6]
 /// sh-041u — the close reason `observe_peaks` dispatches headroom on.
 /// SCHEDULER-MINTED (from `BuildResultStatus` × `FailureClass` × the
 /// witnessed-letter — never free text), so the bug_102 demand ("trust
@@ -388,7 +388,7 @@ impl From<&crate::sla::config::SlaConfig> for ObserveCfg {
     }
 }
 
-// r[impl sched.sla.reactive-floor+6]
+// r[impl sched.sla.reactive-floor+7]
 // r[impl sched.retry.promotion-exempt+4]
 /// sh-041u — the unified peak observe. For each axis with a `Some`
 /// peak: `floor.X = max(floor.X, peak_X × headroom(reason, X))
@@ -927,7 +927,7 @@ mod tests {
         observe_peaks(s, peaks, reason, &CEIL, PROV_MAX, &CFG)
     }
 
-    // r[verify sched.sla.reactive-floor+6]
+    // r[verify sched.sla.reactive-floor+7]
     /// sh-041u red-first (a) — *proposition: a `CgroupOom` close with
     /// peaks on every axis hard-doubles MEM and soft-observes DISK.*
     /// Under the retired per-axis-witness shape, the OOM mint touched
@@ -968,7 +968,7 @@ mod tests {
         assert!(o.at_cap_axes.is_empty());
     }
 
-    // r[verify sched.trust.report-corroboration+5]
+    // r[verify sched.trust.report-corroboration+6]
     /// sh-041u red-first (d) — bug_102 ceiling band: a forged-HIGH mem
     /// peak (16× assigned, physically impossible under `memory.max`)
     /// REFUSES — that axis observes nothing.
@@ -993,7 +993,7 @@ mod tests {
         assert!(!o.hard_promoted && !o.soft_promoted);
     }
 
-    // r[verify sched.trust.report-corroboration+5]
+    // r[verify sched.trust.report-corroboration+6]
     /// sh-041u red-first (e) — bug_090 floor band: a `CgroupOom` claim
     /// with a forged-LOW peak (100 MiB on a 4 GiB assigned —
     /// implausible for a real OOM) DEGRADES to soft 1.2×: never
@@ -1103,7 +1103,7 @@ mod tests {
         assert_eq!(floor, 0);
     }
 
-    // r[verify sched.sla.reactive-floor+6]
+    // r[verify sched.sla.reactive-floor+7]
     /// **sh-012 D4 cores axis** — *proposition: corroborated
     /// cpu_util ≥ threshold jumps cores; ≪ threshold leaves it.*
     /// (sh-041u: ported from the retired compute-bound-band.)
@@ -1658,7 +1658,7 @@ mod tests {
         }
     }
 
-    // r[verify sched.trust.report-corroboration+5]
+    // r[verify sched.trust.report-corroboration+6]
     /// sh-041u r1 — *proposition: a derivation-intrinsic `Other` close
     /// (E3b NotDeterministic / InputRejected / …) with a saturated
     /// `cpu_util` does NOT hard-promote cores.* RED at 7c5d6799b: the

@@ -1219,7 +1219,7 @@ The fit, percentile evaluator, and bisection solve are pure functions covered by
 Requirements without a natural home in the design prose above (wire-level
 and operational invariants).
 
-#r("sched.sla.reactive-floor+6")[
+#r("sched.sla.reactive-floor+7")[
   `SchedHint.resource_floor: ResourceFloor { mem_bytes, disk_bytes, deadline_secs, cores }`
   (default zeros) is the per-dimension reactive floor for cold-start safety.
   Every NON-SUCCESS worker-reported close MUST call `observe_peaks`: for each
@@ -1239,7 +1239,10 @@ and operational invariants).
   `solve_intent_for` MUST clamp its solved (cores, mem, disk) at
   `resource_floor` before returning, and at `Ceilings.max_{cores,mem,disk}`.
   Persisted as `derivations.floor_*` (`M_044` + `M_106`) only on
-  `hard_promoted` --- soft observations are in-memory only.
+  `hard_grew` (any axis strictly grew under hard headroom, INCLUDING a
+  grow-to-cap clip) --- soft observations are in-memory only;
+  `hard_promoted` (`grew && !at_cap` per axis) gates the kernel's
+  promotion-exempt input only.
 ]
 The controller-reported arm of the previous revision (k8s
 `OomKilled`/`EvictedDiskPressure`/`DeadlineExceeded` promoting the floor via

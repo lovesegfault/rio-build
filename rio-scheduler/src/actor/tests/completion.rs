@@ -1133,7 +1133,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 /// `ReportAttemptOutcome` classification fill, which never
 /// promotes).
 // r[verify sched.retry.promotion-exempt+4]
-// r[verify sched.sla.reactive-floor+6]
+// r[verify sched.sla.reactive-floor+7]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1850,7 +1850,7 @@ async fn test_floor_bump_store_suppression_parity(
 /// Post-fix: the floor bump consumes only the typed
 /// `failure_classification` field, corroborated against the
 /// scheduler-assigned shape; free text is display/narration.
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 #[tokio::test]
 async fn forged_free_text_never_moves_resource_floors() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -1896,7 +1896,7 @@ async fn forged_free_text_never_moves_resource_floors() -> TestResult {
 /// refused (telemetry absent, or inconsistent with the
 /// scheduler-assigned shape); a CORROBORATED one takes exactly ONE
 /// doubling per incident. Both axes.
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 #[tokio::test]
 async fn typed_classification_bumps_only_with_corroboration() -> TestResult {
     // Big ceilings: the corroborated cells assert a full doubling —
@@ -5399,7 +5399,7 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor+6]
+// r[verify sched.sla.reactive-floor+7]
 /// bug_027 companion red — the carried-at-ceiling cell of `set_dim`'s
 /// at_cap law: when the pod was DISPATCHED at the deadline cap (the
 /// carried `BoundIntent` rendered 86400s) and the mint-time solve
@@ -6078,7 +6078,7 @@ async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResu
 /// evidence for the reporting build's attributed cohort ⇒ a typed,
 /// counted, non-poisoning refusal of the STAMP (the report's other
 /// effects are unaffected; the drv still completes).
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 #[tokio::test]
 async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult {
     use sha2::Digest;
@@ -6285,7 +6285,7 @@ async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult 
 /// the completion stamp widens to all interested tenants under the
 /// signed Q2 BuiltLocally law (locally produced bytes — all
 /// interested tenants lawful).
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 #[tokio::test]
 async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
     use sha2::Digest;
@@ -6373,7 +6373,7 @@ async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
 /// `query_prior_realisation` (the cutoff-compare consumer), both
 /// tenant-unscoped: the W11-Q end-to-end precedent's global-read
 /// manifestation.
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 // r[verify sched.trust.evidence-scope]
 #[tokio::test]
 async fn untenanted_floating_ca_report_never_mints_global_realisations() -> TestResult {
@@ -6537,7 +6537,7 @@ async fn untenanted_floating_ca_report_never_mints_global_realisations() -> Test
 /// directly — modeling the builds-retention sweep's row removal (the
 /// producer of the aged-out state; the drv row itself survives, which
 /// is exactly what makes the cold resolve succeed with zero tenants).
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 #[tokio::test]
 async fn aged_out_late_ca_report_refuses_realisations() -> TestResult {
     use sha2::Digest;
@@ -6622,7 +6622,7 @@ async fn aged_out_late_ca_report_refuses_realisations() -> TestResult {
 /// reds are this witness's teeth), because evidence is structurally
 /// unrepresentable there: `path_tenants` is tenant-keyed, so an empty
 /// cohort has no consultable evidence row by construction.*
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 #[tokio::test]
 async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> TestResult {
     use sha2::Digest;
@@ -6692,7 +6692,7 @@ async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> Tes
 /// reports through the production pull path); the verdict flow is
 /// asserted UNTOUCHED (timeouts still charge `timeout_count` — the
 /// close is classify-only on the floor axis, never a retry change).
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 #[tokio::test]
 async fn forged_timeout_reports_never_move_the_deadline_floor() -> TestResult {
     let recorder = CountingRecorder::default();
@@ -6756,7 +6756,7 @@ async fn forged_timeout_reports_never_move_the_deadline_floor() -> TestResult {
 /// scheduler's own `running_since` clock vs the reconciled
 /// `last_intent.deadline_secs`) corroborates, and the floor doubles
 /// exactly as the wave-11 behavior intended for honest slow builds.*
-// r[verify sched.trust.report-corroboration+5]
+// r[verify sched.trust.report-corroboration+6]
 #[tokio::test]
 async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> TestResult {
     let recorder = CountingRecorder::default();
@@ -6811,7 +6811,7 @@ async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> Tes
 /// changed the ladder from ×2 to jump-to-max — ComputeBound has no
 /// threshold semantics, so the only useful next probe is the largest
 /// provisionable shape.
-// r[verify sched.sla.reactive-floor+6]
+// r[verify sched.sla.reactive-floor+7]
 // r[verify sched.retry.executor-variant-threshold]
 #[tokio::test]
 async fn e3a_compute_bound_jumps_floor_cores_to_provisionable_max() -> TestResult {
@@ -6874,7 +6874,7 @@ async fn e3a_compute_bound_jumps_floor_cores_to_provisionable_max() -> TestResul
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor+6]
+// r[verify sched.sla.reactive-floor+7]
 /// **sh-041u red-first (g)** — *proposition: an E3a row at mem-cap with
 /// cpu_util ≪ threshold stamps `row.floor_at_cap = false` (the
 /// per-handler axis narrowing) so the kernel's `Poison(ComputeBoundAtCap)`

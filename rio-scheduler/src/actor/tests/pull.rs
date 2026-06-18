@@ -1032,7 +1032,7 @@ async fn attempt_outcome_pod_terminal_reason_still_waits_for_establishment() -> 
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor+6]
+// r[verify sched.sla.reactive-floor+7]
 /// **sh-041u red-first (c)** — *the sh-041 original case: a
 /// compute-bound build interrupted by spot reclaim (AD5 SIGTERM-abort)
 /// jumps `floor.cores` to `prov_max` AND soft-observes mem.* RED at

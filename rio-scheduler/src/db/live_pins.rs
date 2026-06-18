@@ -270,7 +270,7 @@ impl SchedulerDb {
     /// output) carries no confidentiality flip and is
     /// integrity-equivalent to a compromised builder uploading
     /// arbitrary CA content, which the threat model already prices.
-    // r[impl sched.trust.report-corroboration+5]
+    // r[impl sched.trust.report-corroboration+6]
     pub(crate) async fn paths_with_production_evidence(
         &self,
         output_paths: &[String],
@@ -1213,7 +1213,7 @@ mod registration_writer_census {
             .expect("the witnessed-floor caller alphabet is census-pinned");
     }
 
-    // r[verify sched.trust.report-corroboration+5]
+    // r[verify sched.trust.report-corroboration+6]
     /// bug_132 commit 2 (W11-S, the R22″ machine-bind): the CA-face
     /// residual pricing is BOUND to the compensating control's firing
     /// predicate instead of self-reported prose. Two pinned needles
@@ -1610,7 +1610,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-corroboration+5]
+    // r[verify sched.trust.report-corroboration+6]
     /// bug_102 commit 4 (W12-L3's home; R31) -- the FLOOR-MUTATION
     /// census, [GEN-SET]: quantified over `resource_floor` MUTATION
     /// SITES derived from the embedded whole-crate universe, never
@@ -1742,7 +1742,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-corroboration+5]
+    // r[verify sched.trust.report-corroboration+6]
     /// bug_090 commit 6 (W11-X, the R22″ derivation-layer form of
     /// W10-N): the worker→scheduler trust census derives PER-BOUNDARY
     /// from the PROTO SCHEMA — the field universe of the completion

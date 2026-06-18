@@ -202,7 +202,7 @@ submitter-controlled attributes (the CA-ness of one's own drv) convert
 per-face residuals into adversary-chosen bypasses; the CA face therefore
 joins the law's domain with its own evidence base rather than an exemption.
 
-#r("sched.trust.report-corroboration+5")[
+#r("sched.trust.report-corroboration+6")[
   A worker report's claim MUST NOT move scheduler-persisted state without
   corroboration the scheduler can verify against evidence it (or the store)
   owns. Two faces:
@@ -232,8 +232,9 @@ joins the law's domain with its own evidence base rather than an exemption.
   mutation (the per-axis trust band: `peak_X <= assigned_X × band` else the
   axis observes nothing --- the gate-inside-mutation shape; the
   witness-required-to-compile demand narrows to the HARD arm, with soft
-  consequence bounded by `hard_promoted` gating promotion-exempt and the
-  M_044 persist) and the writer population is MACHINE-DERIVED (the
+  consequence bounded by `hard_promoted` gating promotion-exempt and
+  `hard_grew` gating the M_044 persist) and the writer population is
+  MACHINE-DERIVED (the
   floor-mutation census
   quantifies over mutation sites, never over one wire enum --- the
   carrier-keyed census was the wave-11 evasion's door). Untyped or
