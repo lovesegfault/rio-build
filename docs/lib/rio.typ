@@ -744,7 +744,9 @@
       context {
         let nav = _chapter-nav()
         if nav.prev != none or nav.next != none {
-          let nav-a(ch, cls, rel, body) = if ch != none {
+          // Body uses ch.title (built inside the ch!=none guard) so a
+          // none prev/next never dereferences .title at call-site.
+          let nav-a(ch, cls, rel, arrow) = if ch != none {
             html.elem(
               "a",
               attrs: (
@@ -753,7 +755,7 @@
                 href: "/" + route-for(ch.path) + ".html",
                 aria-label: rel + ": " + ch.title,
               ),
-              body,
+              if rel == "prev" [#arrow #ch.title] else [#ch.title #arrow],
             )
           }
           html.elem(

@@ -13,6 +13,9 @@
   addEventListener("DOMContentLoaded", () => {
     if (window.PagefindUI && document.querySelector("#search")) {
       new PagefindUI({ element: "#search", showSubResults: true });
+      document
+        .querySelector("#search input")
+        ?.setAttribute("aria-label", "Search documentation");
     }
     const btn = document.querySelector(".rio-theme-toggle");
     if (btn) {
@@ -44,6 +47,14 @@
     // ─── keyboard nav: ←/→ chapter, S to focus search ───────────────
     addEventListener("keydown", (ev) => {
       if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+      // Escape is meaningful from inside the search input (clear+blur),
+      // so it bypasses the isEditable early-out the other keys use.
+      if (ev.key === "Escape") {
+        setNavOpen(false);
+        document.querySelector(".pagefind-ui__search-clear")?.click();
+        document.querySelector("#search input")?.blur();
+        return;
+      }
       if (isEditable(ev.target)) return;
       if (ev.key === "ArrowLeft") {
         const a = document.querySelector(".mobile-nav-chapters.previous");
@@ -60,8 +71,6 @@
           setNavOpen(true);
           input.focus();
         }
-      } else if (ev.key === "Escape") {
-        setNavOpen(false);
       }
     });
 

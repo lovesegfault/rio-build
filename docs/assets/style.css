@@ -45,6 +45,8 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
 .rio-nav a { color: var(--fg); text-decoration: none; display: block; padding: .15rem 0; }
 .rio-nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
 .rio-nav .section { font-weight: 600; margin-top: .75rem; color: var(--muted); }
+.rio-brand { display: block; font-weight: 700; font-size: 1.2em;
+  margin-bottom: .75rem; color: var(--fg); text-decoration: none; }
 /* The main column fills the grid track; the readable-measure cap is
    applied per prose element so tables/figures/pre can use full width
    on wide viewports while paragraphs stay at ~50rem. */
@@ -194,7 +196,8 @@ h5:hover .anchor, h6:hover .anchor,
 .rio-toc li { margin: 0; }
 .rio-toc a { display: block; padding: .2rem .6rem; color: var(--muted);
   text-decoration: none; border-left: 2px solid transparent;
-  margin-left: -1px; line-height: 1.3; }
+  margin-left: -1px; line-height: 1.3;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rio-toc a:hover { color: var(--fg); }
 .rio-toc a.active { color: var(--accent); border-left-color: var(--accent); }
 .rio-toc-l2 a { padding-left: 1.4rem; }
@@ -210,6 +213,10 @@ h5:hover .anchor, h6:hover .anchor,
 .rio-code:hover .rio-copy, .rio-copy:focus { opacity: 1; }
 .rio-copy:hover { color: var(--fg); }
 .rio-copy.copied { color: var(--c-green); opacity: 1; }
+/* Touch / narrow viewports have no hover — keep the button visible. */
+@media (hover: none), (max-width: 800px) {
+  .rio-main .rio-copy { opacity: 1; }
+}
 /* ─── accordion sidebar ───────────────────────────────────────────── */
 .rio-nav details > summary { list-style: none; cursor: pointer;
   display: flex; align-items: center; }
@@ -267,4 +274,15 @@ h5:hover .anchor, h6:hover .anchor,
   @media (prefers-reduced-motion: reduce) {
     .rio-nav { transition: none; }
   }
+}
+/* ─── skip-to-content (a11y) ──────────────────────────────────────── */
+.rio-skip { position: absolute; left: -9999px; }
+.rio-skip:focus { position: fixed; left: 1rem; top: 1rem; z-index: 100;
+  background: var(--bg); padding: .5rem 1rem; border: 2px solid var(--accent); }
+/* ─── print ───────────────────────────────────────────────────────── */
+@media print {
+  .rio-nav, .rio-toc, .rio-copy, .nav-wrapper, .rio-edit, .rio-theme-toggle,
+  .rio-nav-toggle, .rio-skip, #search { display: none !important; }
+  .rio-page { display: block; max-width: none; }
+  .rio-main { padding: 0; }
 }

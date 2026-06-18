@@ -31,9 +31,12 @@
       }
       #html.elem("meta", attrs: (name: "theme-color", content: _theme-color))
       #html.title[#title — rio-build design book]
-      // Empty data-URI favicon — suppresses the /favicon.ico 404 every
-      // page load otherwise triggers under `nix run .#docs`.
-      #html.elem("link", attrs: (rel: "icon", href: "data:,"))
+      // Inline SVG favicon (Ayu accent disc + "r" glyph). data: URI so
+      // it ships with every page — no /favicon.ico round-trip.
+      #html.elem("link", attrs: (
+        rel: "icon",
+        href: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23f29718'/><text x='16' y='22' text-anchor='middle' font-size='18' font-weight='bold' fill='%2310141c'>r</text></svg>",
+      ))
       #html.elem("link", attrs: (rel: "stylesheet", href: "/style.css"))
       #html.elem("link", attrs: (
         rel: "stylesheet",
@@ -46,6 +49,10 @@
       #html.elem("script", attrs: (src: "/theme.js"))[]
     ]
     #html.body[
+      #html.elem("a", attrs: (
+        class: "rio-skip",
+        href: "#main",
+      ))[Skip to content]
       #html.elem("button", attrs: (
         class: "rio-nav-toggle",
         type: "button",
@@ -55,14 +62,20 @@
       ))[☰]
       #html.elem("div", attrs: (class: "rio-page"))[
         #html.elem("nav", attrs: (class: "rio-nav", id: "rio-nav"))[
+          #html.elem("a", attrs: (
+            class: "rio-brand",
+            href: "/",
+          ))[rio-build]
           #html.elem("button", attrs: (
             class: "rio-theme-toggle",
             type: "button",
+            aria-label: "Toggle color theme",
+            title: "Toggle theme",
           ))[◐]
           #html.elem("div", attrs: (id: "search"))[]
           #nav-tree(route)
         ]
-        #html.elem("main", attrs: (class: "rio-main"))[
+        #html.elem("main", attrs: (class: "rio-main", id: "main"))[
           #if trail.len() > 1 {
             // Breadcrumbs: ancestor chain root→leaf. Leaf (= this page,
             // already the <h1> below) is rendered unlinked; section
@@ -91,6 +104,8 @@
           #html.elem("footer", attrs: (class: "rio-edit"))[
             #html.elem("a", attrs: (
               href: repo-edit-base + src-path,
+              target: "_blank",
+              rel: "noopener",
             ))[Edit this page on GitHub]
           ]
         ]
@@ -108,16 +123,23 @@
             ))
           // Always emit the <aside> so the .rio-page grid's 3rd column has
           // an element regardless of heading count; populate only when >1.
-          html.elem("aside", attrs: (class: "rio-toc"), if toc.len() > 1 [
-            #html.elem("p", attrs: (class: "rio-toc-title"))[On this page]
-            #html.elem("ul", for h in toc {
-              html.elem(
-                "li",
-                attrs: (class: "rio-toc-l" + str(h.level)),
-                html.elem("a", attrs: (href: "#" + h.id))[#h.text],
-              )
-            })
-          ])
+          html.elem(
+            "aside",
+            attrs: (
+              class: "rio-toc",
+              aria-label: "On this page",
+            ),
+            if toc.len() > 1 [
+              #html.elem("p", attrs: (class: "rio-toc-title"))[On this page]
+              #html.elem("ul", for h in toc {
+                html.elem(
+                  "li",
+                  attrs: (class: "rio-toc-l" + str(h.level)),
+                  html.elem("a", attrs: (href: "#" + h.id))[#h.text],
+                )
+              })
+            ],
+          )
         }
       ]
     ]
