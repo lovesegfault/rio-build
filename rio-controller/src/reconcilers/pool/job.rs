@@ -2287,57 +2287,43 @@ pub(super) fn job_deadline_exceeded_epoch_secs(job: &Job) -> Option<f64> {
         .map(time_epoch_secs)
 }
 
-/// Prometheus `reason` label for the OA1 interval-(i) histogram. Same
-/// strings the scheduler's floor path persists as `termination_reason`
-/// — BY CONSTRUCTION since bug_255: the emitting arms route through
-/// `rio_common::classify::attempt_terminal_reason_label` via the
-/// unified wire vocabulary, so the planes cannot drift (the retired
-/// hand-mirrored match emitted `disk_pressure` against the scheduler's
-/// `evicted_disk_pressure`; equality joins returned nothing). Only the
-/// reported classification-fill reasons (OomKilled /
-/// EvictedDiskPressure) and DeadlineExceeded ever reach the metric
-/// (the report path filters the rest before the RPC) — the filtered
-/// arms keep the deliberate `other` collapse.
-fn termination_reason_label(reason: TerminationReason) -> &'static str {
-    match reason {
-        TerminationReason::OomKilled
-        | TerminationReason::EvictedDiskPressure
-        | TerminationReason::DeadlineExceeded => {
-            rio_common::classify::attempt_terminal_reason_label(
-                unified_attempt_reason(reason).into(),
-            )
-        }
-        TerminationReason::EvictedOther
-        | TerminationReason::Completed
-        | TerminationReason::Error
-        // ComputeBound is worker-side only (cpu_util corroboration on
-        // `final_resources.cpu_seconds_total`); the controller never
-        // produces it — `pod_termination_reason` has no producing arm.
-        | TerminationReason::ComputeBound
-        | TerminationReason::Unknown => "other",
-    }
-}
-
 /// sh-039: the WIRE-SIDE pod-terminal classification for
-/// `report_terminated_pods` — the producer split. Folds to
-/// [`unified_attempt_reason`] for every shape EXCEPT a pod-attributed
-/// eviction, which the wire enum carries as the split letter
-/// `EvictedEmptyDirSizeLimit` so the scheduler may promote the disk
-/// floor on kubelet's own per-pod statement while node-condition
-/// `EvictedDiskPressure` stays classify-only (I-199 untouched).
-/// `pod_termination_reason` and the worker-proto `TerminationReason`
-/// stay folded — the split lives in the controller→scheduler wire
-/// enum only (Q2: one wire change, not two; the worker enum gains
-/// nothing).
+/// `report_terminated_pods` — the producer split. Calls
+/// [`pod_termination_reason`] FIRST (so the per-shape
+/// `rio_controller_pod_evictions_total` counter increments for every
+/// Evicted pod, pod-attributed shapes included), then splits on
+/// `(EvictedDiskPressure && pod-attributed)` to carry the wire enum's
+/// split letter `EvictedEmptyDirSizeLimit` so the scheduler may
+/// promote the disk floor on kubelet's own per-pod statement while
+/// node-condition `EvictedDiskPressure` stays classify-only (I-199
+/// untouched). `pod_termination_reason` and the worker-proto
+/// `TerminationReason` stay folded — the split lives in the
+/// controller→scheduler wire enum only (Q2: one wire change, not two;
+/// the worker enum gains nothing).
 pub(super) fn pod_attempt_terminal_reason(pod: &Pod) -> rio_proto::types::AttemptTerminalReason {
     use rio_proto::types::AttemptTerminalReason as A;
-    if let Some(status) = &pod.status
-        && status.reason.as_deref() == Some("Evicted")
+    let reason = pod_termination_reason(pod);
+    if reason == TerminationReason::EvictedDiskPressure
+        && let Some(status) = &pod.status
         && eviction_is_pod_attributed(status.message.as_deref().unwrap_or(""))
     {
         return A::EvictedEmptyDirSizeLimit;
     }
-    unified_attempt_reason(pod_termination_reason(pod))
+    unified_attempt_reason(reason)
+}
+
+/// sh-039: the wire-reportable reason set — the classification-fill
+/// reasons that go over the wire from [`report_terminated_pods`]. ONE
+/// helper for both the open-attempt-view gate and the per-pod filter,
+/// so a fourth wire-reportable reason added once is added for both
+/// (the two hand-restated `matches!` sets diverging silently degraded
+/// the gate to intent-keyed reports).
+fn is_wire_reportable(reason: rio_proto::types::AttemptTerminalReason) -> bool {
+    use rio_proto::types::AttemptTerminalReason as A;
+    matches!(
+        reason,
+        A::OomKilled | A::EvictedDiskPressure | A::EvictedEmptyDirSizeLimit
+    )
 }
 
 /// Map the controller's k8s pod-terminal classification onto the
@@ -2486,6 +2472,31 @@ pub(super) async fn report_terminated_pods(
         }
     };
     let mut admin = ctx.admin.clone();
+    // Classify ONCE per pod, then derive the open-attempt-view gate
+    // and the per-pod filter from the same `(pod, reason)` pairs — the
+    // earlier `.any()` gate + per-pod re-classify ran
+    // `pod_attempt_terminal_reason` (and so the per-shape eviction
+    // counter) twice for every Evicted pod in the `.any()` prefix.
+    // Only the classification-fill reasons (OomKilled /
+    // EvictedDiskPressure / sh-039's split EvictedEmptyDirSizeLimit)
+    // go over the wire ([`is_wire_reportable`]). `Completed`/`Error`/
+    // `EvictedOther` would be sent every tick for every TTL-window
+    // Job; the scheduler's fill-once intake no-ops them anyway.
+    // `Error` IS observable for a deadline-SIGKILL'd pod
+    // (restartPolicy:Never + backoffLimit:0 + the 45 s
+    // `PULL_MODE_TGPS_SECS` grace + the job-tracking
+    // finalizer/JOB_TTL window keep it listable) — reporting it here
+    // would race the same-tick `report_deadline_exceeded_jobs`, which
+    // owns the DeadlineExceeded classification from the Job
+    // condition. This filter eliminates the wasted RPCs and the race.
+    let reportable: Vec<(&Pod, rio_proto::types::AttemptTerminalReason)> = list
+        .items
+        .iter()
+        .filter_map(|pod| {
+            let reason = pod_attempt_terminal_reason(pod);
+            is_wire_reportable(reason).then_some((pod, reason))
+        })
+        .collect();
     // merged_bug_135 sibling (the AD2c fill is exec-resolved-only on
     // the scheduler side): pin the pod-terminal classification to the
     // open attempt's exec_id when one exists, so the kube-authoritative
@@ -2493,13 +2504,7 @@ pub(super) async fn report_terminated_pods(
     // One view read per tick, only when a reportable pod exists; on
     // error the reports go intent-keyed (the scheduler then skips the
     // node fill — conservative, never wrong-attempt).
-    use rio_proto::types::AttemptTerminalReason as A;
-    let open_attempts: Vec<rio_proto::types::OpenAttempt> = if list.items.iter().any(|pod| {
-        matches!(
-            pod_attempt_terminal_reason(pod),
-            A::OomKilled | A::EvictedDiskPressure | A::EvictedEmptyDirSizeLimit
-        )
-    }) {
+    let open_attempts: Vec<rio_proto::types::OpenAttempt> = if !reportable.is_empty() {
         match admin_call(
             admin
                 .clone()
@@ -2518,27 +2523,7 @@ pub(super) async fn report_terminated_pods(
     } else {
         Vec::new()
     };
-    for pod in &list.items {
-        let reason = pod_attempt_terminal_reason(pod);
-        // Only the classification-fill reasons (OomKilled /
-        // EvictedDiskPressure / sh-039's split
-        // EvictedEmptyDirSizeLimit) go over the wire. `Completed`/
-        // `Error`/`EvictedOther` would be sent every tick for every
-        // TTL-window Job; the scheduler's fill-once intake no-ops
-        // them anyway. `Error` IS observable for a deadline-
-        // SIGKILL'd pod (restartPolicy:Never + backoffLimit:0 +
-        // the 45 s `PULL_MODE_TGPS_SECS` grace + the job-tracking
-        // finalizer/JOB_TTL window keep it listable) — reporting it
-        // here would race the same-tick
-        // `report_deadline_exceeded_jobs`, which owns the
-        // DeadlineExceeded classification from the Job condition.
-        // This filter eliminates the wasted RPCs and the race.
-        if !matches!(
-            reason,
-            A::OomKilled | A::EvictedDiskPressure | A::EvictedEmptyDirSizeLimit
-        ) {
-            continue;
-        }
+    for (pod, reason) in reportable {
         let Some(name) = pod.metadata.name.as_deref() else {
             continue;
         };
@@ -2610,8 +2595,10 @@ pub(super) async fn report_terminated_pods(
                     // vocabulary so the OA1 series gains the
                     // `evicted_empty_dir_size_limit` row alongside the
                     // node-condition `evicted_disk_pressure` one.
-                    // Parity holds (`termination_reason_label_parity_
-                    // with_scheduler` checks the shared-reason set).
+                    // Parity holds BY CONSTRUCTION (one shared label
+                    // fn for both planes — bug_255; the full alphabet
+                    // is pinned at
+                    // `rio_common::classify::label_alphabet_pinned`).
                     metrics::histogram!(
                         "rio_controller_job_terminal_report_seconds",
                         "reason" => rio_common::classify::attempt_terminal_reason_label(
@@ -2735,7 +2722,9 @@ pub(super) async fn report_deadline_exceeded_jobs(
                 {
                     metrics::histogram!(
                         "rio_controller_job_terminal_report_seconds",
-                        "reason" => termination_reason_label(TerminationReason::DeadlineExceeded)
+                        "reason" => rio_common::classify::attempt_terminal_reason_label(
+                            rio_common::classify::AttemptTerminalKind::DeadlineExceeded
+                        )
                     )
                     .record(latency);
                 }
@@ -2952,47 +2941,41 @@ mod tests {
         // An in-memory object without a uid mints no key at all —
         // the call sites skip sampling (fail-closed, never suppression).
         assert!(ObjectUid::from_meta(&ObjectMeta::default()).is_none());
-
-        // Label values match the scheduler-side termination_reason
-        // strings for the reasons that reach the wire.
-        assert_eq!(
-            termination_reason_label(TerminationReason::OomKilled),
-            "oom_killed"
-        );
-        assert_eq!(
-            termination_reason_label(TerminationReason::EvictedDiskPressure),
-            "evicted_disk_pressure"
-        );
-        assert_eq!(
-            termination_reason_label(TerminationReason::DeadlineExceeded),
-            "deadline_exceeded"
-        );
     }
 
     /// bug_255 parity: the controller-side OA1 `reason` label and the
-    /// scheduler's persisted `termination_reason` label must be EQUAL
-    /// for every reason both planes emit (the documented "series line
-    /// up" contract — equality joins between the planes depend on it).
+    /// scheduler's persisted `termination_reason` label are EQUAL for
+    /// every reason both planes emit BY CONSTRUCTION — both route
+    /// through `rio_common::classify::attempt_terminal_reason_label`
+    /// via `From<AttemptTerminalReason> for AttemptTerminalKind`. Pin
+    /// the FROM-IMPL rows the controller emits at the wire (the full
+    /// label alphabet itself is pinned at
+    /// `rio_common::classify::label_alphabet_pinned`).
     #[test]
     fn termination_reason_label_parity_with_scheduler() {
         use rio_common::classify::{AttemptTerminalKind, attempt_terminal_reason_label};
-        for (reason, kind) in [
-            (TerminationReason::OomKilled, AttemptTerminalKind::OomKilled),
-            (
-                TerminationReason::EvictedDiskPressure,
-                AttemptTerminalKind::EvictedDiskPressure,
-            ),
-            (
-                TerminationReason::DeadlineExceeded,
-                AttemptTerminalKind::DeadlineExceeded,
-            ),
+        use rio_proto::types::AttemptTerminalReason as A;
+        for (reason, expected) in [
+            (A::OomKilled, "oom_killed"),
+            (A::EvictedDiskPressure, "evicted_disk_pressure"),
+            (A::EvictedEmptyDirSizeLimit, "evicted_empty_dir_size_limit"),
+            (A::DeadlineExceeded, "deadline_exceeded"),
         ] {
+            let kind: AttemptTerminalKind = reason.into();
             assert_eq!(
-                termination_reason_label(reason),
                 attempt_terminal_reason_label(kind),
+                expected,
                 "the planes' series must line up for {reason:?}"
             );
         }
+        // The wire-reportable set is exactly the rows
+        // report_terminated_pods can emit; the gate and the per-pod
+        // filter share ONE helper.
+        assert!(is_wire_reportable(A::OomKilled));
+        assert!(is_wire_reportable(A::EvictedDiskPressure));
+        assert!(is_wire_reportable(A::EvictedEmptyDirSizeLimit));
+        assert!(!is_wire_reportable(A::DeadlineExceeded));
+        assert!(!is_wire_reportable(A::Error));
     }
 
     /// `pod_termination_reason` classification. Mirrors what k8s
