@@ -2048,14 +2048,19 @@ mod tests {
         let client = Client::from_conf(cfg);
 
         // Blobs live at the prefix root, not under chunks/.
-        let with_prefix = S3ChunkBackend::new(client.clone(), "b".into(), "prod".into());
+        let with_prefix = S3ChunkBackend::new(
+            client.clone(),
+            "b".into(),
+            "prod".into(),
+            Semaphore::MAX_PERMITS,
+        );
         assert_eq!(with_prefix.blob_s3_key("abc.narinfo"), "prod/abc.narinfo");
         assert_eq!(
             with_prefix.blob_s3_key("nar/abc.nar.zst"),
             "prod/nar/abc.nar.zst"
         );
 
-        let no_prefix = S3ChunkBackend::new(client, "b".into(), "".into());
+        let no_prefix = S3ChunkBackend::new(client, "b".into(), "".into(), Semaphore::MAX_PERMITS);
         assert_eq!(no_prefix.blob_s3_key("abc.narinfo"), "abc.narinfo");
     }
 

@@ -905,10 +905,13 @@ pub async fn init_chunk_backend(
             let local = match express_bucket {
                 Some(b) => {
                     let local_client = rio_common::s3::default_client(EXPRESS_MAX_ATTEMPTS).await;
-                    // Tiered-local is read-only (`TieredChunkBackend::put`
-                    // writes remote only) — no need to bound a PUT plane
-                    // that doesn't exist. MAX_PERMITS keeps the gate
-                    // structurally present without ever parking.
+                    // `TieredChunkBackend::put` writes remote only; the
+                    // sole local-PUT path is `get`'s write-through, which is
+                    // 1:1 with remote-get and so already bounded by read
+                    // concurrency, not ingest fan-out. Gating it at the
+                    // ingest cap would couple write-through latency to
+                    // unrelated upload backpressure. MAX_PERMITS keeps
+                    // the gate structurally present without ever parking.
                     Some(S3ChunkBackend::new(
                         local_client,
                         b.clone(),
