@@ -647,7 +647,7 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor+5]
+// r[verify sched.sla.reactive-floor+6]
 /// D4: `InfrastructureFailure(CgroupOom)` doubles
 /// `resource_floor.mem_bytes` for both FOD and non-FOD (D2: same
 /// reactive path). The floor feeds `solve_intent_for`'s mem clamp →

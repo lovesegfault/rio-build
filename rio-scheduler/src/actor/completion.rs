@@ -291,15 +291,6 @@ impl StoreDegradedDisposition {
 /// `Cancelled` synthesizes its message (the worker sent a status the
 /// scheduler never initiated — the wire message is untrusted noise on
 /// that arm); every other arm borrows the worker's `error_msg`.
-/// bug_090: the metric-label form of the sizing-class alphabet.
-pub(super) fn sizing_class_label(class: rio_proto::types::FailureClass) -> &'static str {
-    match class {
-        rio_proto::types::FailureClass::Unspecified => "unspecified",
-        rio_proto::types::FailureClass::CgroupOom => "cgroup_oom",
-        rio_proto::types::FailureClass::DiskFull => "disk_full",
-    }
-}
-
 pub(super) fn failure_ctx_for<'a>(
     status: rio_proto::types::BuildResultStatus,
     result: &'a crate::domain::BuildResult,
@@ -1296,151 +1287,54 @@ impl DagActor {
             .collect()
     }
 
-    // r[impl sched.sla.reactive-floor+5]
-    /// Double the relevant `resource_floor` dimension for `drv_hash`
-    /// (D4). Thin wrapper around `floor::bump_floor_or_count` that
+    // r[impl sched.sla.reactive-floor+6]
+    // r[impl sched.trust.report-corroboration+5]
+    /// sh-041u — the unified peak-observe wrapper for `drv_hash`.
+    /// Thin wrapper around [`super::floor::observe_peaks`] that
     /// handles the dag-node lookup, metric, log, and best-effort PG
-    /// persist.
+    /// persist (the M_044 persist gates on `hard_promoted` ONLY —
+    /// soft observations are in-memory only; this leader's tenure).
     ///
-    /// Called ONLY from explicit per-attempt resource-exhaustion
-    /// signals, every one presenting a typed
-    /// [`super::floor::CorroborationWitness`] (bug_102 — the demand
-    /// sits inside the mutation; the witness constructors are the
-    /// only mints) — the caller set is MACHINE-PINNED by the
-    /// `bump_resource_floor_caller_census` ([GEN-SET], db/live_pins.rs;
-    /// a new caller reds the census until it files its row AND the
-    /// lib.rs HELP):
-    /// - `bump_floor_on_corroborated_claim` (worker-reported typed
-    ///   `CgroupOom`/`DiskFull` claims via
-    ///   `handle_infrastructure_failure`; band-corroborated by
-    ///   `CorroborationWitness::corroborated_sizing`) — labels
-    ///   `cgroup_oom` / `disk_full` (the live_057 prjquota-attributed
-    ///   classification, `apply_disk_override`)
-    /// - `handle_timeout_failure` (worker-reported `TimedOut`,
-    ///   corroborated on attempt-open-duration >= assigned_deadline/2
-    ///   by `CorroborationWitness::corroborated_timeout` — the
-    ///   scheduler's own `running_since` anchor) — label `timeout`
-    /// - the establishment sweep's witnessed-OomKilled disposition row
-    ///   (live_058-b, housekeeping.rs — the controller-witnessed
-    ///   per-container kubelet attribution via
-    ///   `CorroborationWitness::witnessed`, promoted exactly once per
-    ///   attempt via the establishment transaction's append+decide
-    ///   `won` flag) — label `witnessed_oom`
+    /// Called on EVERY non-success worker-reported close (chokepoint
+    /// #2, [`Self::handle_admitted_completion`]), the AD5
+    /// SIGTERM-abort short-circuit (chokepoint #3, pull.rs), and the
+    /// controller-witnessed establishment lane (chokepoint #4,
+    /// housekeeping.rs + pull.rs — peaks=assigned). The caller set is
+    /// MACHINE-PINNED by the `observe_resource_floor_caller_census`
+    /// ([GEN-SET], db/live_pins.rs).
     ///
-    /// The stream-era controller-reported arm
-    /// (`ReportExecutorTermination` → OOMKilled / DiskPressure /
-    /// DeadlineExceeded) retired with that RPC. The pod-terminal
-    /// `ReportAttemptOutcome` second installment still never promotes
-    /// (it fills a worker-classified row); the witnessed-terminal
-    /// ESTABLISHMENT lane is the one controller-witnessed promoter,
-    /// for exactly the OomKilled letter, with the durable
-    /// once-per-attempt dedup the retired arm lacked — every other
-    /// witnessed letter is classify-only
-    /// (`floor::witnessed_disposition`).
+    /// bug_090 — the corroboration gate: a worker-reported peak moves
+    /// a persisted floor ONLY when it sits inside the per-axis trust — quantifier: census(typed_classification_bumps_only_with_corroboration) —
+    /// band vs the shape THIS scheduler assigned at dispatch
+    /// (`state.sched.last_intent` — the corroboration anchor a forger
+    /// cannot choose: each ladder step must show a peak AT the
+    /// previously-assigned size, from a real scheduled attempt).
+    /// Band-law (one site, [`super::floor::observe_peaks`]): the
+    /// CEILING band refuses forged-HIGH peaks (axis observes nothing,
+    /// counted on `rio_scheduler_uncorroborated_sizing_claim_total`);
+    /// the FLOOR band degrades a forged-LOW hard claim to soft 1.2×
+    /// (no `hard_promoted`). bug_102: the gate sits INSIDE the
+    /// mutation, and `AttemptCloseReason` is scheduler-minted (from
+    /// `BuildResultStatus × FailureClass × witnessed-letter`, never
+    /// free text).
     ///
-    /// NOT called from bare disconnect / `TransientFailure` /
-    /// non-OOM `InfrastructureFailure`. The previous
+    /// HARD promotion (any axis got 2.0× headroom or jumped to
+    /// `prov_max`) is bounded by `Ceilings` — the previous
     /// I-170/I-173/I-177/I-199 over-broad heuristic (promote on ANY
     /// failure path) over-fired: live QA showed cmake going medium→
     /// large→xlarge from a pod-kill + store-replica-restart with zero
     /// builds run, and floor is sticky (M_044) so the next submitter
-    /// paid for an oversized pod.
-    ///
-    /// `reason_label`: emitted as a label on the metric + the log
-    /// line so operators can tell the producers apart in dashboards.
-    /// The label alphabet is {`cgroup_oom`, `disk_full`, `timeout`,
-    /// `witnessed_oom`} — pinned by the caller census above (the
-    /// `oom_killed`/`disk_pressure` arms were retired with the
-    /// over-broad heuristic; `timeout` covers `DeadlineExceeded`
-    /// too; `disk_full` is the live_057 worker quota lane) — keep
-    /// the lib.rs HELP in lockstep when the census grows.
-    /// bug_090 — the corroboration gate: a worker-reported TYPED
-    /// sizing claim moves a persisted floor ONLY when its telemetry is — quantifier: census(typed_classification_bumps_only_with_corroboration) —
-    /// consistent with the shape THIS scheduler assigned at dispatch
-    /// (`state.sched.last_intent` — the corroboration anchor a forger
-    /// cannot choose: each ladder step must claim exhaustion AT the
-    /// previously-assigned size, from a real scheduled attempt).
-    ///
-    /// Acceptance bands: the band law lives WITH the witness mint —
-    /// [`super::floor::CorroborationWitness::corroborated_sizing`]
-    /// (bug_102: one site for the bands and the only constructor that
-    /// can authorize the sizing axes; this fn keeps the refusal
-    /// letters). No assigned shape (cold start, never dispatched by
-    /// this leader) ⇒ refuse: there is nothing to corroborate
-    /// against, and `bump_floor_or_count` would no-op on a zero base
-    /// anyway. Refusals are TYPED letters: counted
-    /// (`rio_scheduler_uncorroborated_sizing_claim_total`),
-    /// attributed, classify-only (the report's retry/charge flow is
-    /// unaffected).
-    // r[impl sched.trust.report-corroboration+4]
-    pub(super) async fn bump_floor_on_corroborated_claim(
+    /// paid for an oversized pod. Under sh-041u that surface is
+    /// closed by `hard_promoted` gating BOTH promotion-exempt and the
+    /// M_044 persist — a soft observe (peak × 1.2, in-memory only)
+    /// can never re-create it.
+    pub(super) async fn observe_resource_floor(
         &mut self,
         drv_hash: &DrvHash,
-        claim: super::report_ctx::SizingClaim,
+        peaks: super::floor::ObservedPeaks,
+        reason: super::floor::AttemptCloseReason,
     ) -> super::floor::FloorOutcome {
-        let Some(intent) = self
-            .dag
-            .node(drv_hash)
-            .and_then(|state| state.sched.last_intent.as_ref())
-            .map(|i| (i.mem_bytes, i.disk_bytes))
-        else {
-            warn!(
-                drv_hash = %drv_hash, class = ?claim.class,
-                "refusing sizing claim: no dispatch intent to corroborate \
-                 against (cold/never-dispatched)"
-            );
-            metrics::counter!(
-                "rio_scheduler_uncorroborated_sizing_claim_total",
-                "class" => sizing_class_label(claim.class)
-            )
-            .increment(1);
-            return super::floor::FloorOutcome::default();
-        };
-        let (assigned_mem, assigned_disk) = intent;
-        // bug_102: the bands live in the witness constructor — the
-        // mint and the band law are ONE site (actor/floor.rs); this
-        // fn keeps the refusal letters (count + warn, classify-only).
-        let Some(witness) = super::floor::CorroborationWitness::corroborated_sizing(
-            &claim,
-            assigned_mem,
-            assigned_disk,
-        ) else {
-            warn!(
-                drv_hash = %drv_hash, class = ?claim.class,
-                peak_memory = claim.peak_memory_bytes,
-                quota = ?claim.quota,
-                assigned_mem, assigned_disk,
-                "refusing uncorroborated sizing claim (telemetry \
-                 inconsistent with the assigned shape); classify-only"
-            );
-            metrics::counter!(
-                "rio_scheduler_uncorroborated_sizing_claim_total",
-                "class" => sizing_class_label(claim.class)
-            )
-            .increment(1);
-            return super::floor::FloorOutcome::default();
-        };
-        // Unspecified cannot mint a witness (the constructor's
-        // false arm), so the wire-default structurally cannot bump.
-        self.bump_resource_floor(drv_hash, witness).await
-    }
-
-    // r[impl sched.trust.report-corroboration+4]
-    /// bug_102 — the corroboration chokepoint: the demand sits INSIDE
-    /// the floor mutation. Every caller presents a typed
-    /// [`super::floor::CorroborationWitness`] minted by a verifying
-    /// constructor (the worker cannot mint one), so an ungated axis is
-    /// UNREPRESENTABLE — the pre-fix shape (the status-borne TimedOut
-    /// lane bumping unconditionally while the typed-claim gate covered
-    /// only the FailureClass carriers) cannot compile. The
-    /// `(reason, label)` pair derives from the witness — one producer.
-    pub(super) async fn bump_resource_floor(
-        &mut self,
-        drv_hash: &DrvHash,
-        witness: super::floor::CorroborationWitness,
-    ) -> super::floor::FloorOutcome {
-        let reason = witness.reason();
-        let reason_label = witness.label();
+        let reason_label = reason.label();
         // r[impl sched.floor.compute-bound-provisionable]
         // sh-031b: the cores axis caps at the partition-aware
         // provisionable max — feature/arch-routed AND non-ICE-exhausted
@@ -1464,25 +1358,41 @@ impl DagActor {
                 )
             })
             .unwrap_or(self.sla_ceilings.max_cores as u32);
+        let cfg = super::floor::ObserveCfg {
+            compute_bound_threshold: self.sla_config.compute_bound_threshold,
+            compute_bound_min_wall_secs: self.sla_config.compute_bound_min_wall_secs,
+        };
         let mut new_floor = None;
         let outcome = if let Some(state) = self.dag.node_mut(drv_hash) {
-            let o = super::floor::bump_floor_or_count(
+            let o = super::floor::observe_peaks(
                 state,
+                peaks,
                 reason,
                 &self.sla_ceilings,
                 prov_max_cores,
+                &cfg,
             );
-            if o.promoted {
+            if o.hard_promoted || o.soft_promoted {
                 info!(
                     drv_hash = %drv_hash, reason = reason_label,
+                    hard = o.hard_promoted,
                     floor = ?state.sched.resource_floor,
-                    "resource_floor bumped"
+                    "resource_floor observed"
                 );
                 metrics::counter!(
                     "rio_scheduler_resource_floor_bumps_total",
-                    "reason" => reason_label
+                    "reason" => reason_label,
+                    "headroom" => if o.hard_promoted { "hard" } else { "soft" }
                 )
                 .increment(1);
+            }
+            // sh-041u Q1 default: M_044 persist gates on
+            // `hard_promoted` ONLY — soft observations are in-memory
+            // only (a soft observe can be `target < last_intent`;
+            // persisting it via the GREATEST() ratchet would never
+            // heal downward, and the SLA fit's pname-keyed p90
+            // already covers the same evidence).
+            if o.hard_promoted {
                 new_floor = Some(state.sched.resource_floor);
             }
             o
@@ -1896,7 +1806,7 @@ impl DagActor {
     ///
     /// [`SchedulerDb::paths_with_production_evidence`]: crate::db::SchedulerDb::paths_with_production_evidence
     /// [`StampProvenance::BuiltLocallyEvidenced`]: crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced
-    // r[impl sched.trust.report-corroboration+4]
+    // r[impl sched.trust.report-corroboration+5]
     pub(super) async fn ca_production_evidence(
         &self,
         executor_id: &str,
@@ -2184,10 +2094,11 @@ impl DagActor {
         // unknown discriminants are Unspecified, a failure route).
         let wire_status = rio_proto::types::BuildResultStatus::try_from(result.status)
             .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
-        // sh-012 D4 cores axis: the compute-bound corroborant.
-        // Extracted before `final_resources` is moved into the echo
-        // (failure paths) — `Option<f64>` is Copy.
+        // sh-041u: the peak inputs `observe_peaks` consumes. Extracted
+        // before `final_resources` is moved into the echo (failure
+        // paths) — `Option<f64>` / `Option<u64>` are Copy.
         let cpu_seconds_total = final_resources.as_ref().and_then(|r| r.cpu_seconds_total);
+        let peak_disk_bytes = final_resources.as_ref().and_then(|r| r.peak_disk_bytes);
         let mut echo = (!matches!(
             wire_status,
             rio_proto::types::BuildResultStatus::Built
@@ -2444,6 +2355,38 @@ impl DagActor {
             return;
         }
 
+        // r[impl sched.sla.reactive-floor+6]
+        // sh-041u chokepoint #2: ONE peak-observe call on every
+        // non-success worker close, BEFORE the per-status fan-out.
+        // The per-handler floor mints (the retired
+        // per-handler floor mints / compute_witness /
+        // timeout_witness blocks) collapse to this one call; each
+        // handler receives `floor_outcome` for its `attempt_row`
+        // stamp + promotion-exempt branch. Success skips
+        // (`from_status` returns `None` — `record_build_sample`
+        // already feeds the SLA fit, whose `p90 × headroom`
+        // dominates the soft floor at the solve chokepoint).
+        let floor_outcome = match super::floor::AttemptCloseReason::from_status(
+            status,
+            result.failure_classification.as_ref(),
+        ) {
+            Some(reason) => {
+                let attempt_open = self
+                    .dag
+                    .node(drv_hash)
+                    .and_then(|s| s.running_since)
+                    .map(|since| since.elapsed());
+                let peaks = super::floor::ObservedPeaks::from_report(
+                    peak_memory_bytes,
+                    cpu_seconds_total,
+                    peak_disk_bytes,
+                    attempt_open,
+                );
+                self.observe_resource_floor(drv_hash, peaks, reason).await
+            }
+            None => super::floor::FloorOutcome::default(),
+        };
+
         // Report-carried context for the failure handlers. The
         // line-count sentinel conversion matches the success path's
         // stamp below: 0 ("not reported") and out-of-range worker
@@ -2494,6 +2437,7 @@ impl DagActor {
                         drv_hash,
                         executor_id,
                         failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        floor_outcome,
                     )
                     .await;
                 match handling {
@@ -2517,7 +2461,7 @@ impl DagActor {
                         drv_hash,
                         executor_id,
                         failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
-                        cpu_seconds_total,
+                        floor_outcome,
                     )
                     .await;
                 match handling {
@@ -2579,6 +2523,7 @@ impl DagActor {
                         drv_hash,
                         executor_id,
                         failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        floor_outcome,
                     )
                     .await;
                 match handling {
@@ -2611,6 +2556,7 @@ impl DagActor {
                         drv_hash,
                         executor_id,
                         failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        floor_outcome,
                     )
                     .await;
                 match handling {
@@ -4484,6 +4430,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
+        floor_outcome: super::floor::FloorOutcome,
     ) -> FailureHandling {
         // OA1 interval (ii), worker-report cause (see
         // handle_transient_failure).
@@ -4532,30 +4479,22 @@ impl DagActor {
         // bug_090 (live_057-b rebuilt): the floor moves ONLY on the — quantifier: census(forged_free_text_never_moves_resource_floors)
         // TYPED classification field, corroborated against the shape
         // this scheduler itself assigned — worker-supplied free text
-        // (error_msg) is display/narration and drives nothing. The
-        // bug_408 believed-store suppression applies IDENTICALLY: a
-        // store-degraded failure is never a sizing signal, on either
-        // axis.
+        // (error_msg) is display/narration and drives nothing. sh-041u:
+        // the observe ran at chokepoint #2 (the dispatch chokepoint
+        // before this match); `floor_outcome` is threaded in.
         //
         // ENVELOPE (R29, enrolled in the wave's duration/envelope
-        // census; consumer: THIS gate): at most ONE doubling per
-        // corroborated incident IDENTITY — per unique
-        // (drv_hash, exec_id) — POPULATION-denominated, never
-        // wall-windowed (a wall window lets a paced forger ladder up
-        // anyway; N corroboration-free reports over any timespan move
-        // nothing). The identity law's durable half is the report
-        // admission fold: a terminal report is consumed once per exec
-        // (`fold_report` over the durable attempt row + the
-        // assignment-token dedup), so this gate runs at most once per
-        // exec and each ladder step burns a REAL scheduled attempt of
-        // the forger's own drv at the previously-assigned size — the
-        // honest path's cost, no amplification.
-        let floor_outcome = match report.sizing() {
-            Some(claim) if !believed_store => {
-                self.bump_floor_on_corroborated_claim(drv_hash, claim).await
-            }
-            _ => super::floor::FloorOutcome::default(),
-        };
+        // census; consumer: THIS gate): at most ONE hard observation
+        // per incident IDENTITY — per unique (drv_hash, exec_id) —
+        // POPULATION-denominated, never wall-windowed. The identity
+        // law's durable half is the report admission fold: a terminal
+        // report is consumed once per exec (`fold_report` over the
+        // durable attempt row + the assignment-token dedup), so the
+        // chokepoint observe runs at most once per exec and each
+        // ladder step burns a REAL scheduled attempt of the forger's
+        // own drv at the previously-assigned size — the honest path's
+        // cost, no amplification.
+        let _ = believed_store;
 
         if self.dag.node(drv_hash).is_none() {
             return FailureHandling::Handled;
@@ -4598,8 +4537,16 @@ impl DagActor {
         let class = crate::retry_policy::classify(
             &event,
             crate::retry_policy::FloorOutcomeView {
-                promoted: floor_outcome.promoted,
-                at_cap: floor_outcome.at_cap,
+                // sh-041u: promotion-exempt narrows to `hard_promoted`
+                // (a soft observe can be `target < last_intent` —
+                // granting exemption would be the retired I-199
+                // over-broad heuristic). The kernel's `at_cap` for the
+                // Infra arm narrows to {Mem, Disk} (belt-only — the
+                // kernel ignores it on this path).
+                promoted: floor_outcome.hard_promoted,
+                at_cap: floor_outcome
+                    .at_cap_axes
+                    .intersects(&[super::floor::Axis::Mem, super::floor::Axis::Disk]),
             },
         );
         let exempt_from_cap = class == OutcomeClass::ExemptInfra;
@@ -4609,8 +4556,10 @@ impl DagActor {
         // reads instead of re-deriving the floor at decision time.
         if let Some(row) = attempt_row.as_mut() {
             row.exempt = exempt_from_cap;
-            row.floor_promoted = floor_outcome.promoted;
-            row.floor_at_cap = floor_outcome.at_cap;
+            row.floor_promoted = floor_outcome.hard_promoted;
+            row.floor_at_cap = floor_outcome
+                .at_cap_axes
+                .intersects(&[super::floor::Axis::Mem, super::floor::Axis::Disk]);
             row.outcome_class = class;
         }
 
@@ -4868,7 +4817,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
-        cpu_seconds_total: Option<f64>,
+        floor_outcome: super::floor::FloorOutcome,
     ) -> FailureHandling {
         let observed_at = Instant::now();
         let mut attempt_row = self.attempt_row_for(
@@ -4881,43 +4830,19 @@ impl DagActor {
             row.error_msg = (!report.error_msg.is_empty()).then(|| report.error_msg.to_string());
             row.final_line_count = report.final_line_count;
         }
-        // r[impl sched.sla.reactive-floor+5]
-        // sh-012 D4 cores axis: BEFORE the verdict, mint the
-        // compute-bound witness. cpu_util = cpu_seconds_total /
-        // (elapsed_wall × assigned_cores); when ≥ threshold the
-        // attempt demonstrably saturated its assigned cores and
-        // floor.cores doubles. sh-031: the wall anchor is the
-        // scheduler's own `running_since` elapsed (same trust model as
-        // `handle_timeout_failure`'s timeout-witness mint), NOT the
-        // assigned deadline — a saturated build that exits on its own
-        // internal timeout before the nix deadline must still
-        // corroborate. A genuine compile-error exit (short wall, gated
-        // by `min_wall_secs`) refuses — the inverse-cost bound: 3
-        // attempts at the same shape, never 3× resource.
-        let compute_witness = {
-            let state = self.dag.node(drv_hash);
-            let attempt_open = state
-                .and_then(|s| s.running_since)
-                .map(|since| since.elapsed());
-            let assigned_cores = state
-                .and_then(|s| s.sched.last_intent.as_ref())
-                .map(|i| i.cores)
-                .unwrap_or(0);
-            super::floor::CorroborationWitness::corroborated_compute_bound(
-                cpu_seconds_total,
-                assigned_cores,
-                attempt_open,
-                self.sla_config.compute_bound_threshold,
-                self.sla_config.compute_bound_min_wall_secs,
-            )
-        };
-        let floor_outcome = match compute_witness {
-            Some(witness) => self.bump_resource_floor(drv_hash, witness).await,
-            None => super::floor::FloorOutcome::default(),
-        };
+        // sh-041u: the compute-bound observe ran at chokepoint #2. The
+        // E3a `row.floor_at_cap` narrows to the CORES axis ONLY: the
+        // kernel's `Poison(ComputeBoundAtCap)` reads this single bool,
+        // and its retired invariant ("cores is the only floor
+        // dimension an ExecutorVariant row carries") is FALSE under
+        // sh-041u — the per-handler narrowing restores it at the
+        // stamp site (kernel unchanged). A mem-at-cap E3a row
+        // therefore never poisons compute-bound.
         if let Some(row) = attempt_row.as_mut() {
-            row.floor_promoted = floor_outcome.promoted;
-            row.floor_at_cap = floor_outcome.at_cap;
+            row.floor_promoted = floor_outcome.hard_promoted;
+            row.floor_at_cap = floor_outcome
+                .at_cap_axes
+                .contains(super::floor::Axis::Cores);
         }
 
         if self.dag.node(drv_hash).is_none() {
@@ -5273,6 +5198,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
+        floor_outcome: super::floor::FloorOutcome,
     ) -> FailureHandling {
         // OA1 interval (ii), worker-report cause (see
         // handle_transient_failure).
@@ -5288,58 +5214,19 @@ impl DagActor {
             row.error_msg = (!error_msg.is_empty()).then(|| error_msg.to_string());
             row.final_line_count = report.final_line_count;
         }
-        // Bump BEFORE the verdict / state transition: even the
-        // terminal-path attempt should record that this deadline was
-        // inadequate, so an explicit resubmit starts at the doubled
-        // floor instead of replaying the timeout. Same shape as
-        // I-199's handle_infrastructure_failure prologue.
-        //
+        // sh-041u: the deadline observe ran at chokepoint #2.
         // bug_102 — the status-borne axis joins the corroboration law:
-        // TimedOut rides BuildResultStatus (no FailureClassification),
-        // so the wave-11 typed-claim gate never saw it and this bump
-        // was unconditional — a hostile builder ratcheted the
-        // cross-tenant 24h deadline floor in ~5 cheap zero-age
-        // reports. The witness anchors on the scheduler's OWN clock:
-        // the attempt demonstrably RAN at least half its assigned
-        // deadline (`running_since` elapsed vs the reconciled
-        // `last_intent.deadline_secs` — neither mintable by the
-        // worker). Uncorroborated => classify-only: the refusal is a
-        // typed counted letter and the verdict flow below is
-        // untouched (timeouts still charge `timeout_count`).
-        let timeout_witness = {
-            let state = self.dag.node(drv_hash);
-            let attempt_open = state
-                .and_then(|s| s.running_since)
-                .map(|since| since.elapsed());
-            let assigned_deadline = state
-                .and_then(|s| s.sched.last_intent.as_ref())
-                .map(|i| i.deadline_secs)
-                .unwrap_or(0);
-            super::floor::CorroborationWitness::corroborated_timeout(
-                attempt_open,
-                assigned_deadline,
-            )
-        };
-        let floor_outcome = match timeout_witness {
-            Some(witness) => self.bump_resource_floor(drv_hash, witness).await,
-            None => {
-                warn!(
-                    drv_hash = %drv_hash, executor_id = %executor_id,
-                    "refusing uncorroborated timeout claim (attempt-open \
-                     duration below half the assigned deadline, or no \
-                     scheduler-side anchor); classify-only"
-                );
-                metrics::counter!(
-                    "rio_scheduler_uncorroborated_sizing_claim_total",
-                    "class" => "timed_out"
-                )
-                .increment(1);
-                super::floor::FloorOutcome::default()
-            }
-        };
+        // TimedOut rides BuildResultStatus (no FailureClassification);
+        // the gate (`wall ≥ assigned_deadline/2`, scheduler's own
+        // `running_since` anchor) sits inside `observe_peaks` and
+        // counts the refusal there. The verdict flow below is
+        // untouched (timeouts still charge `timeout_count`). The
+        // Timeout `row.floor_at_cap` narrows to the DEADLINE axis.
         if let Some(row) = attempt_row.as_mut() {
-            row.floor_promoted = floor_outcome.promoted;
-            row.floor_at_cap = floor_outcome.at_cap;
+            row.floor_promoted = floor_outcome.hard_promoted;
+            row.floor_at_cap = floor_outcome
+                .at_cap_axes
+                .contains(super::floor::Axis::Deadline);
         }
 
         if self.dag.node(drv_hash).is_none() {
@@ -5477,7 +5364,7 @@ impl DagActor {
                 executor_id = %executor_id,
                 timeout_retry_count = state.retry.timeout_count,
                 max = self.retry_policy.max_timeout_retries,
-                promoted = floor_outcome.promoted,
+                promoted = floor_outcome.hard_promoted,
                 "timeout — bumped deadline floor, retrying"
             );
         }

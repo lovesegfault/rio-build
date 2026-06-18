@@ -117,7 +117,7 @@ impl Default for RetryPolicy {
             // livelock within minutes (no backoff on the exempt path,
             // so 50 immediate cycles ≈ seconds-to-low-minutes for fast
             // builds). Separately bounds `floor_outcome.promoted` as
-            // defense-in-depth against a `bump_resource_floor` bug
+            // defense-in-depth against a `observe_resource_floor` bug
             // that always returns `promoted=true`.
             max_exempt_infra_retries: 50,
             backoff_base_secs: 5.0,

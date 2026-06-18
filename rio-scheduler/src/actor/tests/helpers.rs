@@ -1254,7 +1254,10 @@ pub(crate) fn kubelet_minted_hard_limit(i: &crate::state::SolvedIntent) -> u64 {
 
 /// bug_090: a typed corroborated sizing-failure payload — the wire
 /// form the floor gate consumes (free text no longer drives floors).
-/// `peak_memory_bytes` is the oom corroborant; `quota` the disk one.
+/// `peak_memory_bytes` is the oom corroborant; `quota` is narration
+/// (sh-041u: the disk-axis floor consumes
+/// `final_resources.peak_disk_bytes`, threaded here from
+/// `quota.peak_used_bytes` so existing disk tests keep working).
 pub(crate) fn typed_sizing_failure(
     class: rio_proto::types::FailureClass,
     error_msg: &str,
@@ -1271,6 +1274,12 @@ pub(crate) fn typed_sizing_failure(
         ..Default::default()
     });
     p.peak_memory_bytes = peak_memory_bytes;
+    if let Some(q) = quota {
+        p.final_resources = Some(rio_proto::types::ResourceUsage {
+            peak_disk_bytes: Some(q.peak_used_bytes),
+            ..Default::default()
+        });
+    }
     p
 }
 

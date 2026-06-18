@@ -1008,11 +1008,11 @@ pub struct CaState {
     pub output_unchanged: bool,
 }
 
-// r[impl sched.sla.reactive-floor+5]
+// r[impl sched.sla.reactive-floor+6]
 /// Per-dimension resource floor for the NEXT dispatch (D4).
 ///
 /// Reactive promotion has three producers, census-pinned
-/// (`bump_resource_floor_caller_census`, db/live_pins.rs): the
+/// (`observe_resource_floor_caller_census`, db/live_pins.rs): the
 /// explicit WORKER-REPORTED resource-exhaustion signals (`CgroupOom`
 /// → `OomKilled`, `TimedOut` → `DeadlineExceeded`) and the
 /// controller-WITNESSED OomKilled letter promoted at the
@@ -1020,7 +1020,7 @@ pub struct CaState {
 /// establishment transaction's `won` flag; every other witnessed
 /// letter is classify-only — `actor/floor.rs`'s
 /// `witnessed_disposition` table). All route through
-/// `actor::floor::bump_floor_or_count`, which doubles the relevant
+/// `actor::floor::observe_peaks`, which doubles the relevant
 /// dimension, capped at `Ceilings`. The disk dimension has NO live
 /// producer: witnessed `EvictedDiskPressure` is classify-only BY
 /// RULING (the controller folds node-condition and pod-attributed
@@ -1053,7 +1053,7 @@ pub struct ResourceFloor {
 /// deadline)` SpawnIntent shape + the dispatch-time SLA prediction
 /// snapshot + the cost-routed nodeSelector. Stored on
 /// [`SchedHint::last_intent`] at dispatch so the spawn-intent solve /
-/// the mint profile / `bump_floor_or_count` /
+/// the mint profile / `observe_peaks` /
 /// `record_build_sample` all read the SAME solve.
 #[derive(Debug, Clone, Default)]
 pub struct SolvedIntent {
@@ -1112,7 +1112,7 @@ pub struct SchedHint {
     pub resource_floor: ResourceFloor,
     /// Dispatch-time `solve_intent_for` output. The spawn-intent solve
     /// reads `mem_bytes` (resource-fit), the mint profile reads
-    /// `cores` (the assigned-cores carry), `bump_floor_or_count`
+    /// `cores` (the assigned-cores carry), `observe_peaks`
     /// reads `mem/disk/deadline` as the doubling base,
     /// `record_build_sample` reads `predicted` for actual-vs-predicted
     /// scoring.

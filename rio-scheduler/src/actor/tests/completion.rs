@@ -1132,8 +1132,8 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 /// sizing signal (pod-level OOMKilled arrives as the controller's
 /// `ReportAttemptOutcome` classification fill, which never
 /// promotes).
-// r[verify sched.retry.promotion-exempt+3]
-// r[verify sched.sla.reactive-floor+5]
+// r[verify sched.retry.promotion-exempt+4]
+// r[verify sched.sla.reactive-floor+6]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1448,7 +1448,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         };
     });
 
-    // D4: bump_floor_or_count reads the MINTED intent's deadline as
+    // D4: observe_peaks reads the MINTED intent's deadline as
     // the doubling base (live_040: each pull mint stamps the solve
     // onto last_intent — the freshness law overwrites any seed, so
     // the ladder is asserted relative to the OBSERVED minted base).
@@ -1809,21 +1809,18 @@ async fn test_floor_bump_store_suppression_parity(
         s.sched.resource_floor.mem_bytes,
         s.sched.resource_floor.disk_bytes,
     );
-    if believed_store {
-        assert_eq!(
-            (mem, disk),
-            (0, 0),
-            "believed-store suppresses the sizing signal on BOTH axes \
-             (a store-degraded failure is never a sizing signal)"
-        );
-    } else if oom {
-        assert!(mem > 0, "plain OOM bumps the mem dimension; got {mem}");
+    // sh-041u: the floor observe runs at chokepoint #2 BEFORE the
+    // believed-store disposition — peaks are evidence regardless of
+    // attribution (a real CgroupOom is a sizing signal even if the
+    // store breaker also tripped). The bug_408 law now governs the
+    // CHARGE classification only (Paced → uncharged StoreDegraded);
+    // it no longer suppresses the observe.
+    let _ = believed_store;
+    if oom {
+        assert!(mem > 0, "OOM observes the mem dimension; got {mem}");
         assert_eq!(disk, 0, "…and ONLY the mem dimension");
     } else {
-        assert!(
-            disk > 0,
-            "plain DiskFull bumps the disk dimension; got {disk}"
-        );
+        assert!(disk > 0, "DiskFull observes the disk dimension; got {disk}");
         assert_eq!(mem, 0, "…and ONLY the disk dimension");
     }
     Ok(())
@@ -1840,7 +1837,7 @@ async fn test_floor_bump_store_suppression_parity(
 /// The attack (the red this test was born failing on, pre-fix):
 /// `handle_infrastructure_failure` substring-matched the
 /// worker-supplied free-text `error_msg` against
-/// CGROUP_OOM_MSG/DISK_FULL_MSG to drive `bump_resource_floor` — a
+/// CGROUP_OOM_MSG/DISK_FULL_MSG to drive the floor observe — a
 /// drv_hash-keyed (cross-tenant, M_095), GREATEST()-ratcheted,
 /// never-healed-downward persisted sizing decision riding the
 /// uncharged ExemptInfra lane. Three forged free-text reports
@@ -1850,7 +1847,7 @@ async fn test_floor_bump_store_suppression_parity(
 /// Post-fix: the floor bump consumes only the typed
 /// `failure_classification` field, corroborated against the
 /// scheduler-assigned shape; free text is display/narration.
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 #[tokio::test]
 async fn forged_free_text_never_moves_resource_floors() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -1896,7 +1893,7 @@ async fn forged_free_text_never_moves_resource_floors() -> TestResult {
 /// refused (telemetry absent, or inconsistent with the
 /// scheduler-assigned shape); a CORROBORATED one takes exactly ONE
 /// doubling per incident. Both axes.
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 #[tokio::test]
 async fn typed_classification_bumps_only_with_corroboration() -> TestResult {
     // Big ceilings: the corroborated cells assert a full doubling —
@@ -1993,10 +1990,12 @@ async fn typed_classification_bumps_only_with_corroboration() -> TestResult {
     let s = expect_drv(&handle, drv).await;
     assert_eq!(
         s.sched.resource_floor.disk_bytes,
-        minted_disk * 2,
-        "typed + corroborated takes exactly ONE doubling from the \
-         minted shape"
+        ((minted_hard - (1 << 20)) as f64 * 2.0) as u64,
+        "typed + corroborated takes exactly ONE peak × 2.0 from the \
+         observed prjquota peak (sh-041u: target = peak × headroom, \
+         not last_intent × 2)"
     );
+    let _ = minted_disk;
     assert_eq!(s.sched.resource_floor.mem_bytes, 0, "only its own axis");
 
     // ── mem axis (oom) ──────────────────────────────────────────────
@@ -2021,8 +2020,11 @@ async fn typed_classification_bumps_only_with_corroboration() -> TestResult {
     pull_report(&handle, drv, payload).await?;
     let s = expect_drv(&handle, drv).await;
     assert_eq!(
-        s.sched.resource_floor.mem_bytes, 0,
-        "typed oom with a peak far below the assigned shape is REFUSED"
+        s.sched.resource_floor.mem_bytes,
+        ((1u64 << 20) as f64 * 1.2) as u64,
+        "typed oom with a peak far below the assigned shape DEGRADES \
+         to soft 1.2× (sh-041u: never hard-promoted, never \
+         M_044-persisted, never rides promotion-exempt — bug_090)"
     );
 
     // Typed oom, CORROBORATED: peak at the assigned limit (memory.peak
@@ -3501,7 +3503,7 @@ async fn test_keep_going_build_failed_records_first_failure() -> TestResult {
 // r[verify sched.retry.per-executor-budget+4]
 /// `max_infra_retries` is a uniform bound: at-cap cgroup-OOM and
 /// non-floor infra (FUSE EIO) poison at the SAME attempt number.
-/// Previously `bump_floor_or_count` incremented BEFORE the cap check
+/// Previously the floor body incremented BEFORE the cap check
 /// for at-cap, so it poisoned one attempt earlier.
 #[rstest]
 #[case::at_cap_oom(rio_proto::CGROUP_OOM_MSG, true)]
@@ -5353,6 +5355,7 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
                 None,
                 0,
             ),
+            crate::actor::floor::FloorOutcome::default(),
         )
         .await;
     assert!(
@@ -5382,6 +5385,7 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
                 None,
                 0,
             ),
+            crate::actor::floor::FloorOutcome::default(),
         )
         .await;
     assert!(
@@ -5396,7 +5400,7 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor+5]
+// r[verify sched.sla.reactive-floor+6]
 /// bug_027 companion red — the carried-at-ceiling cell of `bump_dim`'s
 /// at_cap law: when the pod was DISPATCHED at the deadline cap (the
 /// carried `BoundIntent` rendered 86400s) and the mint-time solve
@@ -5478,12 +5482,15 @@ async fn carried_at_cap_deadline_exceeded_is_counted_not_exempt() -> TestResult 
     let rows = ledger_rows(&db.pool, drv_hash).await;
     let row = rows.last().expect("the TimedOut attempt row");
     assert!(
-        row.floor_at_cap && !row.floor_promoted,
-        "the carried-at-ceiling DeadlineExceeded must charge the COUNTED \
-         at-cap arm, not ride promotion-exempt (got promoted={} at_cap={})",
-        row.floor_promoted,
+        row.floor_at_cap,
+        "the carried-at-ceiling DeadlineExceeded marks at_cap (the \
+         kernel's bound; got at_cap={})",
         row.floor_at_cap
     );
+    // sh-041u: `floor_promoted` may be true on the FIRST observation
+    // at the cap (floor 0→cap is strict growth under set_dim); the
+    // counted charge bounds it regardless — timeouts always charge
+    // `timeout_count` (I-200), never riding promotion-exempt.
     assert_eq!(
         info.retry.timeout_count, 1,
         "the counted charge is what bounds the at-cap case"
@@ -6072,7 +6079,7 @@ async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResu
 /// evidence for the reporting build's attributed cohort ⇒ a typed,
 /// counted, non-poisoning refusal of the STAMP (the report's other
 /// effects are unaffected; the drv still completes).
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 #[tokio::test]
 async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult {
     use sha2::Digest;
@@ -6279,7 +6286,7 @@ async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult 
 /// the completion stamp widens to all interested tenants under the
 /// signed Q2 BuiltLocally law (locally produced bytes — all
 /// interested tenants lawful).
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 #[tokio::test]
 async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
     use sha2::Digest;
@@ -6367,7 +6374,7 @@ async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
 /// `query_prior_realisation` (the cutoff-compare consumer), both
 /// tenant-unscoped: the W11-Q end-to-end precedent's global-read
 /// manifestation.
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 // r[verify sched.trust.evidence-scope]
 #[tokio::test]
 async fn untenanted_floating_ca_report_never_mints_global_realisations() -> TestResult {
@@ -6531,7 +6538,7 @@ async fn untenanted_floating_ca_report_never_mints_global_realisations() -> Test
 /// directly — modeling the builds-retention sweep's row removal (the
 /// producer of the aged-out state; the drv row itself survives, which
 /// is exactly what makes the cold resolve succeed with zero tenants).
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 #[tokio::test]
 async fn aged_out_late_ca_report_refuses_realisations() -> TestResult {
     use sha2::Digest;
@@ -6616,7 +6623,7 @@ async fn aged_out_late_ca_report_refuses_realisations() -> TestResult {
 /// reds are this witness's teeth), because evidence is structurally
 /// unrepresentable there: `path_tenants` is tenant-keyed, so an empty
 /// cohort has no consultable evidence row by construction.*
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 #[tokio::test]
 async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> TestResult {
     use sha2::Digest;
@@ -6674,11 +6681,11 @@ async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> Tes
 ///
 /// The wave-11 corroboration gate covered only CgroupOom/DiskFull
 /// riding `failure_classification`; TimedOut rides STATUS, bypassing
-/// SizingClaim entirely — no attempt-age-vs-assigned-deadline anchor
+/// the typed-claim ctx entirely — no attempt-age-vs-assigned-deadline anchor
 /// consulted, and the standing census quantified over FailureClass
 /// CARRIERS, leaving the status lane structurally outside its corpus.
-/// Post-fix `bump_resource_floor` itself demands the typed
-/// `CorroborationWitness`; the timeout axis corroborates on
+/// Post-fix `observe_resource_floor` itself demands the
+/// scheduler-minted close reason; the timeout axis corroborates on
 /// attempt-open-duration >= assigned_deadline/2 (the scheduler's own
 /// `running_since` stamp — an anchor the worker cannot mint).
 ///
@@ -6686,7 +6693,7 @@ async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> Tes
 /// reports through the production pull path); the verdict flow is
 /// asserted UNTOUCHED (timeouts still charge `timeout_count` — the
 /// close is classify-only on the floor axis, never a retry change).
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 #[tokio::test]
 async fn forged_timeout_reports_never_move_the_deadline_floor() -> TestResult {
     let recorder = CountingRecorder::default();
@@ -6750,7 +6757,7 @@ async fn forged_timeout_reports_never_move_the_deadline_floor() -> TestResult {
 /// scheduler's own `running_since` clock vs the reconciled
 /// `last_intent.deadline_secs`) corroborates, and the floor doubles
 /// exactly as the wave-11 behavior intended for honest slow builds.*
-// r[verify sched.trust.report-corroboration+4]
+// r[verify sched.trust.report-corroboration+5]
 #[tokio::test]
 async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> TestResult {
     let recorder = CountingRecorder::default();
@@ -6783,9 +6790,10 @@ async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> Tes
 
     let s = expect_drv(&handle, drv).await;
     assert_eq!(
-        s.sched.resource_floor.deadline_secs, 7200,
+        s.sched.resource_floor.deadline_secs, 3600,
         "corroborated (open 1800s >= 3600/2): the floor doubles from \
-         the assigned deadline — honest slow builds still heal"
+         WALL (sh-041u: target = wall × 2.0, not assigned × 2) — \
+         honest slow builds still heal"
     );
     assert_eq!(
         recorder.get("rio_scheduler_uncorroborated_sizing_claim_total{class=timed_out}"),
@@ -6804,7 +6812,7 @@ async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> Tes
 /// changed the ladder from ×2 to jump-to-max — ComputeBound has no
 /// threshold semantics, so the only useful next probe is the largest
 /// provisionable shape.
-// r[verify sched.sla.reactive-floor+5]
+// r[verify sched.sla.reactive-floor+6]
 // r[verify sched.retry.executor-variant-threshold]
 #[tokio::test]
 async fn e3a_compute_bound_jumps_floor_cores_to_provisionable_max() -> TestResult {
@@ -6859,9 +6867,82 @@ async fn e3a_compute_bound_jumps_floor_cores_to_provisionable_max() -> TestResul
         "below the distinct-executor threshold: requeue (E3a)"
     );
     assert_eq!(
-        recorder.get("rio_scheduler_resource_floor_bumps_total{reason=compute_bound}"),
+        recorder
+            .get("rio_scheduler_resource_floor_bumps_total{headroom=hard,reason=executor_variant}"),
         1,
-        "the compute_bound label is the cores-axis bump letter"
+        "the executor_variant/hard label is the cores-axis observe letter"
+    );
+    Ok(())
+}
+
+// r[verify sched.sla.reactive-floor+6]
+/// **sh-041u red-first (g)** — *proposition: an E3a row at mem-cap with
+/// cpu_util ≪ threshold stamps `row.floor_at_cap = false` (the
+/// per-handler axis narrowing) so the kernel's `Poison(ComputeBoundAtCap)`
+/// never fires on a non-cores at-cap.* RED if commit-4 stamped
+/// `!at_cap_axes.is_empty()`.
+#[tokio::test]
+async fn exec_variant_mem_at_cap_does_not_poison_compute_bound() -> TestResult {
+    let (db, handle, _task) = setup_with_big_ceilings().await;
+    let drv = "e3a-mem-at-cap";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let exec = open_pull_exec(&handle, drv).await;
+    assert!(handle.debug_backdate_running(drv, 600).await?);
+    handle.debug_seed_intent_cores(drv, 4, 600).await?;
+    // Force mem at cap: the report's peak == assigned == cap.
+    let cap = expect_drv(&handle, drv)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .map(|i| i.mem_bytes)
+        .unwrap_or(0);
+    handle
+        .debug_seed_sched_hint(
+            drv,
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                mem_bytes: u64::MAX,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    pull_report_exec(
+        &handle,
+        exec,
+        drv,
+        PullReportPayload {
+            peak_memory_bytes: cap,
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_seconds_total: Some(120.0),
+                ..Default::default()
+            }),
+            ..pull_payload(rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::ExecutorVariantFailure.into(),
+                error_msg: "exit 1 (low cpu, mem at cap)".into(),
+                ..Default::default()
+            })
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.status,
+        DerivationStatus::Ready,
+        "mem-at-cap on E3a with cpu_util ≪ threshold MUST NOT poison \
+         ComputeBoundAtCap — Requeue, not Poison"
+    );
+    let rows = ledger_rows(&db.pool, drv).await;
+    let row = rows.last().expect("the E3a attempt row");
+    assert!(
+        !row.floor_at_cap,
+        "the E3a `row.floor_at_cap` narrows to Axis::Cores ONLY — a \
+         mem-at-cap E3a row stamps false (got {})",
+        row.floor_at_cap
     );
     Ok(())
 }

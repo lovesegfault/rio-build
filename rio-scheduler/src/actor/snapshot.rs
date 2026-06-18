@@ -3208,17 +3208,17 @@ impl DagActor {
                 (c, m, d, cells, None)
             }
         };
-        // r[impl sched.sla.reactive-floor+5]
+        // r[impl sched.sla.reactive-floor+6]
         // D4: floor AND ceiling at the single post-solve chokepoint.
         // Floor: a derivation that OOM'd at its solved mem had
-        // `bump_floor_or_count` double `floor.mem`; the next solve
+        // `observe_peaks` double `floor.mem`; the next solve
         // returns at least that. Ceiling: `intent_for`'s early-return
         // branches (forced/serial/local/explore) pass fit-derived /
         // override bytes through unclamped, so the `solve_tier` /
         // `solve_full` BestEffort clamp doesn't cover them — a
         // `disk_p90` (or `--mem` / `--cores`) above a
         // tightened `max_disk`/`max_mem`/`max_cores` would otherwise
-        // spawn a permanently-Pending pod. `bump_floor_or_count`
+        // spawn a permanently-Pending pod. `observe_peaks`
         // already caps `floor` at `ceil` (floor.rs), so
         // `.max(floor).min(ceil)` always yields `≤ ceil`. `.max(1)` is
         // belt-and-braces — every upstream branch already floors at 1.
@@ -3310,9 +3310,9 @@ impl DagActor {
         // sub-second fit (trivial-builders) would otherwise yield
         // `activeDeadlineSeconds≈3`, killing the Job before the pod
         // ever pulls — with no pull there's no attempt row to
-        // classify, so `bump_floor_or_count`
+        // classify, so `observe_peaks`
         // never runs and the next solve emits the same 3s. Clamp
-        // order: floor first (D4 — a `bump_floor_or_count
+        // order: floor first (D4 — a `observe_peaks
         // (DeadlineExceeded)` doubles `floor.deadline_secs`; the next
         // solve must honor it), then 24h ceiling so a doubled floor
         // cannot run away.

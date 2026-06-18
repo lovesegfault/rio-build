@@ -2065,6 +2065,39 @@ impl DagActor {
                         ) && s.exec_id == Some(exec_id)
                     });
                 if abort_of_still_wanted {
+                    // sh-041u chokepoint #3: the AD5 short-circuit
+                    // never reaches `handle_admitted_completion`'s
+                    // chokepoint #2, so observe peaks HERE. Placed
+                    // BEFORE `admit_worker_abort`; the at-bound
+                    // fall-through ALSO reaches chokepoint #2 — the
+                    // double-observe is idempotent under `set_dim`'s
+                    // max, and #2's per-handler `floor_at_cap` stamp
+                    // narrows by axis, so the redundant observe is
+                    // harmless.
+                    let attempt_open = self
+                        .dag
+                        .node(&drv_hash)
+                        .and_then(|s| s.running_since)
+                        .map(|since| since.elapsed());
+                    let peaks = super::floor::ObservedPeaks::from_report(
+                        payload.peak_memory_bytes,
+                        payload
+                            .final_resources
+                            .as_ref()
+                            .and_then(|r| r.cpu_seconds_total),
+                        payload
+                            .final_resources
+                            .as_ref()
+                            .and_then(|r| r.peak_disk_bytes),
+                        attempt_open,
+                    );
+                    let _ = self
+                        .observe_resource_floor(
+                            &drv_hash,
+                            peaks,
+                            super::floor::AttemptCloseReason::WorkerAbort,
+                        )
+                        .await;
                     // r[impl sched.attempt.worker-abort-bounded+2]
                     // bug_279: the charge-free admission is LEDGER-
                     // BOUNDED — the worker-supplied Cancelled
@@ -2239,7 +2272,7 @@ impl DagActor {
     /// delete the Job (`delete_job_with_synthesized_report` deletes
     /// unconditionally). Runs the establishment sweep's C2 charge arm
     /// (`housekeeping.rs`) inline — `append_and_decide_in_tx` +
-    /// `witnessed_disposition` + `bump_resource_floor` — so the durable
+    /// `witnessed_disposition` + `observe_resource_floor` — so the durable
     /// row commits BEFORE the ack returns and the controller deletes
     /// the Job. The earlier defer-to-mark shape (age `witnessed_at` to
     /// 0.0, return `Unresolved`) left a ~5s window where the Job was
@@ -2324,14 +2357,20 @@ impl DagActor {
         if !won {
             return;
         }
-        // The witnessed reason feeds the per-reason disposition table
-        // (the same `witnessed_disposition` + `bump_resource_floor`
-        // path the establishment sweep's witnessed arm runs;
-        // `bump_resource_floor_caller_census` files this row).
-        if let Some(witness) = super::floor::CorroborationWitness::witnessed(
-            super::floor::witnessed_disposition(witnessed_reason),
-        ) {
-            let _ = self.bump_resource_floor(&drv_hash, witness).await;
+        // sh-041u chokepoint #4: the witnessed reason feeds the
+        // per-reason disposition table (the same `witnessed_disposition`
+        // + `observe_resource_floor` path the establishment sweep's
+        // witnessed arm runs; `observe_resource_floor_caller_census`
+        // files this row). Sits AFTER the `if !won { return }` guard —
+        // the won flag remains the once-per-attempt cap (live_058-b).
+        if let Some(reason) = super::floor::witnessed_disposition(witnessed_reason)
+            && let Some(last) = self
+                .dag
+                .node(&drv_hash)
+                .and_then(|s| s.sched.last_intent.as_ref())
+        {
+            let peaks = super::floor::ObservedPeaks::witnessed(last, &reason);
+            let _ = self.observe_resource_floor(&drv_hash, peaks, reason).await;
         }
         metrics::histogram!(
             "rio_scheduler_attempt_requeue_seconds",

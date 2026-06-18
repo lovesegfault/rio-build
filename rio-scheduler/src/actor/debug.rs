@@ -428,7 +428,7 @@ impl DagActor {
 
     /// Inject a Ready non-FOD with a given `resource_floor.{mem,disk}_bytes`.
     /// For the D4 solve_intent_for-clamps-at-floor test — bypasses the
-    /// disconnect→`bump_floor_or_count` dance.
+    /// disconnect→`observe_peaks` dance.
     pub(crate) fn test_inject_ready_with_floor(
         &mut self,
         hash: &str,

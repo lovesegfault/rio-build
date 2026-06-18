@@ -35,68 +35,36 @@ pub(super) struct FailureReportCtx<'a> {
     /// class (`sched.retry.store-degraded-uncharged`). Private:
     /// settable only by [`Self::infra`].
     store_degraded: bool,
-    /// bug_090: the typed sizing claim (class + corroborating
-    /// telemetry + the report's memory peak — the oom axis's
-    /// corroborant). Private and settable only by [`Self::infra`]:
-    /// a non-infrastructure arm structurally cannot express a sizing
-    /// claim (the same C3 module-boundary law as `store_degraded`).
-    sizing: Option<SizingClaim>,
-}
-
-/// bug_090: the typed sizing claim the floor gate consumes — a
-/// Copy-flattened carry of `BuildResult.failure_classification` plus
-/// the report-level `peak_memory_bytes` (the CGROUP_OOM corroborant).
-#[derive(Debug, Clone, Copy)]
-pub(super) struct SizingClaim {
-    /// The wire class (decoded; `Unspecified` never constructs a
-    /// claim — see [`FailureReportCtx::infra`]).
-    pub(super) class: rio_proto::types::FailureClass,
-    /// DISK_FULL corroboration triple, when carried.
-    pub(super) quota: Option<rio_proto::types::QuotaTelemetry>,
-    /// `CompletionReport.peak_memory_bytes` — the oom corroborant
-    /// (memory.peak saturates at memory.max under an oom kill).
-    pub(super) peak_memory_bytes: u64,
 }
 
 impl<'a> FailureReportCtx<'a> {
     /// Context for the `InfrastructureFailure` dispatch arm — the only
-    /// arm allowed to carry the worker's store-degraded attribution
-    /// and the typed sizing claim. An absent or `Unspecified`
-    /// classification constructs NO claim (the Q6 legacy reading:
-    /// classify-only).
+    /// arm allowed to carry the worker's store-degraded attribution.
+    /// sh-041u: the typed sizing claim (the now-retired sizing-claim
+    /// carry of `failure_classification` + `peak_memory_bytes`) no
+    /// longer rides this struct — chokepoint #2 reads both directly
+    /// from the report and threads `floor_outcome` to the handler.
     pub(super) fn infra(
         final_line_count: Option<i64>,
         error_msg: &'a str,
         store_degraded: bool,
-        classification: Option<&rio_proto::types::FailureClassification>,
-        peak_memory_bytes: u64,
+        _classification: Option<&rio_proto::types::FailureClassification>,
+        _peak_memory_bytes: u64,
     ) -> Self {
-        let sizing = classification.and_then(|fc| {
-            let class = rio_proto::types::FailureClass::try_from(fc.class)
-                .unwrap_or(rio_proto::types::FailureClass::Unspecified);
-            (class != rio_proto::types::FailureClass::Unspecified).then_some(SizingClaim {
-                class,
-                quota: fc.quota,
-                peak_memory_bytes,
-            })
-        });
         Self {
             final_line_count,
             error_msg,
             store_degraded,
-            sizing,
         }
     }
 
     /// Context for every non-infrastructure failure arm. No degraded
-    /// and no sizing parameter exists: these arms cannot express
-    /// store evidence or a sizing claim.
+    /// parameter exists: these arms cannot express store evidence.
     pub(super) fn non_infra(final_line_count: Option<i64>, error_msg: &'a str) -> Self {
         Self {
             final_line_count,
             error_msg,
             store_degraded: false,
-            sizing: None,
         }
     }
 
@@ -104,11 +72,5 @@ impl<'a> FailureReportCtx<'a> {
     /// degraded store.
     pub(super) fn store_degraded(&self) -> bool {
         self.store_degraded
-    }
-
-    /// The typed sizing claim, if the (infrastructure) report carried
-    /// one.
-    pub(super) fn sizing(&self) -> Option<SizingClaim> {
-        self.sizing
     }
 }

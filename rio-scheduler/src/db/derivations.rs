@@ -491,12 +491,12 @@ impl SchedulerDb {
         Ok(FencedOutcome::Applied(updated))
     }
 
-    // r[impl sched.sla.reactive-floor+5]
+    // r[impl sched.sla.reactive-floor+6]
     // r[impl sched.evidence.durability+4]
     /// Persist a derivation's reactive `resource_floor` (D4, `M_044`),
     /// fenced and server-side monotone.
     ///
-    /// Called from `bump_floor_or_count` right after the in-mem
+    /// Called from `observe_peaks` right after the in-mem
     /// doubling so a scheduler failover between OOM and retry doesn't
     /// reset the floor to zero → re-dispatch at probe defaults → OOM
     /// again. Write-at-mutation (NOT in `batch_upsert_derivations` —

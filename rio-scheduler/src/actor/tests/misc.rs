@@ -1362,17 +1362,17 @@ async fn apply_soft_features_records_for_probe_lookup() {
     );
 }
 
-// r[verify sched.sla.reactive-floor+5]
+// r[verify sched.sla.reactive-floor+6]
 /// D4: `solve_intent_for` clamps its solved (mem, disk) at
 /// `resource_floor`. A derivation with `floor.mem=32GiB` (from prior
-/// `bump_floor_or_count` cycles) gets a SpawnIntent with mem ≥ 32GiB
+/// `observe_peaks` cycles) gets a SpawnIntent with mem ≥ 32GiB
 /// even when the SLA solve would return less.
 #[tokio::test]
 async fn solve_intent_for_clamps_at_resource_floor() {
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     // `bare_actor_sla`: realistic ceilings (256 GiB > 32 GiB floor). The
-    // chokepoint applies `.max(floor).min(ceil)`; `bump_floor_or_count`
+    // chokepoint applies `.max(floor).min(ceil)`; `observe_peaks`
     // caps floor at ceil so the order is sound, but `test_default()`'s
     // tiny 2 GiB max_mem would otherwise make this assertion test the
     // ceiling, not the floor.
@@ -1481,7 +1481,7 @@ async fn solve_intent_for_clamps_at_ceil() {
         max_mem
     );
 
-    // r[verify sched.sla.reactive-floor+5]
+    // r[verify sched.sla.reactive-floor+6]
     // cores (a): forced_cores override above max_cores. The override path
     // emits raw `c.ceil()` with no `.min(max_cores)`; the chokepoint is
     // the only clamp.

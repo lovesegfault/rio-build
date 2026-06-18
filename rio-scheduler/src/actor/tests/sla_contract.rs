@@ -8053,26 +8053,36 @@ async fn floor_cores_kvm_partition_caps_at_metal_max_not_featureless_global() {
          featureless global 96"
     );
 
-    // Drive a corroborated ComputeBound bump from last_intent.cores=32
-    // through `bump_floor_or_count` with the partition's prov_max
-    // threaded (the production `bump_resource_floor` chokepoint
-    // computes the same `prov_max` from `(feat, arch, ice)` — its
-    // composition is census-pinned at
-    // `bump_resource_floor_caller_census` and exercised by the
+    // Drive a corroborated compute-bound observe from
+    // last_intent.cores=32 through `observe_peaks` with the partition's
+    // prov_max threaded (the production `observe_resource_floor`
+    // chokepoint computes the same `prov_max` from `(feat, arch, ice)`
+    // — its composition is census-pinned at
+    // `observe_resource_floor_caller_census` and exercised by the
     // floor.rs unit-level jump-to-max test).
     {
         let state = actor.dag.node_mut("d-kvm").unwrap();
         state.sched.last_intent = Some(crate::state::SolvedIntent {
             cores: 32,
+            deadline_secs: 600,
             ..Default::default()
         });
-        let o = crate::actor::floor::bump_floor_or_count(
+        let o = crate::actor::floor::observe_peaks(
             state,
-            rio_proto::types::TerminationReason::ComputeBound,
+            crate::actor::floor::ObservedPeaks {
+                cpu_seconds: Some(32.0 * 600.0 * 0.9),
+                wall: Some(std::time::Duration::from_secs(600)),
+                ..Default::default()
+            },
+            crate::actor::floor::AttemptCloseReason::ExecutorVariant,
             &actor.sla_ceilings,
             prov_max,
+            &crate::actor::floor::ObserveCfg {
+                compute_bound_threshold: 0.8,
+                compute_bound_min_wall_secs: 60.0,
+            },
         );
-        assert!(o.promoted && !o.at_cap);
+        assert!(o.hard_promoted && !o.at_cap_axes.contains(crate::actor::floor::Axis::Cores));
         assert_eq!(
             state.sched.resource_floor.cores, 48,
             "the cores floor jumps straight to the kvm-partition \

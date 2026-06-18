@@ -1856,30 +1856,30 @@ impl DagActor {
         // promotion surface (I-199) cannot re-form on either axis
         // (population or rate).
         if let Some(mark) = witnessed {
-            // bug_102 (PD-2): the third production caller presents its
-            // witness via the witnessed-disposition constructor — the
-            // scheduler-anchored `sched.attempt.witnessed-terminal`
-            // mark (kubelet per-container attribution, establishment
-            // `won`-flag deduped) the worker cannot mint. The
-            // constructor returns a witness for the two promoting
-            // rows (PromoteMemFloor, sh-039's PromoteDiskFloor);
-            // every other letter is classify-only (None — the no-bump
-            // arm: establish + requeue only).
-            match super::floor::CorroborationWitness::witnessed(
-                super::floor::witnessed_disposition(mark.reason),
-            ) {
-                Some(witness) => {
-                    // The establishment charge was already decided
-                    // (append+decide above): the bump is sizing
-                    // evidence for the NEXT dispatch, not a
-                    // retry-budget exemption — FloorOutcome's
-                    // promoted/at_cap bits drive the worker-reported
-                    // arms' counter logic, which has no analogue here.
-                    let _ = self.bump_resource_floor(&drv_hash, witness).await;
-                }
-                None => {
-                    // The no-bump row: establish + requeue only.
-                }
+            // sh-041u chokepoint #4 / bug_102 (PD-2): the third
+            // production caller presents its reason via the
+            // witnessed-disposition table — the scheduler-anchored
+            // `sched.attempt.witnessed-terminal` mark (kubelet
+            // per-container attribution, establishment `won`-flag
+            // deduped) the worker cannot mint. The table returns
+            // `Some(..)` for the two promoting rows (OomKilled,
+            // sh-039's EvictedEmptyDirSizeLimit); every other letter
+            // is classify-only (`None` — establish + requeue only).
+            // Sits AFTER the `if !won { return }` guard above — the
+            // won flag remains the once-per-attempt cap (live_058-b).
+            if let Some(reason) = super::floor::witnessed_disposition(mark.reason)
+                && let Some(last) = self
+                    .dag
+                    .node(&drv_hash)
+                    .and_then(|s| s.sched.last_intent.as_ref())
+            {
+                // The establishment charge was already decided
+                // (append+decide above): the observe is sizing
+                // evidence for the NEXT dispatch, not a retry-budget
+                // exemption — FloorOutcome drives the worker-reported
+                // arms' counter logic, which has no analogue here.
+                let peaks = super::floor::ObservedPeaks::witnessed(last, &reason);
+                let _ = self.observe_resource_floor(&drv_hash, peaks, reason).await;
             }
         }
         // OA1 interval, establishment cause: attempt opened → established.

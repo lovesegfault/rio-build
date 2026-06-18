@@ -1032,6 +1032,62 @@ async fn attempt_outcome_pod_terminal_reason_still_waits_for_establishment() -> 
     Ok(())
 }
 
+// r[verify sched.sla.reactive-floor+6]
+/// **sh-041u red-first (c)** — *the sh-041 original case: a
+/// compute-bound build interrupted by spot reclaim (AD5 SIGTERM-abort)
+/// jumps `floor.cores` to `prov_max` AND soft-observes mem.* RED at
+/// base: the AD5 short-circuit never reached any floor mint;
+/// `floor.cores == 0` AND `floor.mem == 0`.
+#[tokio::test]
+async fn worker_abort_compute_bound_jumps_floor_cores() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "ad5-cores";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, drv, Some(drv)).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    // The scheduler-side wall anchor: this attempt RAN for 1778s.
+    let minted_mem = expect_drv(&handle, drv)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .map(|i| i.mem_bytes)
+        .unwrap_or(0);
+    assert!(handle.debug_backdate_running(drv, 1778).await?);
+    handle.debug_seed_intent_cores(drv, 4, 7200).await?;
+    // cpu_util = (4×1778×0.90) / (1778×4) = 0.90 ≥ 0.8.
+    let payload = crate::actor::pull::PullReportPayload {
+        peak_memory_bytes: minted_mem,
+        final_resources: Some(rio_proto::types::ResourceUsage {
+            cpu_seconds_total: Some(4.0 * 1778.0 * 0.90),
+            ..Default::default()
+        }),
+        ..crate::actor::tests::helpers::pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+            error_msg: "cancelled by scheduler".into(),
+            ..Default::default()
+        })
+    };
+    crate::actor::tests::helpers::pull_report_exec(&handle, exec_id, drv, payload).await?;
+
+    let s = expect_drv(&handle, drv).await;
+    assert!(
+        s.sched.resource_floor.cores > 0,
+        "sh-041: a SIGTERM-abort with cpu_util=0.90 jumps cores to the \
+         partition-aware provisionable max (RED at base: stayed 0); \
+         got {}",
+        s.sched.resource_floor.cores
+    );
+    let _ = minted_mem;
+    assert_eq!(
+        s.status,
+        crate::state::DerivationStatus::Ready,
+        "the AD5 abort still requeues charge-free"
+    );
+    assert_eq!(s.retry.infra_count, 0, "no infra budget consumed");
+    Ok(())
+}
+
 // r[verify sched.attempt.synthesized-verdict+4]
 /// The builder's AD5 SIGTERM-abort report (`BuildResultStatus::Cancelled`
 /// on a still-wanted derivation) resolves the pull attempt charge-free
@@ -2235,7 +2291,7 @@ async fn mint_stamps_last_intent_and_assignment_carries_it() -> TestResult {
 }
 
 /// live_040 companion: the D4 OOM floor doubles FROM the minted
-/// intent. Pre-fix `bump_floor_or_count`'s base was
+/// intent. Pre-fix `observe_peaks`'s base was
 /// `max(floor=0, last_intent=None→0) = 0` on every first OOM, so the
 /// reactive floor never escalated from a cold start — the worker
 /// looped at probe size until the retry budget poisoned it. Driven

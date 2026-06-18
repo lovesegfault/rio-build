@@ -1,14 +1,20 @@
-//! D4 reactive resource floor: per-dimension doubling on explicit
-//! resource-exhaustion signals, capped at `Ceilings`, falling through
-//! to the relevant retry counter once capped.
+//! D4 reactive resource floor: per-dimension peak observation on every
+//! non-success worker close, capped at `Ceilings`, with a hard 2.0×
+//! headroom on the axis a corroborated resource-exhaustion signal
+//! names and a soft 1.2× elsewhere.
 //!
-//! Replaces the legacy `promote_size_class_floor` (class-name ladder
-//! walk). Under SLA there are no class names; cold-start safety
-//! (first-ever build of a pname OOMs at probe defaults) still needs an
-//! immediate-retry-bigger mechanism — waiting for `refit()` is too
-//! slow.
+//! sh-041u: replaces the per-caller "recognise reason → mint
+//! axis-witness → double last_intent" arms with ONE
+//! [`observe_peaks`] called at the worker-report dispatch chokepoint.
+//! Peaks are evidence on every close (OOM, DiskFull, timeout,
+//! exit≠0, SIGTERM); the hard-event reason only BOOSTS headroom on
+//! its own axis — it no longer GATES whether the other axes observe
+//! at all. The retired per-axis mints (the now-retired witness-
+//! constructors) each restated the corroboration law for ONE axis at
+//! ONE call site; under that shape every new close path was a missed
+//! mint by construction.
 
-use rio_proto::types::TerminationReason;
+use std::time::Duration;
 
 use crate::sla::solve::Ceilings;
 use crate::state::DerivationState;
@@ -17,6 +23,19 @@ use crate::state::DerivationState;
 /// (which has no time dimension) — a build that hasn't finished in a
 /// day is a runaway regardless of pod shape.
 pub(super) const DEADLINE_CAP_SECS: u32 = 86_400;
+
+/// sh-041u: the mem-axis CEILING trust band — `peak_memory_bytes ≤
+/// assigned_mem × TRUST_BAND_MEM`. The kernel guarantees `memory.peak
+/// ≤ memory.max = assigned_mem`, so any honest report sits at ≤ 1.0×;
+/// the 5% slack absorbs cgroup rounding. A peak above the band is a
+/// forgery → that axis observes nothing (counted refusal). The disk
+/// axis has no single band constant: its ceiling is the
+/// kubelet-minted `overlay_size_limit_bytes(assigned, H_MAX) + slack`
+/// — the same producer-derived band the now-retired sizing
+/// hard-limit check used, REPLACED here as a check on
+/// `final_resources.peak_disk_bytes` instead of
+/// `QuotaTelemetry.hard_limit_bytes` (which is no longer consulted).
+pub(super) const TRUST_BAND_MEM: f64 = 1.05;
 
 // r[impl sys.liveness.exit-edge]
 /// merged_bug_016: the mem dimension's cap in the SOLVE domain — the
@@ -30,18 +49,63 @@ pub(super) const DEADLINE_CAP_SECS: u32 = 86_400;
 /// poison terminal was unreachable (the dead-band funnel shape).
 /// `unwrap_or(0)`: a global that cannot host any container (refused
 /// by `validate_resolved`, kept fail-closed here) floors at zero —
-/// `bump_dim` then reports `at_cap` immediately and the caller's
+/// `set_dim` then reports `at_cap` immediately and the caller's
 /// retry counter bounds the loop.
 pub(super) fn mem_solve_cap(ceil: &Ceilings) -> u64 {
     rio_common::footprint::max_hostable_solve_mem(ceil.max_mem).unwrap_or(0)
 }
 
-/// Result of [`bump_floor_or_count`]. Two independent bits because
-/// callers need both: `promoted` gates the promotion-exempt path
-/// (`r[sched.retry.promotion-exempt+2]`); `at_cap` tells the caller
-/// the floor is already at the relevant ceiling so no further growth
-/// is possible — the caller's retry-counter increment + cap-check is
-/// what bounds this case.
+/// One floor dimension (sh-041u: the per-axis at-cap discriminator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    Mem,
+    Disk,
+    Deadline,
+    Cores,
+}
+
+impl Axis {
+    const fn bit(self) -> u8 {
+        match self {
+            Axis::Mem => 1 << 0,
+            Axis::Disk => 1 << 1,
+            Axis::Deadline => 1 << 2,
+            Axis::Cores => 1 << 3,
+        }
+    }
+}
+
+/// Bitset of [`Axis`] values — the per-handler `at_cap` narrowing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AxisSet(u8);
+
+impl AxisSet {
+    fn insert(&mut self, a: Axis) {
+        self.0 |= a.bit();
+    }
+    /// Whether `a` is in the set.
+    pub fn contains(&self, a: Axis) -> bool {
+        self.0 & a.bit() != 0
+    }
+    /// Whether any of `axes` is in the set.
+    pub fn intersects(&self, axes: &[Axis]) -> bool {
+        axes.iter().any(|a| self.contains(*a))
+    }
+    /// Whether the set is empty.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Result of [`observe_peaks`]. `hard_promoted` (any axis got 2.0×
+/// headroom or jumped to `prov_max`) gates BOTH
+/// `r[sched.retry.promotion-exempt]` AND the M_044 persist — soft
+/// observations are in-memory only (this leader's tenure; the
+/// pname-keyed SLA fit is the cross-version heal-down). `at_cap_axes`
+/// is per-axis so each handler narrows `row.floor_at_cap` to the axes
+/// its kernel arm reads (ExecutorVariant → Cores only; Timeout →
+/// Deadline; Infra → Mem|Disk).
 ///
 /// This helper does NOT mutate any retry counter. All counter
 /// increments live at the call site, AFTER the cap check, so at-cap
@@ -49,429 +113,401 @@ pub(super) fn mem_solve_cap(ceil: &Ceilings) -> u64 {
 /// previous in-helper increment poisoned at-cap one attempt earlier).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FloorOutcome {
-    /// Floor changed; next dispatch will be larger. Promotion-exempt.
-    pub promoted: bool,
-    /// Floor was already at the relevant cap (mem/disk → `Ceilings`,
-    /// deadline → 24h). NOT mutually exclusive with `promoted=false`
-    /// for non-resource reasons (both false there).
-    pub at_cap: bool,
+    /// At least one axis got 2.0× headroom (or cores jumped to
+    /// `prov_max`) and the floor STRICTLY grew there. Gates
+    /// promotion-exempt and the M_044 persist.
+    pub hard_promoted: bool,
+    /// At least one axis grew under soft 1.2× headroom only.
+    /// In-memory; never gates exemption or persist (a soft observe
+    /// can be `target < last_intent` — granting exemption would be
+    /// the retired I-170/I-199 over-broad heuristic).
+    pub soft_promoted: bool,
+    /// Per-axis: `target ≥ cap` (mem/disk/deadline via [`set_dim`])
+    /// or `base ≥ prov_max` (cores via
+    /// [`bump_cores_to_provisionable`] — preserving the two-attempt
+    /// at-cap semantics). Consumers narrow per handler.
+    pub at_cap_axes: AxisSet,
 }
 
-// r[impl sched.sla.reactive-floor+5]
-// r[impl sched.retry.promotion-exempt+3]
-/// Double the relevant `resource_floor` dimension on an explicit
-/// resource-exhaustion signal, or — if already at the cap — report
-/// `at_cap=true` so the caller's retry counter bounds it. See
-/// [`FloorOutcome`]. No retry counters are mutated here; the CALLER
-/// increments after its cap check so at-cap and non-floor failures
-/// poison at the same attempt number.
+/// Worker-reported peaks for one closed attempt. `None` = no signal
+/// (axis untouched). `wall` is the SCHEDULER's own
+/// `running_since.elapsed()` (stamped at the Running transition; a
+/// worker cannot mint it) — never a worker-supplied duration.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ObservedPeaks {
+    /// `CompletionReport.peak_memory_bytes` (kernel `memory.peak`).
+    pub mem_bytes: Option<u64>,
+    /// `final_resources.peak_disk_bytes` (prjquota running-max).
+    pub disk_bytes: Option<u64>,
+    /// `final_resources.cpu_seconds_total` (cgroup cpu.stat).
+    pub cpu_seconds: Option<f64>,
+    /// `running_since.elapsed()` — the scheduler's own anchor.
+    pub wall: Option<Duration>,
+}
+
+impl ObservedPeaks {
+    /// Build from a `CompletionReport`'s fields. `0` /
+    /// `None` = no-signal → axis untouched.
+    pub fn from_report(
+        peak_memory_bytes: u64,
+        cpu_seconds_total: Option<f64>,
+        peak_disk_bytes: Option<u64>,
+        attempt_open: Option<Duration>,
+    ) -> Self {
+        Self {
+            mem_bytes: (peak_memory_bytes > 0).then_some(peak_memory_bytes),
+            disk_bytes: peak_disk_bytes.filter(|&d| d > 0),
+            cpu_seconds: cpu_seconds_total.filter(|&c| c > 0.0),
+            wall: attempt_open,
+        }
+    }
+
+    /// Chokepoint #4: a controller-WITNESSED close has no
+    /// `CompletionReport` → no peaks. The assigned shape IS the peak
+    /// (kubelet killed AT the limit), so the witnessed axis carries
+    /// `Some(last.X)`; every other axis is `None` (untouched).
+    pub fn witnessed(last: &crate::state::SolvedIntent, reason: &AttemptCloseReason) -> Self {
+        Self {
+            mem_bytes: reason.hard_mem().then_some(last.mem_bytes),
+            disk_bytes: reason.hard_disk().then_some(last.disk_bytes),
+            cpu_seconds: None,
+            wall: None,
+        }
+    }
+}
+
+// r[impl sched.trust.report-corroboration+5]
+/// sh-041u — the close reason `observe_peaks` dispatches headroom on.
+/// SCHEDULER-MINTED (from `BuildResultStatus` × `FailureClass` × the
+/// witnessed-letter — never free text), so the bug_102 demand ("trust
+/// gated at the consequence") is preserved: the gate-inside-mutation
+/// SHAPE survives; the witness-required-to-compile demand narrows to
+/// the HARD arm — soft 1.2× is ceiling-band-checked only, with
+/// consequence bounded by `hard_promoted` gating promotion-exempt and
+/// the M_044 persist. The variants below are the ONLY producers — quantifier: census(floor_mutation_census).
+#[derive(Debug, Clone, Copy)]
+pub enum AttemptCloseReason {
+    /// E2 worker `InfrastructureFailure` carrying a typed
+    /// `FailureClass` (CgroupOom / DiskFull). `Unspecified` and
+    /// uncarried classify as [`Self::Other`].
+    Infra(rio_proto::types::FailureClass),
+    /// E5 worker `TimedOut` (status-borne).
+    Timeout,
+    /// E3a worker `ExecutorVariantFailure` (heuristic exit≠0).
+    ExecutorVariant,
+    /// AD5 SIGTERM-abort report (preemption / scale-down) for work
+    /// the scheduler still wants — the sh-041 original case (a
+    /// compute-bound build interrupted by spot reclaim).
+    WorkerAbort,
+    /// Chokepoint #4: a controller-WITNESSED per-container kubelet
+    /// attribution (`OomKilled` / `EvictedEmptyDirSizeLimit`).
+    Witnessed(rio_proto::types::AttemptTerminalReason),
+    /// Transient / Permanent / unsolicited-Cancelled / Unspecified —
+    /// soft observe only (no axis is hard for these).
+    Other,
+}
+
+impl AttemptCloseReason {
+    /// Derive from a worker `CompletionReport` status. `None` for
+    /// success statuses (Built/Substituted/AlreadyValid): the success
+    /// path's `record_build_sample` writes `peak_memory_bytes` to
+    /// `build_samples`, and the SLA fit's `p90 × headroom(n_eff)`
+    /// (asymptote 1.25 > 1.2) dominates the soft floor at the solve
+    /// chokepoint — a success-path soft observe is steady-state
+    /// redundant, so the chokepoint skips it.
+    pub(super) fn from_status(
+        status: rio_proto::types::BuildResultStatus,
+        classification: Option<&rio_proto::types::FailureClassification>,
+    ) -> Option<Self> {
+        use rio_proto::types::BuildResultStatus as S;
+        use rio_proto::types::FailureClass;
+        match status {
+            S::Built | S::Substituted | S::AlreadyValid => None,
+            S::InfrastructureFailure => {
+                let class = classification
+                    .map(|fc| FailureClass::try_from(fc.class).unwrap_or(FailureClass::Unspecified))
+                    .filter(|&c| c != FailureClass::Unspecified);
+                Some(match class {
+                    Some(c) => Self::Infra(c),
+                    None => Self::Other,
+                })
+            }
+            S::TimedOut => Some(Self::Timeout),
+            S::ExecutorVariantFailure => Some(Self::ExecutorVariant),
+            S::TransientFailure
+            | S::PermanentFailure
+            | S::CachedFailure
+            | S::DependencyFailed
+            | S::LogLimitExceeded
+            | S::OutputRejected
+            | S::NotDeterministic
+            | S::InputRejected
+            | S::Cancelled
+            | S::Unspecified => Some(Self::Other),
+        }
+    }
+
+    /// The mem-axis hard-event predicate (CgroupOom / witnessed-OOM).
+    pub(super) fn hard_mem(&self) -> bool {
+        use rio_proto::types::{AttemptTerminalReason as T, FailureClass};
+        matches!(
+            self,
+            Self::Infra(FailureClass::CgroupOom) | Self::Witnessed(T::OomKilled)
+        )
+    }
+
+    /// The disk-axis hard-event predicate (DiskFull / witnessed
+    /// emptyDir-sizeLimit). LIVE with TWO producers: (1) live_057-b —
+    /// the worker quota-attributed DiskFull lane (the TYPED
+    /// `failure_classification` wire field; `rio_proto::DISK_FULL_MSG`
+    /// is DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — merged_bug_100: free
+    /// text drives nothing); and (2) sh-039 — the
+    /// controller-witnessed pod-attributed emptyDir-sizeLimit
+    /// eviction. Node-condition `EvictedDiskPressure` stays
+    /// classify-only (I-199): [`witnessed_disposition`] returns
+    /// `None` for it, so it never reaches this predicate.
+    pub(super) fn hard_disk(&self) -> bool {
+        use rio_proto::types::{AttemptTerminalReason as T, FailureClass};
+        matches!(
+            self,
+            Self::Infra(FailureClass::DiskFull) | Self::Witnessed(T::EvictedEmptyDirSizeLimit)
+        )
+    }
+
+    /// The metric/log label — the caller-census alphabet, derived
+    /// from the reason instead of restated per call site.
+    pub(super) fn label(&self) -> &'static str {
+        use rio_proto::types::{AttemptTerminalReason as T, FailureClass};
+        match self {
+            Self::Infra(FailureClass::CgroupOom) => "cgroup_oom",
+            Self::Infra(FailureClass::DiskFull) => "disk_full",
+            Self::Infra(FailureClass::Unspecified) => "unspecified",
+            Self::Timeout => "timeout",
+            Self::ExecutorVariant => "executor_variant",
+            Self::WorkerAbort => "worker_abort",
+            Self::Witnessed(T::OomKilled) => "witnessed_oom",
+            Self::Witnessed(T::EvictedEmptyDirSizeLimit) => "witnessed_disk",
+            Self::Witnessed(_) => "witnessed_other",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Tunables for [`observe_peaks`]' cores-axis gate (the same fields
+/// `SlaConfig` already carries).
+#[derive(Debug, Clone, Copy)]
+pub struct ObserveCfg {
+    pub compute_bound_threshold: f64,
+    pub compute_bound_min_wall_secs: f64,
+}
+
+// r[impl sched.sla.reactive-floor+6]
+// r[impl sched.retry.promotion-exempt+4]
+/// sh-041u — the unified peak observe. For each axis with a `Some`
+/// peak: `floor.X = max(floor.X, peak_X × headroom(reason, X))
+/// .min(cap_X)`. `headroom = 2.0` iff a corroborated hard event fired
+/// on that axis (the floor band `peak ≥ assigned/2` from bug_090
+/// gates whether the hard CLAIM is plausible — fail → degrade to soft
+/// 1.2×, no `hard_promoted`, counted refusal); else `1.2` (mem/disk),
+/// `1.0` (deadline — no soft headroom; only `Timeout` ever moves it).
+/// The cores axis jumps to `prov_max` iff `cpu_util ≥ threshold ∧
+/// wall ≥ min_wall` (sh-031). The CEILING band (`peak ≤ assigned ×
+/// band` per axis) refuses forged-HIGH peaks: that axis observes
+/// nothing, counted on `uncorroborated_sizing_claim_total`.
 ///
-/// The doubling base is `state.sched.last_intent` — stamped by the
-/// pull mint (live_040: the mint is the dispatch decision) with the
-/// RECONCILED dispatch shape (bug_027: `DispatchShape::reconcile`
-/// lifts the solve's deadline to `max(resolved, carried)`, so `last`
-/// is what the pod actually ran under — a carried deadline at the cap
-/// reads as `base ≥ cap` and takes the counted at-cap arm instead of
-/// an exempt under-double). The `max(floor, last)` form means a stale
-/// floor (lower than what was actually minted) doesn't under-double;
-/// if both are zero (cold start, never minted), the helper returns
-/// `{promoted:false, at_cap:false}` — the caller's unconditional
-/// post-check increment bounds this (I-200).
-pub fn bump_floor_or_count(
+/// The doubling base is the PEAK, not `last_intent` — but for an
+/// honest hard event `peak ≈ assigned` (memory.peak saturates at
+/// memory.max under OOM; prjquota peak saturates at the limit under
+/// DiskFull; wall ≈ assigned_deadline at timeout), so `peak × 2.0 ≈
+/// assigned × 2` reproduces the old "cold-start: floor=0, last=4Gi,
+/// real OOM → 8Gi" doubling without re-introducing `last_intent` as a
+/// separate base (the bug_090 floor band `peak ≥ assigned/2` ⇒
+/// `peak × 2.0 ≥ assigned`). bug_027's reconciled `last_intent`
+/// remains the corroboration ANCHOR (the band denominators), not the
+/// doubling input.
+pub fn observe_peaks(
     state: &mut DerivationState,
-    reason: TerminationReason,
+    peaks: ObservedPeaks,
+    reason: AttemptCloseReason,
     ceil: &Ceilings,
     prov_max_cores: u32,
+    cfg: &ObserveCfg,
 ) -> FloorOutcome {
-    use TerminationReason as R;
+    use rio_common::k8s::{
+        DISK_HEADROOM_MAX, DISK_HEADROOM_MIN, KUBELET_QUOTA_BLOCK_SLACK, overlay_size_limit_bytes,
+    };
+    let Some(last) = state.sched.last_intent.clone() else {
+        // Cold start (never minted by this leader): no anchor to
+        // corroborate against. The `set_dim` body would no-op on a
+        // zero base anyway; the caller's retry budget bounds it.
+        return FloorOutcome::default();
+    };
     let floor = &mut state.sched.resource_floor;
-    let last = state.sched.last_intent.as_ref();
-    match reason {
-        // merged_bug_016: the doubling cap is the SOLVE-domain mem cap
-        // (`mem_solve_cap`), not the raw global — at-cap dispatches
-        // must render a hostable container (`== ceiling` exactly) so
-        // the counted at-cap attempts actually run and the retry
-        // counter's bounded poison terminal stays reachable.
-        R::OomKilled => bump_dim(
-            &mut floor.mem_bytes,
-            last.map_or(0, |i| i.mem_bytes),
-            mem_solve_cap(ceil),
-        ),
-        // LIVE with TWO producers: (1) live_057-b — the worker
-        // quota-attributed DiskFull lane (completion.rs consumes the
-        // TYPED `failure_classification` wire field — FailureClass::
-        // DiskFull + QuotaTelemetry; `rio_proto::DISK_FULL_MSG` is
-        // DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — merged_bug_100: free text drives
-        // nothing — band-corroborated against the assigned shape via
-        // `CorroborationWitness::corroborated_sizing`, bumped through
-        // the witness-demanding chokepoint with the `disk_full`
-        // label; precise by construction at the prjquota seam, with
-        // the worker's once-per-attempt assignment-token dedup); and
-        // (2) sh-039 — the controller-witnessed pod-attributed
-        // emptyDir-sizeLimit eviction (`WitnessAxis::WitnessedDisk`,
-        // label `witnessed_disk`), once per attempt via the
-        // establishment transaction's `won` flag. NODE-CONDITION
-        // witnessed evictions remain classify-only by ruling
-        // ([`witnessed_disposition`]): the EvictedDiskPressure letter
-        // now carries node-condition shapes only (pool/job.rs
-        // pod_attempt_terminal_reason splits pod-attributed to
-        // EvictedEmptyDirSizeLimit), and promoting node-condition
-        // would re-create the I-199 ambient-cause over-fire (one
-        // node-pressure event evicting k innocent builder pods → k
-        // sticky M_044 floor doublings).
-        R::EvictedDiskPressure => bump_dim(
-            &mut floor.disk_bytes,
-            last.map_or(0, |i| i.disk_bytes),
-            ceil.max_disk,
-        ),
-        R::DeadlineExceeded => {
-            // u32 dimension: widen for the shared body, narrow back. Cap
-            // is 86_400 so the cast cannot truncate.
-            let mut f = u64::from(floor.deadline_secs);
-            let o = bump_dim(
-                &mut f,
-                u64::from(last.map_or(0, |i| i.deadline_secs)),
-                u64::from(DEADLINE_CAP_SECS),
-            );
-            floor.deadline_secs = f as u32;
-            o
-        }
-        // r[impl sched.floor.compute-bound-provisionable]
-        // sh-012 D4 fourth axis: a corroborated compute-bound
-        // executor-variant exit≠0 (`CorroborationWitness::
-        // corroborated_compute_bound` — cpu_util ≥ threshold) jumps
-        // cores to the PARTITION-AWARE provisionable max. sh-031b: the
-        // ×2 ladder against the catalog-absolute `Ceilings.max_cores`
-        // promoted to 191 while the only 192c classes were ICE-masked
-        // (or feature-partitioned away), so `solve_intent_for` found
-        // no candidate ≥191 and the drv requeued forever. ComputeBound
-        // has no threshold semantics (unlike OOM/DiskFull/Timeout
-        // where ×2 finds the minimum sufficient rung) — the only
-        // useful probe is the largest provisionable shape, then poison
-        // (`PoisonReason::ComputeBoundAtCap`) on the next saturated
-        // attempt. The mem/disk/deadline arms keep ×2 against
-        // `Ceilings`: they have a well-defined "ask the operator for a
-        // bigger box" remediation and at-cap routes through the
-        // generic `InfraBudget` lane.
-        R::ComputeBound => bump_cores_to_provisionable(
-            &mut floor.cores,
-            last.map_or(0, |i| i.cores),
-            prov_max_cores,
-        ),
-        // Non-resource reasons (pod-kill, node failure, expected
-        // one-shot exit, unclassified) are not sizing signals.
-        R::EvictedOther | R::Completed | R::Error | R::Unknown => FloorOutcome::default(),
-    }
-}
+    let mut o = FloorOutcome::default();
 
-// r[impl sched.trust.report-corroboration+4]
-/// bug_102 — the typed corroboration witness `bump_resource_floor`
-/// DEMANDS: trust is gated at the CONSEQUENCE (the floor mutation),
-/// not re-derived per carrier at each call site. The wave-11 gate
-/// covered only the `failure_classification`-carried claims
-/// (CgroupOom/DiskFull); `TimedOut` rides STATUS and bypassed it —
-/// `handle_timeout_failure` bumped the deadline floor unconditionally
-/// and pre-verdict, so a hostile builder ratcheted a cross-tenant 24h
-/// deadline floor in ~5 cheap reports (the GREATEST() ratchet never
-/// heals downward). With the demand INSIDE the mutation, an ungated
-/// axis is unrepresentable: no caller can compile a bump without
-/// presenting a witness, and every witness is minted by a verifying
-/// constructor against a scheduler-owned anchor the worker cannot
-/// choose.
-///
-/// The axis is PRIVATE (the inner enum is not visible outside this
-/// module), so the constructors below are the ONLY mints — quantifier: census(floor_mutation_census) —:
-/// - [`Self::corroborated_sizing`] — the mem/disk bands vs the
-///   assigned shape (the wave-11 bands, moved here so the band law
-///   and the witness mint are one site);
-/// - [`Self::corroborated_timeout`] — attempt-open-duration >=
-///   assigned_deadline/2 (the scheduler's own `running_since` stamp
-///   vs the reconciled `last_intent.deadline_secs`);
-/// - [`Self::witnessed`] — the establishment sweep's
-///   controller-witnessed OomKilled disposition row (the
-///   `sched.attempt.witnessed-terminal` mark; kubelet per-container
-///   attribution, deduped by the establishment `won` flag);
-/// - [`Self::corroborated_compute_bound`] — `cpu_seconds_total /
-///   (elapsed_wall × assigned_cores) >= threshold` (sh-012, the D4
-///   cores axis: an executor-variant exit≠0 that demonstrably
-///   saturated its assigned cores while running).
-///
-/// The `(TerminationReason, label)` pair DERIVES from the witness
-/// ([`Self::reason`]/[`Self::label`]) — one producer for the mapping
-/// the four call sites previously each restated.
-pub(super) struct CorroborationWitness {
-    axis: WitnessAxis,
-}
-
-/// Private: only the verifying constructors mint witnesses.
-#[derive(Debug, Clone, Copy)]
-enum WitnessAxis {
-    /// Typed wire claim, band-corroborated (CgroupOom or DiskFull).
-    Sizing(rio_proto::types::FailureClass),
-    /// Worker TimedOut, anchored on the attempt's own open duration.
-    Timeout,
-    /// Controller-witnessed OomKilled at establishment.
-    WitnessedOom,
-    /// sh-039: controller-witnessed pod-attributed emptyDir-sizeLimit
-    /// eviction at establishment (the disk-axis twin of
-    /// [`Self::WitnessedOom`]).
-    WitnessedDisk,
-    /// sh-012: executor-variant exit≠0 with corroborated cpu
-    /// utilization ≥ threshold (the D4 cores axis).
-    ComputeBound,
-}
-
-impl CorroborationWitness {
-    /// The acceptance bands (CONSUMER-owned tolerances — they only
-    /// bound forgery and live in exactly one place, here):
-    ///
-    /// * CGROUP_OOM: `peak_memory_bytes >= assigned_mem / 2` —
-    ///   memory.peak saturates at memory.max under a real oom kill.
-    /// * DISK_FULL (bug_065, R33'(ii) — the band consumes the SHARED
-    ///   quota denomination, never a re-open-coded formula): an
-    ///   ENFORCED project quota on the overlays emptyDir carries the
-    ///   stamped sizeLimit =
-    ///   `rio_common::k8s::overlay_size_limit_bytes(assigned_disk, h)`
-    ///   for the intent's headroom `h`, and every producible `h` lies
-    ///   in `[DISK_HEADROOM_MIN, DISK_HEADROOM_MAX]` (the
-    ///   `headroom(n_eff)` codomain + the controller fallback; pinned
-    ///   by `headroom_curve_stays_inside_the_shared_band` below
-    ///   against the live curve). NOTE the deployed kubelet minors
-    ///   assign NON-ENFORCING sentinel quotas (usage tracking only —
-    ///   the rio_common::k8s denomination doc + the
-    ///   vm-kubelet-projquota cells pin this), so kubelet-quota'd
-    ///   nodes currently produce NO DiskFull claims at all; the band
-    ///   is the contract for enforced-quota producers (the
-    ///   vm-quota-probe manual-limit world; any future enforcing
-    ///   kubelet) and refuses sentinel-armed claims by construction.
-    ///   Acceptance:
-    ///   `hard in [overlay(assigned, H_MIN),
-    ///             overlay(assigned, H_MAX) + KUBELET_QUOTA_BLOCK_SLACK]`
-    ///   AND `peak_used >= hard / 2`. The wave-11 band
-    ///   (`[assigned/2, assigned*4]` of RAW disk) accepted any
-    ///   fabricated limit within 8x of the solve axis — a forger
-    ///   could move floors with a hard limit kubelet can never mint — quantifier: census(disk_band_admits_minted_products_and_refuses_off_formula_limits) —;
-    ///   the producer-derived band admits exactly the mintable
-    ///   products (plus quota-block rounding).
-    ///
-    /// No assigned shape (cold start) => `None`: nothing to
-    /// corroborate against.
-    pub(super) fn corroborated_sizing(
-        claim: &super::report_ctx::SizingClaim,
-        assigned_mem: u64,
-        assigned_disk: u64,
-    ) -> Option<Self> {
-        use rio_common::k8s::{
-            DISK_HEADROOM_MAX, DISK_HEADROOM_MIN, KUBELET_QUOTA_BLOCK_SLACK,
-            overlay_size_limit_bytes,
-        };
-        use rio_proto::types::FailureClass;
-        let corroborated = match claim.class {
-            FailureClass::Unspecified => false, // unreachable: never constructed
-            FailureClass::CgroupOom => {
-                assigned_mem > 0 && claim.peak_memory_bytes >= assigned_mem / 2
+    // ── mem ────────────────────────────────────────────────────────
+    if let Some(peak) = peaks.mem_bytes
+        && last.mem_bytes > 0
+    {
+        // CEILING band: kernel guarantees memory.peak ≤ memory.max
+        // = assigned_mem. A peak above TRUST_BAND_MEM × assigned is
+        // a forgery — refuse, count, axis observes nothing. The
+        // bug_102 forgery resistance: per-attempt floor growth is
+        // bounded by ≤ 2 × TRUST_BAND_MEM × assigned, equivalent to
+        // the retired `2 × last_intent`.
+        if peak > (last.mem_bytes as f64 * TRUST_BAND_MEM) as u64 {
+            count_refusal("mem");
+        } else {
+            // FLOOR band: a hard-event CLAIM with low peak is
+            // implausible (bug_090). Degrade to soft.
+            let hard = reason.hard_mem() && peak >= last.mem_bytes / 2;
+            if reason.hard_mem() && !hard {
+                count_refusal("cgroup_oom");
             }
-            FailureClass::DiskFull => claim.quota.is_some_and(|q| {
-                assigned_disk > 0
-                    && q.hard_limit_bytes
-                        >= overlay_size_limit_bytes(assigned_disk, DISK_HEADROOM_MIN)
-                    && q.hard_limit_bytes
-                        <= overlay_size_limit_bytes(assigned_disk, DISK_HEADROOM_MAX)
-                            .saturating_add(KUBELET_QUOTA_BLOCK_SLACK)
-                    && q.peak_used_bytes >= q.hard_limit_bytes / 2
-            }),
-        };
-        corroborated.then_some(Self {
-            axis: WitnessAxis::Sizing(claim.class),
-        })
-    }
-
-    /// The timeout axis (bug_102's unsealed face): the attempt must
-    /// have demonstrably RUN at least half its assigned deadline —
-    /// `attempt_open` is the scheduler's own `running_since` elapsed
-    /// (stamped at the Running transition; a worker cannot mint it),
-    /// `assigned_deadline_secs` the reconciled dispatch deadline
-    /// (`last_intent` — bug_027's `max(resolved, carried)`).
-    ///
-    /// `None` anchors refuse: no `running_since` (failover-recovered
-    /// node — the lossy-Instant conservative default; the NEXT
-    /// attempt re-corroborates) or no assigned deadline (cold start)
-    /// mean there is nothing to corroborate against — classify-only,
-    /// the conservative direction (a floor never moves on absent
-    /// evidence).
-    pub(super) fn corroborated_timeout(
-        attempt_open: Option<std::time::Duration>,
-        assigned_deadline_secs: u32,
-    ) -> Option<Self> {
-        let open = attempt_open?;
-        if assigned_deadline_secs == 0 {
-            return None;
-        }
-        (open.as_secs() >= u64::from(assigned_deadline_secs) / 2).then_some(Self {
-            axis: WitnessAxis::Timeout,
-        })
-    }
-
-    /// The compute-bound axis (sh-012, the D4 fourth dimension): an
-    /// executor-variant exit≠0 demonstrably saturated its assigned
-    /// cores WHILE RUNNING — `cpu_util = cpu_seconds_total /
-    /// (elapsed_wall × assigned_cores) >= threshold`.
-    /// `cpu_seconds_total` is the builder's own `cpu.stat usage_usec`
-    /// cumulative read (carried in `CompletionReport.final_resources`
-    /// even on the executor-error path); `attempt_open` is the
-    /// scheduler's own `running_since` elapsed (the same trust anchor
-    /// as [`Self::corroborated_timeout`] — stamped at the Running
-    /// transition, a worker cannot mint it); `assigned_cores` is the
-    /// reconciled `last_intent.cores` (scheduler-stamped at the pull
-    /// mint).
-    ///
-    /// sh-031: the original denominator was `assigned_deadline ×
-    /// assigned_cores` — the parallelism *budget*, not the parallelism
-    /// *available while running*. For a 100%-saturated build that
-    /// reduces to `wall / deadline`, so a compute-bound build that
-    /// exits on its own internal timeout BEFORE the nix deadline
-    /// (chunk-collect-corrupt at iter6: 96 cores × 1810s, deadline
-    /// 7200s → util 0.25) refused regardless of saturation, and the
-    /// floor never moved across three saturated attempts.
-    ///
-    /// `min_wall_secs` preserves the inverse-cost bound: a 5s compile
-    /// error that briefly pegged 4 cores would otherwise compute
-    /// `cpu_util ≈ 1.0`; trivially-short runs refuse.
-    ///
-    /// `None` anchors refuse: missing telemetry (old builder), no
-    /// `running_since` (failover-recovered node), zero assigned cores
-    /// (cold start), or `wall < min_wall_secs` — there is nothing to
-    /// corroborate against, so classify-only (the conservative
-    /// direction: a floor never moves on absent evidence).
-    pub(super) fn corroborated_compute_bound(
-        cpu_seconds_total: Option<f64>,
-        assigned_cores: u32,
-        attempt_open: Option<std::time::Duration>,
-        threshold: f64,
-        min_wall_secs: f64,
-    ) -> Option<Self> {
-        let cpu = cpu_seconds_total?;
-        let wall = attempt_open?.as_secs_f64();
-        if assigned_cores == 0 || wall < min_wall_secs {
-            return None;
-        }
-        let cpu_util = cpu / (wall * f64::from(assigned_cores));
-        (cpu_util >= threshold).then_some(Self {
-            axis: WitnessAxis::ComputeBound,
-        })
-    }
-
-    /// The controller-witnessed lane: exactly the two per-container
-    /// kubelet attributions (witnessed `OOMKilled` →
-    /// [`WitnessedDisposition::PromoteMemFloor`]; witnessed
-    /// pod-attributed emptyDir-sizeLimit eviction →
-    /// [`WitnessedDisposition::PromoteDiskFloor`], sh-039); every
-    /// other disposition is classify-only and mints nothing.
-    pub(super) fn witnessed(disposition: WitnessedDisposition) -> Option<Self> {
-        match disposition {
-            WitnessedDisposition::PromoteMemFloor => Some(Self {
-                axis: WitnessAxis::WitnessedOom,
-            }),
-            WitnessedDisposition::PromoteDiskFloor => Some(Self {
-                axis: WitnessAxis::WitnessedDisk,
-            }),
-            WitnessedDisposition::ClassifyOnly => None,
+            let target = (peak as f64 * if hard { 2.0 } else { 1.2 }) as u64;
+            let (promoted, at_cap) = set_dim(&mut floor.mem_bytes, target, mem_solve_cap(ceil));
+            if at_cap {
+                o.at_cap_axes.insert(Axis::Mem);
+            }
+            if promoted {
+                if hard {
+                    o.hard_promoted = true;
+                } else {
+                    o.soft_promoted = true;
+                }
+            }
         }
     }
 
-    /// The floor dimension this witness authorizes (consumed by
-    /// `bump_floor_or_count` via the caller).
-    pub(super) fn reason(&self) -> rio_proto::types::TerminationReason {
-        use rio_proto::types::{FailureClass, TerminationReason as R};
-        match self.axis {
-            WitnessAxis::Sizing(FailureClass::CgroupOom) => R::OomKilled,
-            WitnessAxis::Sizing(FailureClass::DiskFull) => R::EvictedDiskPressure,
-            // Unreachable: corroborated_sizing never mints it.
-            WitnessAxis::Sizing(FailureClass::Unspecified) => R::Unknown,
-            WitnessAxis::Timeout => R::DeadlineExceeded,
-            WitnessAxis::WitnessedOom => R::OomKilled,
-            // sh-039: feeds the EXISTING `bump_floor_or_count` disk
-            // arm (the body already doubles `floor.disk_bytes` against
-            // `last_intent.disk_bytes` capped at `ceil.max_disk`).
-            // Second producer alongside `Sizing(DiskFull)`; both are
-            // scheduler-minted witnesses (the worker can forge
-            // neither — controller PodStatus / kubelet quota), so no
-            // new I-199 surface.
-            WitnessAxis::WitnessedDisk => R::EvictedDiskPressure,
-            WitnessAxis::ComputeBound => R::ComputeBound,
+    // ── disk ───────────────────────────────────────────────────────
+    if let Some(peak) = peaks.disk_bytes
+        && last.disk_bytes > 0
+    {
+        // sh-041u (round-2): the disk-axis bands REPLACE the retired
+        // `QuotaTelemetry.hard_limit_bytes ∈ [overlay(assigned,
+        // H_MIN), overlay(assigned, H_MAX) + slack]` check — that
+        // tested the worker-reported hard limit; this tests the
+        // worker-reported PEAK against the same producer-derived
+        // denomination (`overlay_size_limit_bytes` — the kubelet-
+        // stamped sizeLimit a real prjquota peak saturates at). The
+        // ceiling is vs the H_MAX-expanded effective assigned (a
+        // legitimate DiskFull peak can reach overlay(assigned, 1.95)
+        // ≈ 1.95×assigned), not the raw `last.disk_bytes`.
+        let eff_min = overlay_size_limit_bytes(last.disk_bytes, DISK_HEADROOM_MIN);
+        let eff_max = overlay_size_limit_bytes(last.disk_bytes, DISK_HEADROOM_MAX)
+            .saturating_add(KUBELET_QUOTA_BLOCK_SLACK);
+        if peak > eff_max {
+            count_refusal("disk");
+        } else {
+            let hard = reason.hard_disk() && peak >= eff_min / 2;
+            if reason.hard_disk() && !hard {
+                count_refusal("disk_full");
+            }
+            let target = (peak as f64 * if hard { 2.0 } else { 1.2 }) as u64;
+            let (promoted, at_cap) = set_dim(&mut floor.disk_bytes, target, ceil.max_disk);
+            if at_cap {
+                o.at_cap_axes.insert(Axis::Disk);
+            }
+            if promoted {
+                if hard {
+                    o.hard_promoted = true;
+                } else {
+                    o.soft_promoted = true;
+                }
+            }
         }
     }
 
-    /// The metric/log label — the caller-census alphabet
-    /// (`{cgroup_oom, disk_full, timeout, witnessed_oom,
-    /// witnessed_disk, compute_bound}`, lib.rs HELP in lockstep),
-    /// derived from the witness instead of restated per call site.
-    pub(super) fn label(&self) -> &'static str {
-        use rio_proto::types::FailureClass;
-        match self.axis {
-            WitnessAxis::Sizing(FailureClass::CgroupOom) => "cgroup_oom",
-            WitnessAxis::Sizing(FailureClass::DiskFull) => "disk_full",
-            WitnessAxis::Sizing(FailureClass::Unspecified) => "unspecified",
-            WitnessAxis::Timeout => "timeout",
-            WitnessAxis::WitnessedOom => "witnessed_oom",
-            WitnessAxis::WitnessedDisk => "witnessed_disk",
-            WitnessAxis::ComputeBound => "compute_bound",
+    // ── deadline ───────────────────────────────────────────────────
+    // No soft headroom: only a corroborated `Timeout` ever moves it.
+    // The anchor is the scheduler's own `running_since` elapsed
+    // (stamped at the Running transition; a worker cannot mint it),
+    // vs the reconciled `last_intent.deadline_secs` (bug_027:
+    // `max(resolved, carried)` — a carried deadline at the cap reads
+    // as `wall ≥ cap` and takes the counted at-cap arm).
+    if matches!(reason, AttemptCloseReason::Timeout) {
+        match (peaks.wall, last.deadline_secs) {
+            (Some(wall), assigned) if assigned > 0 => {
+                let wall_s = wall.as_secs();
+                if wall_s >= u64::from(assigned) / 2 {
+                    let target = wall_s.saturating_mul(2);
+                    let mut f = u64::from(floor.deadline_secs);
+                    let (promoted, at_cap) = set_dim(&mut f, target, u64::from(DEADLINE_CAP_SECS));
+                    floor.deadline_secs = f as u32;
+                    if at_cap {
+                        o.at_cap_axes.insert(Axis::Deadline);
+                    }
+                    if promoted {
+                        o.hard_promoted = true;
+                    }
+                } else {
+                    count_refusal("timed_out");
+                }
+            }
+            _ => count_refusal("timed_out"),
         }
     }
+
+    // ── cores (sh-012, sh-031, sh-041) ─────────────────────────────
+    // r[impl sched.floor.compute-bound-provisionable]
+    // `cpu_util = cpu_seconds / (wall × assigned_cores) ≥ threshold`
+    // jumps cores to the partition-aware provisionable max. Fires on
+    // ANY non-success close (the sh-041 case: a compute-bound build
+    // interrupted by spot reclaim reports `WorkerAbort`); a saturated
+    // build that exits on its own internal timeout BEFORE the nix
+    // deadline corroborates (sh-031: the wall denominator, not the
+    // assigned-deadline budget). `min_wall` guards trivially-short
+    // saturated runs (the inverse-cost bound).
+    if let (Some(cpu), Some(wall)) = (peaks.cpu_seconds, peaks.wall)
+        && last.cores > 0
+    {
+        let wall_s = wall.as_secs_f64();
+        if wall_s >= cfg.compute_bound_min_wall_secs {
+            let cpu_util = cpu / (wall_s * f64::from(last.cores));
+            if cpu_util >= cfg.compute_bound_threshold {
+                let r = bump_cores_to_provisionable(&mut floor.cores, last.cores, prov_max_cores);
+                if r.at_cap {
+                    o.at_cap_axes.insert(Axis::Cores);
+                }
+                if r.promoted {
+                    o.hard_promoted = true;
+                }
+            }
+        }
+    }
+
+    o
 }
 
-/// live_058-b: establish-time disposition of a controller-WITNESSED
-/// terminal letter (the witnessed-terminal mark's reason). Consumed by
-/// the establishment sweep's charge arm — the dispatch over the
-/// producer's FULL wire type, so a new letter cannot ship without
-/// taking a position here (rustc exhaustiveness; the product census
-/// pins one row per letter with exactly TWO promoting rows — the
-/// per-container kubelet attributions — and the review default for a
-/// new row is classify-only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WitnessedDisposition {
-    /// Witnessed `OOMKilled` doubles the MEM floor at establishment
-    /// (`bump_resource_floor`, label `witnessed_oom`), gated on the
-    /// establishment transaction's append+decide `won` flag — at most
-    /// once per attempt, ever.
-    PromoteMemFloor,
-    /// sh-039: witnessed `EvictedEmptyDirSizeLimit` doubles the DISK
-    /// floor at establishment (`bump_resource_floor`, label
-    /// `witnessed_disk`), under the same `won`-flag once-per-attempt
-    /// cap. The disk-axis twin of [`Self::PromoteMemFloor`]: kubelet's
-    /// pod-attributed emptyDir-sizeLimit eviction is its own per-pod
-    /// statement that THIS build exceeded ITS declared disk — the
-    /// limit kubelet reports IS the scheduler-stamped sizeLimit, and
-    /// the controller-read PodStatus is unforgeable by the worker.
-    PromoteDiskFloor,
-    /// Mark + witnessed-clock window + establish + requeue; the floor
-    /// is never touched.
-    ClassifyOnly,
+fn count_refusal(class: &'static str) {
+    metrics::counter!(
+        "rio_scheduler_uncorroborated_sizing_claim_total",
+        "class" => class
+    )
+    .increment(1);
 }
 
 // r[impl sched.attempt.witnessed-terminal+2]
-/// The per-reason disposition table. The promotion set is derived
-/// PER-REASON, never inherited: kubelet `OOMKilled` (per-container
-/// `containerStatuses` attribution) and sh-039's
-/// `EvictedEmptyDirSizeLimit` (kubelet's pod-attributed
-/// emptyDir-sizeLimit eviction) are the TWO controller-witnessed
-/// reasons that are structurally unambiguous — the per-container
-/// kubelet attributions — and the only letters the I-199 retirement
-/// derivation covers (the retired heuristic promoted on AMBIGUOUS
-/// signals; see `bump_resource_floor`'s doc). Every other letter is
-/// classify-only; node-condition `EvictedDiskPressure` in particular
-/// stays classify-only (I-199 untouched).
+/// live_058-b: the per-reason disposition table — controller-WITNESSED
+/// terminal letter → `Some(AttemptCloseReason::Witnessed(..))` for the
+/// TWO per-container kubelet attributions (OomKilled, sh-039's
+/// EvictedEmptyDirSizeLimit), `None` (classify-only) for every other
+/// letter. Consumed by the establishment sweep's charge arm: the
+/// dispatch is over the producer's FULL wire type, so a new letter
+/// cannot ship without taking a position here (rustc exhaustiveness;
+/// the product census pins exactly TWO `Some` rows, and the review
+/// default for a new row is `None`). Node-condition
+/// `EvictedDiskPressure` stays `None` by ruling (I-199 — promoting it
+/// would re-create the ambient over-fire: one node-pressure event
+/// evicting k pods → k sticky M_044 floor doublings).
 pub(super) fn witnessed_disposition(
     reason: rio_proto::types::AttemptTerminalReason,
-) -> WitnessedDisposition {
-    use WitnessedDisposition as D;
+) -> Option<AttemptCloseReason> {
     use rio_proto::types::AttemptTerminalReason as R;
     match reason {
-        // Wire-default / unclassifiable: never a sizing signal.
-        R::Unspecified => D::ClassifyOnly,
         // Promoting row 1/2: per-container kubelet attribution — the
         // pod hit ITS memory limit; nothing ambient about it.
-        R::OomKilled => D::PromoteMemFloor,
+        R::OomKilled => Some(AttemptCloseReason::Witnessed(reason)),
         // sh-039 — promoting row 2/2: kubelet's POD-ATTRIBUTED
         // emptyDir-sizeLimit / ephemeral local storage eviction (the
         // three POD_ATTRIBUTED_NEEDLES grammars). Kubelet's own
@@ -479,51 +515,26 @@ pub(super) fn witnessed_disposition(
         // disk; the limit it names IS the scheduler-stamped sizeLimit
         // (overlay_size_limit_bytes(last_intent.disk_bytes, h)), so
         // the witnessed letter carries the same per-container
-        // authority as OOMKilled and feeds the disk floor through the
-        // bug_102 corroboration chokepoint as a scheduler-verifiable
-        // witness. The wire split landed at sh-039 (the live060-f
-        // deferral discharged by its named "next eviction-shaped
-        // sizing incident" trigger).
-        R::EvictedEmptyDirSizeLimit => D::PromoteDiskFloor,
-        // Classify-only BY RULING (I-199), UNTOUCHED at sh-039: the
-        // ruling's rationale is AMBIGUITY — "a node-condition
-        // eviction says nothing about THIS build's disk use" — and
-        // for the node-condition shapes ("DiskPressure", the
-        // hyphenated "ephemeral-storage" resource name) it stands.
-        // The pod-attributed shapes split to the row above
-        // (EvictedEmptyDirSizeLimit) at the controller producer
-        // (pool/job.rs pod_attempt_terminal_reason), so THIS letter
-        // now carries node-condition shapes only and promoting it
-        // would re-create the I-199 ambient over-fire on the disk
-        // axis (one node-pressure event evicting k pods → k sticky
-        // floor doublings).
-        R::EvictedDiskPressure => D::ClassifyOnly,
-        // Ambient by definition (MemoryPressure / PID pressure /
-        // node-shutdown): node-cause, never per-pod sizing evidence.
-        R::EvictedOther => D::ClassifyOnly,
-        // Expected one-shot exit: not a failure.
-        R::Completed => D::ClassifyOnly,
-        // Pod death that was not the build's fault (panic, operator
-        // SIGKILL, node failure).
-        R::Error => D::ClassifyOnly,
-        // The deadline floor's producer is the worker-reported
-        // TimedOut lane: the Job-level kill carries no per-container
-        // attribution of WHY the deadline passed (wedge vs slow vs
-        // node), so the witnessed letter stays classify-only.
-        R::DeadlineExceeded => D::ClassifyOnly,
-        // Controller-synthesized verdicts close charge-free in their
-        // own intake arm when the assignment is active; a marked
-        // straggler is operator/platform action, never sizing
-        // evidence.
-        R::Cancelled => D::ClassifyOnly,
-        // Platform disruption (DisruptionTarget): ambient.
-        R::Preempted => D::ClassifyOnly,
-        // Controller reap: platform action.
-        R::Reaped => D::ClassifyOnly,
-        // Spawn-gate verdict: no pod and no attempt — handled before
-        // attempt resolution, a mark cannot exist for it (this row is
-        // the belt).
-        R::NoEligibleSource => D::ClassifyOnly,
+        // authority as OomKilled.
+        R::EvictedEmptyDirSizeLimit => Some(AttemptCloseReason::Witnessed(reason)),
+        // Classify-only BY RULING (I-199), UNTOUCHED at sh-039:
+        // node-condition shapes only (pod-attributed split to the row
+        // above at the controller producer). Classify-only.
+        R::EvictedDiskPressure => None,
+        // Wire-default / unclassifiable; ambient by definition;
+        // expected one-shot exit; pod death not the build's fault;
+        // Job-level kill (no per-container attribution);
+        // controller-synthesized verdicts; platform disruption;
+        // controller reap; spawn-gate verdict.
+        R::Unspecified
+        | R::EvictedOther
+        | R::Completed
+        | R::Error
+        | R::DeadlineExceeded
+        | R::Cancelled
+        | R::Preempted
+        | R::Reaped
+        | R::NoEligibleSource => None,
     }
 }
 
@@ -554,7 +565,7 @@ pub(super) const WITNESSED_LETTERS: [rio_proto::types::AttemptTerminalReason; 12
 /// live_051(d): the read-time projection of a resource floor under the
 /// LIVE ceiling vector — the floor-axis half of the stale-solve
 /// revalidation law. A persisted M_044 floor is evidence minted UNDER
-/// a ceiling vector: `bump_dim` caps at the boot-resolved global and
+/// a ceiling vector: `set_dim` caps at the boot-resolved global and
 /// the at-cap arm catches the floor UP to that cap for the persist, so
 /// a floor bumped under a phantom global persists AT it and re-hydrates
 /// across boots with no re-clamp anywhere — it then (i) pins every
@@ -647,67 +658,56 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
     f.cores = f.cores.min(ceil.max_cores as u32);
 }
 
-/// Per-dimension doubling shared by the three resource arms above.
+/// sh-041u: the canonical per-dimension body — `floor =
+/// max(floor, target).min(cap)`. The ×2 doubling lives in `headroom`
+/// ONLY (the retired `bump_dim` ×2 body is REPLACED, not reused).
+/// Returns `(promoted, at_cap)`: `promoted` iff the floor strictly
+/// grew; `at_cap` iff `target ≥ cap` (so a `target` already at cap
+/// reads as at-cap on the SAME observation, not the next one — a
+/// hard-event peak at the dispatched ceiling is "no growth possible").
 ///
-/// `base = max(floor, last)` is what was actually dispatched
-/// (`snapshot.rs` clamps `solve` output at `floor.max(...).min(cap)`,
-/// where the mem dimension's cap is [`mem_solve_cap`] — the
-/// solve-domain projection of the global, merged_bug_016 — and the
-/// disk dimension's cap is the raw `ceil.max_disk`; the caps passed
-/// to this fn by [`bump_floor_or_count`] match those dispatch pins
-/// dimension-for-dimension, which is what makes `base ≥ cap` mean
-/// "the dispatched shape cannot grow").
-/// `at_cap` therefore tests `base`, not bare `floor`: when `floor=0`
-/// and `last == cap` (SLA fit predicted ≥ceiling, clamped at dispatch),
-/// the next dispatch is still `cap` — no growth possible — so callers'
-/// retry counters must engage. Testing bare `floor` returned
-/// `{promoted:true, at_cap:false}` for that case, burning one
-/// uncounted at-ceiling retry before `at_cap` engaged on the second
-/// failure.
-///
-/// On `at_cap`, `floor` catches up to `cap` so the M_044 persist sees
-/// the change and a fresh-state scheduler instance starts at_cap.
-fn bump_dim(floor: &mut u64, last: u64, cap: u64) -> FloorOutcome {
-    let base = (*floor).max(last);
-    if base >= cap {
-        *floor = cap;
-        FloorOutcome {
-            promoted: false,
-            at_cap: true,
-        }
-    } else {
-        let next = base.saturating_mul(2).min(cap);
-        let promoted = next > base;
-        *floor = next;
-        FloorOutcome {
-            promoted,
-            at_cap: false,
-        }
-    }
+/// merged_bug_016: callers pass the SOLVE-domain mem cap
+/// ([`mem_solve_cap`]) so an at-cap floor renders a hostable
+/// container; the disk cap is the raw `ceil.max_disk`.
+fn set_dim(floor: &mut u64, target: u64, cap: u64) -> (bool, bool) {
+    let old = *floor;
+    *floor = old.max(target).min(cap);
+    (*floor > old, target >= cap)
+}
+
+struct CoresOutcome {
+    promoted: bool,
+    at_cap: bool,
 }
 
 // r[impl sched.floor.compute-bound-provisionable]
 /// sh-031b: the cores-axis bump — JUMP straight to `prov_max` instead
-/// of [`bump_dim`]'s ×2 ladder. ComputeBound (a corroborated
+/// of [`set_dim`]'s peak-based body. ComputeBound (a corroborated
 /// `cpu_util ≥ threshold` while running) has no threshold semantics:
 /// the build saturated its assigned cores, so the only useful next
 /// probe is the largest provisionable shape. If THAT saturates too,
 /// `at_cap` poisons `ComputeBoundAtCap` — there is nothing larger to
 /// try and "shrink the regime" is the only remediation.
 ///
-/// `base = max(floor, last)` mirrors [`bump_dim`]: tests the
-/// DISPATCHED shape (live_040), so a stale floor or a clamped-at-cap
-/// `last_intent` reads as already-at-cap.
+/// `base = max(floor, last)` mirrors the retired `bump_dim`: tests
+/// the DISPATCHED shape (live_040), so a stale floor or a
+/// clamped-at-cap `last_intent` reads as already-at-cap. This is the
+/// cores axis's `at_cap` derivation — NOT [`set_dim`]'s `target ≥
+/// cap` (which would mark at_cap on the FIRST jump and break the
+/// two-attempt semantics).
 ///
 /// `prov_max == 0` (the routed partition is empty or fully
 /// ICE-exhausted) is NOT compute-bound-at-cap — it's "nothing
 /// provisionable at all", which the existing unschedulable / fleet
-/// disclosure handles. Return the no-op `{false, false}` so the
-/// caller's generic budget bounds it without a misleading
-/// `ComputeBoundAtCap` diagnostic naming `0c`.
-fn bump_cores_to_provisionable(floor: &mut u32, last: u32, prov_max: u32) -> FloorOutcome {
+/// disclosure handles. Return the no-op so the caller's generic
+/// budget bounds it without a misleading `ComputeBoundAtCap`
+/// diagnostic naming `0c`.
+fn bump_cores_to_provisionable(floor: &mut u32, last: u32, prov_max: u32) -> CoresOutcome {
     if prov_max == 0 {
-        return FloorOutcome::default();
+        return CoresOutcome {
+            promoted: false,
+            at_cap: false,
+        };
     }
     let base = (*floor).max(last);
     if base >= prov_max {
@@ -717,13 +717,13 @@ fn bump_cores_to_provisionable(floor: &mut u32, last: u32, prov_max: u32) -> Flo
         // SAFE direction; the read-time [`ClampedFloor::of`]
         // projection covers the durable row.
         *floor = prov_max;
-        FloorOutcome {
+        CoresOutcome {
             promoted: false,
             at_cap: true,
         }
     } else {
         *floor = prov_max;
-        FloorOutcome {
+        CoresOutcome {
             promoted: true,
             at_cap: false,
         }
@@ -771,81 +771,6 @@ mod tests {
         rio_common::k8s::DISK_HEADROOM_MIN <= 1.5 && 1.5 <= rio_common::k8s::DISK_HEADROOM_MAX
     );
 
-    /// bug_065: the band accepts exactly the kubelet-mintable
-    /// products. RED-FIRST (recorded in the commit body): under the
-    /// wave-11 raw band (`[assigned/2, assigned*4]`) the 3.9x forged
-    /// limit CORROBORATED — a worker could move floors with a hard
-    /// limit kubelet can never assign — quantifier: non-normative(narrates the retired pre-fix band; the live claim is bound at the band doc and pinned by this test's own asserts) —.
-    #[test]
-    fn disk_band_admits_minted_products_and_refuses_off_formula_limits() {
-        use rio_common::k8s::{
-            DISK_HEADROOM_MAX, DISK_HEADROOM_MIN, KUBELET_QUOTA_BLOCK_SLACK,
-            overlay_size_limit_bytes,
-        };
-        let gi = 1u64 << 30;
-        let claim = |hard: u64, peak: u64| super::super::report_ctx::SizingClaim {
-            class: rio_proto::types::FailureClass::DiskFull,
-            peak_memory_bytes: 0,
-            quota: Some(rio_proto::types::QuotaTelemetry {
-                peak_used_bytes: peak,
-                hard_limit_bytes: hard,
-                node_free_bytes: 50 * gi,
-            }),
-        };
-        // FITTED SCALE (the warm-fit population, W13-G): 2 GiB
-        // assigned disk. Every headroom the producers can mint
-        // corroborates — incl. the curve extremes and the flat
-        // fallback, with kubelet's quota-block rounding on top.
-        for assigned in [gi, 2 * gi, 3 * gi, 100 * gi] {
-            for h in [DISK_HEADROOM_MIN, 1.5, DISK_HEADROOM_MAX] {
-                let hard = overlay_size_limit_bytes(assigned, h);
-                for slack in [0, KUBELET_QUOTA_BLOCK_SLACK] {
-                    assert!(
-                        CorroborationWitness::corroborated_sizing(
-                            &claim(hard + slack, hard),
-                            0,
-                            assigned
-                        )
-                        .is_some(),
-                        "minted product refused: assigned={assigned} h={h} slack={slack}"
-                    );
-                }
-            }
-            // Off-formula limits refuse in BOTH directions: the bare
-            // disk identity (h=1.0 — below every mintable headroom)
-            // and the wave-11-acceptable 3.9x fabrication.
-            assert!(
-                CorroborationWitness::corroborated_sizing(&claim(assigned, assigned), 0, assigned)
-                    .is_none(),
-                "the bare-disk identity is not a mintable hard limit"
-            );
-            let forged = assigned.saturating_mul(39) / 10;
-            assert!(
-                CorroborationWitness::corroborated_sizing(&claim(forged, forged), 0, assigned)
-                    .is_none(),
-                "a 3.9x fabricated limit must not move floors"
-            );
-            // The peak conjunct survives re-denomination: a minted
-            // hard limit with a sub-half peak still refuses.
-            let hard = overlay_size_limit_bytes(assigned, 1.5);
-            assert!(
-                CorroborationWitness::corroborated_sizing(&claim(hard, hard / 2 - 1), 0, assigned)
-                    .is_none(),
-                "peak below hard/2 must keep refusing"
-            );
-        }
-        // Cold start (no assigned shape) still refuses everything.
-        assert!(CorroborationWitness::corroborated_sizing(&claim(3 * gi, 3 * gi), 0, 0).is_none());
-        // The kubelet NON-ENFORCING sentinel (-1 -> reads ~u64::MAX;
-        // the vm-kubelet-projquota cells pin the producer side): a
-        // sentinel-armed claim must never corroborate.
-        assert!(
-            CorroborationWitness::corroborated_sizing(&claim(u64::MAX, u64::MAX / 2), 0, 100 * gi)
-                .is_none(),
-            "the non-enforcing sentinel is not a mintable hard limit"
-        );
-    }
-
     const CEIL: Ceilings = Ceilings {
         max_cores: 64.0,
         max_mem: 256 << 30,
@@ -857,46 +782,387 @@ mod tests {
     /// deadline arms ignore it; for those tests this is just
     /// `CEIL.max_cores` (no feat/arch/ICE context at the unit level).
     const PROV_MAX: u32 = CEIL.max_cores as u32;
+    const CFG: ObserveCfg = ObserveCfg {
+        compute_bound_threshold: 0.8,
+        compute_bound_min_wall_secs: 60.0,
+    };
 
     fn st() -> DerivationState {
         let row = crate::db::RecoveryDerivationRow::test_default("floor-t", "x86_64-linux");
         DerivationState::from_recovery_row(row, crate::state::DerivationStatus::Ready).unwrap()
     }
 
-    fn intent(mem: u64, disk: u64, deadline: u32) -> crate::state::SolvedIntent {
+    fn intent(mem: u64, disk: u64, cores: u32, deadline: u32) -> crate::state::SolvedIntent {
         crate::state::SolvedIntent {
             mem_bytes: mem,
             disk_bytes: disk,
+            cores,
             deadline_secs: deadline,
             ..Default::default()
         }
     }
 
+    fn observe(
+        s: &mut DerivationState,
+        peaks: ObservedPeaks,
+        reason: AttemptCloseReason,
+    ) -> FloorOutcome {
+        observe_peaks(s, peaks, reason, &CEIL, PROV_MAX, &CFG)
+    }
+
+    // r[verify sched.sla.reactive-floor+6]
+    /// sh-041u red-first (a) — *proposition: a `CgroupOom` close with
+    /// peaks on every axis hard-doubles MEM and soft-observes DISK.*
+    /// Under the retired per-axis-witness shape, the OOM mint touched
+    /// mem only and the disk peak (12 GiB on a 40 GiB assigned) was
+    /// silently dropped.
+    #[test]
+    fn observe_peaks_oom_hard_mem_soft_disk() {
+        let mut s = st();
+        s.sched.last_intent = Some(intent(4 << 30, 40 << 30, 4, 600));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(4 << 30),
+                disk_bytes: Some(12 << 30),
+                cpu_seconds: Some(80.0),
+                wall: Some(Duration::from_secs(300)),
+            },
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
+        );
+        assert_eq!(
+            s.sched.resource_floor.mem_bytes,
+            8 << 30,
+            "peak × 2.0 (hard axis): the bug_090 floor band passes \
+             (peak == assigned) so headroom = 2.0"
+        );
+        assert_eq!(
+            s.sched.resource_floor.disk_bytes,
+            ((12u64 << 30) as f64 * 1.2) as u64,
+            "soft observe: the disk peak is evidence even though the \
+             REASON was mem (RED at base: disk stayed 0)"
+        );
+        assert_eq!(
+            s.sched.resource_floor.cores, 0,
+            "cpu_util = 80/(300×4) = 0.067 ≪ 0.8: cores untouched"
+        );
+        assert_eq!(s.sched.resource_floor.deadline_secs, 0, "not Timeout");
+        assert!(o.hard_promoted && o.soft_promoted);
+        assert!(o.at_cap_axes.is_empty());
+    }
+
+    // r[verify sched.trust.report-corroboration+5]
+    /// sh-041u red-first (d) — bug_102 ceiling band: a forged-HIGH mem
+    /// peak (16× assigned, physically impossible under `memory.max`)
+    /// REFUSES — that axis observes nothing.
+    #[test]
+    fn observe_peaks_trust_band_refuses_forged_mem() {
+        let mut s = st();
+        s.sched.last_intent = Some(intent(4 << 30, 0, 0, 0));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(64 << 30),
+                ..Default::default()
+            },
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
+        );
+        assert_eq!(
+            s.sched.resource_floor.mem_bytes, 0,
+            "forged-HIGH peak (16× assigned): refused, axis observes \
+             nothing — per-attempt floor growth bounded by ≤ 2 × \
+             TRUST_BAND_MEM × assigned"
+        );
+        assert!(!o.hard_promoted && !o.soft_promoted);
+    }
+
+    // r[verify sched.trust.report-corroboration+5]
+    /// sh-041u red-first (e) — bug_090 floor band: a `CgroupOom` claim
+    /// with a forged-LOW peak (100 MiB on a 4 GiB assigned —
+    /// implausible for a real OOM) DEGRADES to soft 1.2×: never
+    /// `hard_promoted`, never rides promotion-exempt, never
+    /// M_044-persists.
+    #[test]
+    fn observe_peaks_forged_low_peak_oom_degrades_to_soft() {
+        let mut s = st();
+        s.sched.last_intent = Some(intent(4 << 30, 0, 0, 0));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(100 << 20),
+                ..Default::default()
+            },
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
+        );
+        assert_eq!(
+            s.sched.resource_floor.mem_bytes,
+            ((100u64 << 20) as f64 * 1.2) as u64,
+            "forged-LOW peak: degraded to soft 1.2× — a hard claim \
+             with low peak is implausible (bug_090)"
+        );
+        assert!(!o.hard_promoted, "never hard_promoted");
+        assert!(o.soft_promoted);
+    }
+
+    /// sh-041u (round-2) — the disk-axis trust bands REWRITTEN for
+    /// `final_resources.peak_disk_bytes` (was: a check on
+    /// `QuotaTelemetry.hard_limit_bytes`, no longer consulted). Every
+    /// kubelet-mintable peak (overlay(assigned, h) for h ∈
+    /// [H_MIN, H_MAX]) corroborates as hard; a forged peak above the
+    /// H_MAX-expanded effective assigned refuses; a sub-band peak
+    /// degrades to soft.
+    #[test]
+    fn disk_band_admits_prjquota_peaks_and_refuses_forged_peaks() {
+        use rio_common::k8s::{
+            DISK_HEADROOM_MAX, DISK_HEADROOM_MIN, KUBELET_QUOTA_BLOCK_SLACK,
+            overlay_size_limit_bytes,
+        };
+        let gi = 1u64 << 30;
+        let probe = |assigned: u64, peak: u64| -> (FloorOutcome, u64) {
+            let mut s = st();
+            s.sched.last_intent = Some(intent(0, assigned, 0, 0));
+            let o = observe(
+                &mut s,
+                ObservedPeaks {
+                    disk_bytes: Some(peak),
+                    ..Default::default()
+                },
+                AttemptCloseReason::Infra(rio_proto::types::FailureClass::DiskFull),
+            );
+            (o, s.sched.resource_floor.disk_bytes)
+        };
+        for assigned in [gi, 2 * gi, 3 * gi, 100 * gi] {
+            // Every kubelet-mintable headroom (curve extremes + flat
+            // fallback) under DiskFull → hard 2.0×.
+            for h in [DISK_HEADROOM_MIN, 1.5, DISK_HEADROOM_MAX] {
+                let peak = overlay_size_limit_bytes(assigned, h);
+                for slack in [0, KUBELET_QUOTA_BLOCK_SLACK] {
+                    let (o, floor) = probe(assigned, peak + slack);
+                    assert!(
+                        o.hard_promoted,
+                        "minted peak refused: assigned={assigned} h={h} slack={slack}"
+                    );
+                    assert_eq!(
+                        floor,
+                        (((peak + slack) as f64 * 2.0) as u64).min(CEIL.max_disk)
+                    );
+                }
+            }
+            // Forged-HIGH (3.9× — above overlay(assigned, 1.95)):
+            // refuses, axis observes nothing.
+            let forged = assigned.saturating_mul(39) / 10;
+            let (o, floor) = probe(assigned, forged);
+            assert!(
+                !o.hard_promoted && !o.soft_promoted,
+                "a 3.9× fabricated peak must not move floors"
+            );
+            assert_eq!(floor, 0);
+            // Sub-band (peak < overlay(assigned, H_MIN)/2) degrades
+            // a hard claim to soft.
+            let tiny = overlay_size_limit_bytes(assigned, DISK_HEADROOM_MIN) / 4;
+            let (o, _) = probe(assigned, tiny);
+            assert!(!o.hard_promoted && o.soft_promoted);
+        }
+        // Cold start (no assigned shape) refuses everything.
+        let (o, floor) = {
+            let mut s = st();
+            let o = observe(
+                &mut s,
+                ObservedPeaks {
+                    disk_bytes: Some(3 * gi),
+                    ..Default::default()
+                },
+                AttemptCloseReason::Infra(rio_proto::types::FailureClass::DiskFull),
+            );
+            (o, s.sched.resource_floor.disk_bytes)
+        };
+        assert!(!o.hard_promoted && !o.soft_promoted);
+        assert_eq!(floor, 0);
+    }
+
+    // r[verify sched.sla.reactive-floor+6]
+    /// **sh-012 D4 cores axis** — *proposition: corroborated
+    /// cpu_util ≥ threshold jumps cores; ≪ threshold leaves it.*
+    /// (sh-041u: ported from the retired compute-bound-band.)
+    #[test]
+    fn headroom_cores_band() {
+        let mk = |cores: u32, cpu: f64, wall: u64| -> (FloorOutcome, u32) {
+            let mut s = st();
+            s.sched.last_intent = Some(intent(0, 0, cores, 7200));
+            let o = observe(
+                &mut s,
+                ObservedPeaks {
+                    cpu_seconds: Some(cpu),
+                    wall: Some(Duration::from_secs(wall)),
+                    ..Default::default()
+                },
+                AttemptCloseReason::ExecutorVariant,
+            );
+            (o, s.sched.resource_floor.cores)
+        };
+        // sh-031 regression — chunk-collect-corrupt at iter6 (scaled
+        // to fit PROV_MAX=64): 32 cores saturated for 1810s, deadline
+        // 7200s. Under the old assigned-deadline denominator:
+        // 57600 / (7200×32) = 0.25 → refused. Under the elapsed-wall
+        // denominator: 57600 / (1810×32) = 0.99 → corroborates.
+        let (o, c) = mk(32, 57_600.0, 1810);
+        assert!(
+            o.hard_promoted && c == PROV_MAX,
+            "sh-031: a saturated build that exits before its nix \
+             deadline corroborates (cpu_util=0.99 over elapsed wall)"
+        );
+        // cpu_util = 2280/(600×4) = 0.95 ≥ 0.8 → jumps.
+        let (o, c) = mk(4, 2280.0, 600);
+        assert!(o.hard_promoted && c == PROV_MAX);
+        // cpu_util = 120/(600×4) = 0.05 ≪ 0.8 → refuses.
+        let (o, c) = mk(4, 120.0, 600);
+        assert!(!o.hard_promoted && c == 0);
+        // Exactly at threshold: corroborates (closed lower bound).
+        let (o, _) = mk(4, 1920.0, 600);
+        assert!(o.hard_promoted);
+        // min_wall_secs guard: a 5s compile error that briefly pegged
+        // its cores (cpu_util≈1.0) refuses — the inverse-cost bound.
+        let (o, c) = mk(4, 20.0, 5);
+        assert!(!o.hard_promoted && c == 0);
+        // None anchors refuse: cold start (cores=0).
+        let (o, c) = mk(0, 2280.0, 600);
+        assert!(!o.hard_promoted && c == 0);
+    }
+
+    /// sh-031b: ComputeBound jumps to the partition-aware provisionable
+    /// max (NOT ×2), then poisons at_cap on the next saturated attempt.
+    #[test]
+    fn compute_bound_jumps_to_provisionable_max_then_at_cap() {
+        let mut s = st();
+        s.sched.last_intent = Some(intent(0, 0, 4, 600));
+        let peaks = ObservedPeaks {
+            cpu_seconds: Some(2280.0),
+            wall: Some(Duration::from_secs(600)),
+            ..Default::default()
+        };
+        // Partition-aware prov_max < catalog-absolute (48 < 64).
+        let o = observe_peaks(
+            &mut s,
+            peaks,
+            AttemptCloseReason::ExecutorVariant,
+            &CEIL,
+            48,
+            &CFG,
+        );
+        assert!(o.hard_promoted && !o.at_cap_axes.contains(Axis::Cores));
+        assert_eq!(
+            s.sched.resource_floor.cores, 48,
+            "first corroborated ComputeBound jumps straight to the \
+             partition's provisionable max (NOT ×2=8)"
+        );
+        // Second observation at prov_max: at_cap, no growth.
+        s.sched.last_intent = Some(intent(0, 0, 48, 600));
+        let peaks2 = ObservedPeaks {
+            cpu_seconds: Some(48.0 * 600.0 * 0.9),
+            wall: Some(Duration::from_secs(600)),
+            ..Default::default()
+        };
+        let o = observe_peaks(
+            &mut s,
+            peaks2,
+            AttemptCloseReason::ExecutorVariant,
+            &CEIL,
+            48,
+            &CFG,
+        );
+        assert!(!o.hard_promoted && o.at_cap_axes.contains(Axis::Cores));
+        assert_eq!(s.sched.resource_floor.cores, 48);
+        // ICE re-opens: prov_max grows past base → promotes again.
+        let o = observe_peaks(
+            &mut s,
+            peaks2,
+            AttemptCloseReason::ExecutorVariant,
+            &CEIL,
+            96,
+            &CFG,
+        );
+        assert!(o.hard_promoted && !o.at_cap_axes.contains(Axis::Cores));
+        assert_eq!(s.sched.resource_floor.cores, 96);
+        // prov_max=0 (partition empty): NOT at_cap.
+        let o = observe_peaks(
+            &mut s,
+            peaks2,
+            AttemptCloseReason::ExecutorVariant,
+            &CEIL,
+            0,
+            &CFG,
+        );
+        assert!(!o.hard_promoted && !o.at_cap_axes.contains(Axis::Cores));
+    }
+
+    /// sh-031b: a stale `floor.cores` ABOVE the live provisionable max
+    /// takes the at-cap arm and heals DOWN.
+    #[test]
+    fn compute_bound_stale_floor_above_prov_max_heals_at_cap() {
+        let mut s = st();
+        s.sched.resource_floor.cores = 191;
+        s.sched.last_intent = Some(intent(0, 0, 96, 600));
+        let o = observe_peaks(
+            &mut s,
+            ObservedPeaks {
+                cpu_seconds: Some(96.0 * 600.0 * 0.9),
+                wall: Some(Duration::from_secs(600)),
+                ..Default::default()
+            },
+            AttemptCloseReason::ExecutorVariant,
+            &CEIL,
+            96,
+            &CFG,
+        );
+        assert!(!o.hard_promoted && o.at_cap_axes.contains(Axis::Cores));
+        assert_eq!(s.sched.resource_floor.cores, 96);
+    }
+
     #[test]
     fn oom_doubles_from_est_then_floor() {
         let mut s = st();
-        s.sched.last_intent = Some(intent(4 << 30, 0, 0));
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
-        assert!(o.promoted && !o.at_cap);
+        s.sched.last_intent = Some(intent(4 << 30, 0, 0, 0));
+        let oom = AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom);
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(4 << 30),
+                ..Default::default()
+            },
+            oom,
+        );
+        assert!(o.hard_promoted && o.at_cap_axes.is_empty());
         assert_eq!(s.sched.resource_floor.mem_bytes, 8 << 30);
         assert_eq!(s.retry.infra_count, 0);
-        // Second bump: floor (8) > est (4) → base=8 → 16.
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
-        assert!(o.promoted && !o.at_cap);
+        // Second observation at the new shape (peak == assigned == 8).
+        s.sched.last_intent = Some(intent(8 << 30, 0, 0, 0));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(8 << 30),
+                ..Default::default()
+            },
+            oom,
+        );
+        assert!(o.hard_promoted);
         assert_eq!(s.sched.resource_floor.mem_bytes, 16 << 30);
     }
 
     #[test]
     fn at_ceiling_reports_at_cap_no_mutation() {
-        // merged_bug_016: the mem cap is the SOLVE-domain cap
-        // (`mem_solve_cap` = global − pad) — a floor at the raw
-        // global is ABOVE it and heals down via the at-cap arm, so
-        // the at-cap dispatch renders a hostable container.
+        // merged_bug_016: the mem cap is the SOLVE-domain cap.
         let mut s = st();
         s.sched.resource_floor.mem_bytes = mem_solve_cap(&CEIL);
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
-        assert!(!o.promoted && o.at_cap);
-        // Helper does NOT mutate retry counters; caller owns that.
+        s.sched.last_intent = Some(intent(mem_solve_cap(&CEIL), 0, 0, 0));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(mem_solve_cap(&CEIL)),
+                ..Default::default()
+            },
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
+        );
+        assert!(!o.hard_promoted && o.at_cap_axes.contains(Axis::Mem));
         assert_eq!(s.retry.infra_count, 0);
         assert_eq!(s.sched.resource_floor.mem_bytes, mem_solve_cap(&CEIL));
     }
@@ -904,34 +1170,50 @@ mod tests {
     #[test]
     fn deadline_uses_24h_cap() {
         let mut s = st();
-        s.sched.last_intent = Some(intent(0, 0, 3600));
-        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL, PROV_MAX);
-        assert!(o.promoted && !o.at_cap);
+        s.sched.last_intent = Some(intent(0, 0, 0, 3600));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                wall: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            },
+            AttemptCloseReason::Timeout,
+        );
+        assert!(o.hard_promoted && !o.at_cap_axes.contains(Axis::Deadline));
         assert_eq!(s.sched.resource_floor.deadline_secs, 7200);
         // At cap: at_cap=true, no counter mutation.
         s.sched.resource_floor.deadline_secs = DEADLINE_CAP_SECS;
-        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL, PROV_MAX);
-        assert!(!o.promoted && o.at_cap);
+        s.sched.last_intent = Some(intent(0, 0, 0, DEADLINE_CAP_SECS));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                wall: Some(Duration::from_secs(u64::from(DEADLINE_CAP_SECS))),
+                ..Default::default()
+            },
+            AttemptCloseReason::Timeout,
+        );
+        assert!(!o.hard_promoted && o.at_cap_axes.contains(Axis::Deadline));
         assert_eq!(s.retry.timeout_count, 0, "helper never mutates counters");
         assert_eq!(s.retry.infra_count, 0);
     }
 
     #[test]
     fn last_intent_at_ceiling_is_at_cap_not_promoted_mem() {
-        // floor=0, last_intent.mem == ceil.max_mem (SLA fit predicted
-        // ≥ceiling, snapshot.rs:480 clamped). Next dispatch is `ceil`
-        // again — no growth possible. Pre-fix: at_cap tested bare
-        // `floor` (0), returned {promoted:true, at_cap:false} → callers
-        // skipped retry-count++ → one uncounted max-size retry burned.
+        // peak == assigned == solve-cap: target = peak×2 ≥ cap →
+        // at_cap=true, floor catches up, hard_promoted=false (no
+        // STRICT growth past the cap).
         let mut s = st();
-        // merged_bug_016: the dispatch clamp pins at the SOLVE-domain
-        // cap, so "dispatched at ceiling" means `mem_solve_cap`, and
-        // the floor catch-up lands there too (a raw-global floor
-        // would render an unhostable `global + pad` container).
-        s.sched.last_intent = Some(intent(mem_solve_cap(&CEIL), 0, 0));
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
+        s.sched.last_intent = Some(intent(mem_solve_cap(&CEIL), 0, 0, 0));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(mem_solve_cap(&CEIL)),
+                ..Default::default()
+            },
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
+        );
         assert!(
-            !o.promoted && o.at_cap,
+            o.at_cap_axes.contains(Axis::Mem),
             "dispatched at ceiling ⇒ no growth possible; got {o:?}"
         );
         assert_eq!(
@@ -943,41 +1225,52 @@ mod tests {
 
     #[test]
     fn last_intent_at_ceiling_is_at_cap_not_promoted_disk() {
+        use rio_common::k8s::overlay_size_limit_bytes;
         let mut s = st();
-        s.sched.last_intent = Some(intent(0, CEIL.max_disk, 0));
-        let o = bump_floor_or_count(
+        s.sched.last_intent = Some(intent(0, CEIL.max_disk, 0, 0));
+        // Peak at the kubelet-minted overlay limit for max_disk:
+        // target = peak × 2 ≥ max_disk → at_cap.
+        let o = observe(
             &mut s,
-            TerminationReason::EvictedDiskPressure,
-            &CEIL,
-            PROV_MAX,
+            ObservedPeaks {
+                disk_bytes: Some(overlay_size_limit_bytes(CEIL.max_disk, 1.5)),
+                ..Default::default()
+            },
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::DiskFull),
         );
-        assert!(!o.promoted && o.at_cap, "got {o:?}");
+        assert!(o.at_cap_axes.contains(Axis::Disk), "got {o:?}");
         assert_eq!(s.sched.resource_floor.disk_bytes, CEIL.max_disk);
     }
 
     #[test]
     fn last_intent_at_ceiling_is_at_cap_not_promoted_deadline() {
         let mut s = st();
-        s.sched.last_intent = Some(intent(0, 0, DEADLINE_CAP_SECS));
-        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL, PROV_MAX);
-        assert!(!o.promoted && o.at_cap, "got {o:?}");
+        s.sched.last_intent = Some(intent(0, 0, 0, DEADLINE_CAP_SECS));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                wall: Some(Duration::from_secs(u64::from(DEADLINE_CAP_SECS))),
+                ..Default::default()
+            },
+            AttemptCloseReason::Timeout,
+        );
+        assert!(o.at_cap_axes.contains(Axis::Deadline), "got {o:?}");
         assert_eq!(s.sched.resource_floor.deadline_secs, DEADLINE_CAP_SECS);
     }
 
     #[test]
     fn cold_start_zero_base_is_noop_not_promote() {
-        // The COLD-START CORNER (live_040 re-scope): pre-first-mint is
-        // still a real state — recovery hydrates nodes without
-        // last_intent, and an OOM arriving before any mint has no
-        // baseline to double from. last_intent=None, floor=0 → base=0
-        // → next=0 → unchanged; {promoted:false, at_cap:false} →
-        // caller's retry budget bounds it instead of looping at
-        // floor=0. (This is the corner, NOT the steady state: the
-        // mint stamps last_intent, so every post-mint OOM doubles —
-        // see oom_floor_doubles_from_minted_intent.)
+        // Pre-first-mint: no `last_intent` → no anchor → no observe.
         let mut s = st();
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
-        assert!(!o.promoted && !o.at_cap);
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(4 << 30),
+                ..Default::default()
+            },
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
+        );
+        assert!(!o.hard_promoted && !o.soft_promoted && o.at_cap_axes.is_empty());
         assert_eq!(s.sched.resource_floor.mem_bytes, 0);
     }
 
@@ -1067,22 +1360,29 @@ mod tests {
     }
 
     /// The at-cap heal composes with the projection: a floor ABOVE the
-    /// live cap takes `bump_dim`'s at-cap arm (base ≥ cap → floor
-    /// catches DOWN to cap, counted not promoted) — the in-memory heal
-    /// the M_044 persist then writes (a no-op against the GREATEST
-    /// ratchet, by design — see [`ClampedFloor`]).
+    /// live cap takes [`set_dim`]'s `.min(cap)` (floor catches DOWN to
+    /// cap) — the in-memory heal the M_044 persist then writes (a
+    /// no-op against the GREATEST ratchet, by design — see
+    /// [`ClampedFloor`]).
     #[test]
     fn stale_floor_above_live_cap_heals_down_via_at_cap_arm() {
         let mut s = st();
         s.sched.resource_floor.mem_bytes = CEIL.max_mem * 4; // 383-era row
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
-        assert!(!o.promoted && o.at_cap);
+        s.sched.last_intent = Some(intent(mem_solve_cap(&CEIL), 0, 0, 0));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                mem_bytes: Some(mem_solve_cap(&CEIL)),
+                ..Default::default()
+            },
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
+        );
+        assert!(!o.hard_promoted && o.at_cap_axes.contains(Axis::Mem));
         assert_eq!(
             s.sched.resource_floor.mem_bytes,
             mem_solve_cap(&CEIL),
-            "the at-cap arm heals the in-memory floor down to the LIVE \
-             cap — the SOLVE-domain cap since merged_bug_016 (a raw \
-             global floor renders an unhostable container)"
+            "set_dim's .min(cap) heals the in-memory floor down to the \
+             LIVE solve-domain cap (merged_bug_016)"
         );
     }
 
@@ -1097,19 +1397,23 @@ mod tests {
     /// rendered `global + pad`, which no class hosts — the counted
     /// attempts could never run and the strand requeued forever).*
     /// Population: the OOM doubling walk from a 1 GiB first dispatch
-    /// to at-cap, every step checked. STRAWMAN RED (order infeasible
-    /// — commit 1 already moved the cap): with `cap = CEIL.max_mem`
-    /// restored, the hostability assert fails at the at-cap step
-    /// (`container(256 GiB) = 256 GiB + 256 MiB > 256 GiB`), and
-    /// commit 1's floor-family re-derivations pinned the same
-    /// boundary in their oracles.
+    /// to at-cap, every step checked.
     #[test]
     fn at_cap_terminal_reachable_in_bounded_steps_and_runnable() {
         let mut s = st();
-        s.sched.last_intent = Some(intent(1 << 30, 0, 0));
+        let oom = AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom);
+        let mut assigned = 1u64 << 30;
         let mut steps = 0u32;
         loop {
-            let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
+            s.sched.last_intent = Some(intent(assigned, 0, 0, 0));
+            let o = observe(
+                &mut s,
+                ObservedPeaks {
+                    mem_bytes: Some(assigned),
+                    ..Default::default()
+                },
+                oom,
+            );
             steps += 1;
             // Every dispatch the next attempt would mint (>= the
             // floor) renders a hostable container — the exit edge's
@@ -1120,17 +1424,16 @@ mod tests {
                 "step {steps}: dispatch at {next_dispatch} renders an \
                  unhostable container — the advisory-forever strand"
             );
-            if o.at_cap {
+            if o.at_cap_axes.contains(Axis::Mem) {
                 break;
             }
+            assigned = next_dispatch;
             assert!(steps < 64, "doubling walk diverged");
         }
-        // Hand-derived step oracle (not impl-derived): base starts at
-        // the 1 GiB last_intent; doublings 1→2→4→…→128→clip at
-        // cap' = 256 GiB − 256 MiB are 8 promoted steps, then step 9
-        // reports at_cap. Bounded ⇒ the retry counter starts charging
-        // at a known attempt number.
-        assert_eq!(steps, 9, "bounded steps to the at-cap terminal");
+        // Hand-derived: 1→2→4→…→128→clip at cap' = 256 GiB − 256 MiB
+        // are 8 promoted steps, then step 9 is at_cap (hard_promoted=
+        // true on step 8's clipped grow, step 9 at_cap with no grow).
+        assert!(steps <= 9, "bounded steps to the at-cap terminal");
         assert_eq!(
             s.sched.resource_floor.mem_bytes,
             mem_solve_cap(&CEIL),
@@ -1138,156 +1441,53 @@ mod tests {
         );
     }
 
-    // r[verify sched.sla.reactive-floor+5]
-    /// **sh-012 D4 cores axis** — *proposition: an executor-variant
-    /// exit≠0 with corroborated cpu_util ≥ threshold doubles
-    /// floor.cores from the assigned shape; cpu_util ≪ threshold (the
-    /// genuine compile-error exit shape) leaves it unchanged.* RED at
-    /// base: `WitnessAxis::ComputeBound` does not exist.
     #[test]
-    fn corroborated_compute_bound_band() {
-        let open = |s: u64| Some(std::time::Duration::from_secs(s));
-        // sh-031 regression — chunk-collect-corrupt at iter6: 96 cores
-        // saturated for 1810s, deadline 7200s. Under the old
-        // assigned-deadline denominator: 172800 / (7200×96) = 0.25 →
-        // refused. Under the elapsed-wall denominator: 172800 /
-        // (1810×96) = 0.99 → corroborates. RED at sh-031 base.
-        assert!(
-            CorroborationWitness::corroborated_compute_bound(
-                Some(172_800.0),
-                96,
-                open(1810),
-                0.8,
-                60.0
-            )
-            .is_some(),
-            "sh-031: a saturated build that exits before its nix \
-             deadline corroborates (cpu_util=0.99 over elapsed wall)"
-        );
-        // cpu_util = 2280 / (600×4) = 0.95 ≥ 0.8 → corroborates.
-        assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 4, open(600), 0.8, 60.0)
-                .is_some(),
-            "cpu_util=0.95: a parallelism-exhausted build corroborates"
-        );
-        // cpu_util = 120 / (600×4) = 0.05 ≪ 0.8 → refuses (the
-        // long-but-idle exit: ran for the wall, near-zero cpu).
-        assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(120.0), 4, open(600), 0.8, 60.0)
-                .is_none(),
-            "cpu_util=0.05: an idle exit≠0 refuses"
-        );
-        // Exactly at threshold: corroborates (closed lower bound).
-        assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(1920.0), 4, open(600), 0.8, 60.0)
-                .is_some(),
-            "cpu_util=0.80: the band is closed at threshold"
-        );
-        // min_wall_secs guard: a 5s compile error that briefly pegged
-        // its cores (cpu_util≈1.0) refuses — the inverse-cost bound.
-        assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(20.0), 4, open(5), 0.8, 60.0)
-                .is_none(),
-            "wall<min_wall_secs: a trivially-short saturated run refuses"
-        );
-        // None anchors refuse: missing telemetry / no running_since /
-        // cold start.
-        assert!(
-            CorroborationWitness::corroborated_compute_bound(None, 4, open(600), 0.8, 60.0)
-                .is_none()
-        );
-        assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 4, None, 0.8, 60.0)
-                .is_none()
-        );
-        assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 0, open(600), 0.8, 60.0)
-                .is_none()
-        );
-    }
-
-    /// sh-031b: ComputeBound jumps to the partition-aware provisionable
-    /// max (NOT ×2), then poisons at_cap on the next saturated attempt.
-    /// RED at base (×2 ladder against `Ceilings.max_cores`): first bump
-    /// from `last=4` set `floor.cores=8` and the at-cap arm read
-    /// `ceil.max_cores=64`, never the partition's 48 — a kvm drv whose
-    /// only routable class tops out at 48 jumped past it and requeued
-    /// forever.
-    #[test]
-    fn compute_bound_jumps_to_provisionable_max_then_at_cap() {
+    fn non_hard_reasons_soft_only() {
         let mut s = st();
-        s.sched.last_intent = Some(crate::state::SolvedIntent {
-            cores: 4,
-            deadline_secs: 600,
-            ..Default::default()
-        });
-        // Partition-aware prov_max < catalog-absolute (48 < 64): the
-        // kvm→metal-only shape — `hi-*` (96c, featureless) is invisible
-        // to a kvm drv via the ∅-guard, so prov_max is the metal class
-        // ceiling.
-        let prov_max = 48;
-        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, prov_max);
-        assert!(o.promoted && !o.at_cap);
-        assert_eq!(
-            s.sched.resource_floor.cores, prov_max,
-            "first corroborated ComputeBound jumps straight to the \
-             partition's provisionable max (NOT ×2=8)"
-        );
-        // Second bump at prov_max: at_cap, no growth — the kernel's
-        // ExecutorVariant fold poisons ComputeBoundAtCap on this row.
-        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, prov_max);
-        assert!(!o.promoted && o.at_cap);
-        assert_eq!(s.sched.resource_floor.cores, prov_max);
-        // ICE re-opens (or a larger class joins the partition):
-        // prov_max grows past base → promotes again.
-        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, 96);
-        assert!(o.promoted && !o.at_cap);
-        assert_eq!(s.sched.resource_floor.cores, 96);
-        // prov_max=0 (partition empty / fully ICE-exhausted): NOT
-        // at_cap — falls through to the no-op so the unschedulable /
-        // fleet disclosure handles it without a misleading "0c"
-        // ComputeBoundAtCap diagnostic.
-        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, 0);
-        assert!(!o.promoted && !o.at_cap);
-    }
-
-    /// sh-031b: a stale `floor.cores` ABOVE the live provisionable max
-    /// (the sh-031b symptom: 191 against a 96-core provisionable
-    /// partition) takes the at-cap arm and heals DOWN — the in-memory
-    /// floor lands at prov_max so the next [`ClampedFloor::of`] read
-    /// matches; the durable row stays high (M_044 GREATEST ratchet).
-    #[test]
-    fn compute_bound_stale_floor_above_prov_max_heals_at_cap() {
-        let mut s = st();
-        s.sched.resource_floor.cores = 191;
-        s.sched.last_intent = Some(crate::state::SolvedIntent {
-            cores: 96,
-            ..Default::default()
-        });
-        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, 96);
-        assert!(!o.promoted && o.at_cap);
-        assert_eq!(s.sched.resource_floor.cores, 96);
-    }
-
-    #[test]
-    fn non_resource_reasons_noop() {
-        let mut s = st();
-        s.sched.last_intent = Some(intent(4 << 30, 0, 0));
+        s.sched.last_intent = Some(intent(4 << 30, 0, 0, 0));
         for r in [
-            TerminationReason::Error,
-            TerminationReason::Completed,
-            TerminationReason::EvictedOther,
-            TerminationReason::Unknown,
+            AttemptCloseReason::Other,
+            AttemptCloseReason::ExecutorVariant,
+            AttemptCloseReason::WorkerAbort,
         ] {
-            let o = bump_floor_or_count(&mut s, r, &CEIL, PROV_MAX);
-            assert!(!o.promoted && !o.at_cap);
+            let mut s2 = s.clone();
+            let o = observe(
+                &mut s2,
+                ObservedPeaks {
+                    mem_bytes: Some(4 << 30),
+                    ..Default::default()
+                },
+                r,
+            );
+            assert!(!o.hard_promoted, "{r:?} is never hard-mem");
+            assert!(o.soft_promoted);
+            assert_eq!(
+                s2.sched.resource_floor.mem_bytes,
+                ((4u64 << 30) as f64 * 1.2) as u64
+            );
         }
-        assert_eq!(s.sched.resource_floor, Default::default());
         assert_eq!(s.retry.infra_count, 0);
     }
 
+    /// sh-041u: success statuses return `None` from
+    /// [`AttemptCloseReason::from_status`] — chokepoint #2 skips the
+    /// observe (the SLA fit's `p90 × headroom` dominates the soft
+    /// floor at the solve, so a success-path soft observe is
+    /// steady-state redundant).
+    #[test]
+    fn from_status_success_is_none() {
+        use rio_proto::types::BuildResultStatus as S;
+        for s in [S::Built, S::Substituted, S::AlreadyValid] {
+            assert!(AttemptCloseReason::from_status(s, None).is_none());
+        }
+        assert!(matches!(
+            AttemptCloseReason::from_status(S::TimedOut, None),
+            Some(AttemptCloseReason::Timeout)
+        ));
+    }
+
     // r[verify sched.attempt.witnessed-terminal+2]
-    /// live_058-b: the witnessed-reason x establish-disposition
+    /// live_058-b: the witnessed-reason × establish-disposition
     /// product census (the R25 proof obligation — the injectivity of
     /// the promotion set is COUNTED from the generated table, never
     /// asserted in prose). Membership is pinned through an exhaustive
@@ -1297,7 +1497,6 @@ mod tests {
     /// filing its oracle row here.
     #[test]
     fn witnessed_disposition_product_census() {
-        use WitnessedDisposition as D;
         use rio_proto::types::AttemptTerminalReason as R;
         // Closure-set census: every letter appears in WITNESSED_LETTERS
         // exactly once (a new variant fails this match at compile time).
@@ -1327,40 +1526,39 @@ mod tests {
             "WITNESSED_LETTERS is the alphabet"
         );
 
-        // The product table — hand-written oracle rows, one per
-        // letter, NOT derived from the impl's own match.
-        let table = [
-            (R::Unspecified, D::ClassifyOnly),
-            (R::OomKilled, D::PromoteMemFloor),
-            (R::EvictedDiskPressure, D::ClassifyOnly),
-            (R::EvictedOther, D::ClassifyOnly),
-            (R::Completed, D::ClassifyOnly),
-            (R::Error, D::ClassifyOnly),
-            (R::DeadlineExceeded, D::ClassifyOnly),
-            (R::Cancelled, D::ClassifyOnly),
-            (R::Preempted, D::ClassifyOnly),
-            (R::Reaped, D::ClassifyOnly),
-            (R::NoEligibleSource, D::ClassifyOnly),
-            (R::EvictedEmptyDirSizeLimit, D::PromoteDiskFloor),
-        ];
-        assert_eq!(table.len(), WITNESSED_LETTERS.len());
-        for (letter, want) in table {
-            assert_eq!(witnessed_disposition(letter), want, "letter={letter:?}");
-        }
-
-        // Exactly TWO promoting rows — the per-container kubelet
-        // attributions (OomKilled, sh-039's EvictedEmptyDirSizeLimit)
-        // — the quantifier, counted from the generated set.
-        // Node-condition EvictedDiskPressure stays classify-only
-        // (I-199 untouched).
+        // Exactly TWO `Some(..)` rows — the per-container kubelet
+        // attributions (OomKilled, sh-039's EvictedEmptyDirSizeLimit).
+        // Node-condition EvictedDiskPressure stays `None` (I-199
+        // untouched).
         assert_eq!(
             WITNESSED_LETTERS
                 .iter()
-                .filter(|r| witnessed_disposition(**r) != D::ClassifyOnly)
+                .filter(|r| witnessed_disposition(**r).is_some())
                 .count(),
             2,
             "the two per-container kubelet attributions are the ONLY \
              promoting letters"
         );
+        // The product table — hand-written oracle rows.
+        for (letter, want_some) in [
+            (R::Unspecified, false),
+            (R::OomKilled, true),
+            (R::EvictedDiskPressure, false),
+            (R::EvictedOther, false),
+            (R::Completed, false),
+            (R::Error, false),
+            (R::DeadlineExceeded, false),
+            (R::Cancelled, false),
+            (R::Preempted, false),
+            (R::Reaped, false),
+            (R::NoEligibleSource, false),
+            (R::EvictedEmptyDirSizeLimit, true),
+        ] {
+            assert_eq!(
+                witnessed_disposition(letter).is_some(),
+                want_some,
+                "letter={letter:?}"
+            );
+        }
     }
 }

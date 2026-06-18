@@ -270,7 +270,7 @@ impl SchedulerDb {
     /// output) carries no confidentiality flip and is
     /// integrity-equivalent to a compromised builder uploading
     /// arbitrary CA content, which the threat model already prices.
-    // r[impl sched.trust.report-corroboration+4]
+    // r[impl sched.trust.report-corroboration+5]
     pub(crate) async fn paths_with_production_evidence(
         &self,
         output_paths: &[String],
@@ -1160,58 +1160,47 @@ mod registration_writer_census {
     }
 
     // r[verify sched.attempt.witnessed-terminal+2]
-    /// live_058-b ([GEN-SET], the R23′ bind): the `bump_resource_floor`
-    /// caller alphabet is MACHINE-PINNED — the fn doc's and the lib.rs
-    /// HELP's "the callers are the alphabet" sentences cite THIS census
-    /// instead of restating a list that goes stale (the restated-
-    /// sentence arm is struck: an alphabet/ONLY claim takes the machine
-    /// bind). Current population (bug_102: every caller presents a
-    /// typed `CorroborationWitness` — the demand sits inside the
-    /// mutation, so the label alphabet `{cgroup_oom, disk_full,
-    /// timeout, witnessed_oom, witnessed_disk, compute_bound}` derives
-    /// from the witness, one producer): the corroborated-sizing
-    /// chokepoint (completion.rs `bump_floor_on_corroborated_claim` —
-    /// one call site carrying both `cgroup_oom` and `disk_full` via
-    /// the witness), the corroborated-timeout lane (completion.rs
-    /// `handle_timeout_failure` — `timeout`, the attempt-age anchor),
-    /// the corroborated-compute-bound lane (completion.rs
-    /// `handle_executor_variant_failure` — `compute_bound`, sh-012:
-    /// cpu_util ≥ threshold against the assigned cores×deadline),
-    /// and the establishment sweep's witnessed disposition rows
-    /// (housekeeping.rs — `witnessed_oom`, live_058-b, and sh-039's
-    /// `witnessed_disk` ride ONE witness-driven call via the
-    /// witnessed-disposition constructor). A new caller reds here
-    /// until it files its row, its witness constructor, and the
-    /// lib.rs HELP; rides the same embedded-source universe as every
-    /// census in this module (the dev-tree completeness pin is
+    /// live_058-b ([GEN-SET], the R23′ bind): the
+    /// `observe_resource_floor` caller alphabet is MACHINE-PINNED —
+    /// the fn doc's and the lib.rs HELP's "the callers are the
+    /// alphabet" sentences cite THIS census instead of restating a
+    /// list that goes stale. sh-041u population (bug_102: every caller
+    /// presents a scheduler-minted `AttemptCloseReason` — the demand
+    /// sits inside the mutation; the label alphabet derives from the
+    /// reason, one producer): chokepoint #2 (completion.rs
+    /// `handle_admitted_completion` — the per-status-handler axis
+    /// mints collapsed to ONE call before the `match status`
+    /// fan-out), chokepoint #3 (pull.rs AD5 worker-abort
+    /// short-circuit — the sh-041 case), and chokepoint #4 (the
+    /// establishment sweep's witnessed disposition rows:
+    /// housekeeping.rs + pull.rs `establish_from_witnessed`;
+    /// `witnessed_oom`, sh-039's `witnessed_disk`). A new caller reds
+    /// here until it files its row and the lib.rs HELP; rides the
+    /// same embedded-source universe as every census in this module
+    /// (the dev-tree completeness pin is
     /// `census_universe_matches_live_tree`; the raw-layer plant is
     /// `worker_report_taint_sinks_pinned`'s strawman, which proves
     /// `assert_census` rejects and NAMES unlisted rows).
     #[test]
-    fn bump_resource_floor_caller_census() {
-        let hits = census(&[".bump_resource", "_floor("]);
+    fn observe_resource_floor_caller_census() {
+        let hits = census(&[".observe_resource", "_floor("]);
         let expected: BTreeMap<String, usize> = [
-            // 3 = the corroborated-sizing chokepoint (cgroup_oom +
-            // disk_full ride ONE witness-driven call) + the
-            // corroborated-timeout lane (bug_102) + the
-            // corroborated-compute-bound lane (sh-012, the D4 cores
-            // axis on E3a).
-            ("actor/completion.rs".to_string(), 3),
+            // sh-041u: 1 = chokepoint #2 (the dispatch chokepoint
+            // before `match status` — every non-success worker close
+            // observes once; the per-handler axis mints collapsed).
+            ("actor/completion.rs".to_string(), 1),
             ("actor/housekeeping.rs".to_string(), 1),
-            // sh-039 (revised): the synchronous witnessed-clock
-            // establishment (`establish_from_witnessed`) — the
-            // synthesized verdict over a recorded witnessed mark runs
-            // the same witnessed-disposition bump the establishment
-            // sweep does, inline, so the durable row commits before
-            // the controller deletes the Job.
-            ("actor/pull.rs".to_string(), 1),
+            // 2 = chokepoint #3 (AD5 worker-abort short-circuit) +
+            // chokepoint #4 (`establish_from_witnessed` — the
+            // synchronous witnessed-clock establishment).
+            ("actor/pull.rs".to_string(), 2),
         ]
         .into();
-        assert_census(&hits, &expected, "bump_resource_floor callers")
-            .expect("the floor-promotion caller alphabet is census-pinned");
+        assert_census(&hits, &expected, "observe_resource_floor callers")
+            .expect("the floor-observe caller alphabet is census-pinned");
     }
 
-    // r[verify sched.trust.report-corroboration+4]
+    // r[verify sched.trust.report-corroboration+5]
     /// bug_132 commit 2 (W11-S, the R22″ machine-bind): the CA-face
     /// residual pricing is BOUND to the compensating control's firing
     /// predicate instead of self-reported prose. Two pinned needles
@@ -1608,7 +1597,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-corroboration+4]
+    // r[verify sched.trust.report-corroboration+5]
     /// bug_102 commit 4 (W12-L3's home; R31) -- the FLOOR-MUTATION
     /// census, [GEN-SET]: quantified over `resource_floor` MUTATION
     /// SITES derived from the embedded whole-crate universe, never
@@ -1630,16 +1619,15 @@ mod registration_writer_census {
     ///   typed WITNESS-EXEMPT: a LOAD lane re-importing previously
     ///   promoted persisted floors, raising-only and clamped; it
     ///   imports prior verdicts, never mints new ones) and the
-    ///   chokepoint's own interior (actor/floor.rs
-    ///   `bump_floor_or_count` -- reachable only through
-    ///   `bump_resource_floor`, whose witness demand is compile-
-    ///   enforced and whose caller alphabet is pinned by
-    ///   `bump_resource_floor_caller_census` -- the standing
-    ///   live_058-b caller census COMPOSES with this mutation census:
-    ///   callers there, write heads here, zero needle churn at the
-    ///   bug_102 hoist).
-    /// - the demand pin: exactly ONE floor-bump signature carries the
-    ///   typed `CorroborationWitness` parameter -- the chokepoint.
+    ///   chokepoint's own interior (actor/floor.rs `observe_peaks`
+    ///   -- reachable only through `observe_resource_floor`, whose
+    ///   reason demand is compile-enforced and whose caller alphabet
+    ///   is pinned by `observe_resource_floor_caller_census` -- the
+    ///   standing live_058-b caller census COMPOSES with this
+    ///   mutation census: callers there, write heads here).
+    /// - the demand pin: exactly ONE floor-observe signature carries
+    ///   the scheduler-minted `AttemptCloseReason` parameter -- the
+    ///   chokepoint.
     ///
     /// POPULATION face (census riders (a)): non-vacuity per derived
     /// family + the WO-named EXPECTED members verified (merge.rs
@@ -1680,13 +1668,17 @@ mod registration_writer_census {
             );
         }
 
-        // The demand pin: ONE witness-demanding bump signature.
-        let demand = census(&["witness: super::floor::Corroboration", "Witness"]);
+        // The demand pin: ONE observe signature carries the
+        // scheduler-minted close reason (sh-041u: the
+        // gate-inside-mutation shape — `AttemptCloseReason` is the
+        // typed reason a caller cannot construct from worker free
+        // text, replacing the retired typed witness parameter).
+        let demand = census(&["reason: super::floor::Attempt", "CloseReason"]);
         assert_eq!(
             demand.get("actor/completion.rs"),
             Some(&1),
-            "exactly one floor-bump chokepoint demands the typed \
-             corroboration witness"
+            "exactly one floor-observe chokepoint demands the \
+             scheduler-minted close reason"
         );
     }
 
@@ -1737,7 +1729,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-corroboration+4]
+    // r[verify sched.trust.report-corroboration+5]
     /// bug_090 commit 6 (W11-X, the R22″ derivation-layer form of
     /// W10-N): the worker→scheduler trust census derives PER-BOUNDARY
     /// from the PROTO SCHEMA — the field universe of the completion
@@ -1884,10 +1876,10 @@ mod registration_writer_census {
             ("CompletionReport.drv_path", "identity key; two-key resolve at intake (hash-or-path); never persisted raw"),
             ("CompletionReport.result", "the BuildResult payload — every sub-field priced below"),
             ("CompletionReport.assignment_token", "HMAC-verified at the pull boundary; the once-per-exec dedup anchor"),
-            ("CompletionReport.peak_memory_bytes", "telemetry; build_samples + the CGROUP_OOM corroborant (consumed ONLY through the corroboration gate vs the assigned shape)"),
+            ("CompletionReport.peak_memory_bytes", "the observe_peaks mem-axis input — consumed ONLY through the per-axis trust band vs the assigned shape (bug_090); also build_samples"),
             ("CompletionReport.peak_cpu_cores", "telemetry; build_samples only — no decision dispatches on it"),
             ("CompletionReport.node_name", "attribution; hw join + failed_builders exclusion key"),
-            ("CompletionReport.final_resources", "telemetry snapshot; build_samples only"),
+            ("CompletionReport.final_resources", "the observe_peaks disk/cores-axis input (peak_disk_bytes, cpu_seconds_total) — consumed ONLY through the per-axis trust band vs the assigned shape; also build_samples"),
             ("CompletionReport.hw_class", "attribution; sample normalization only"),
             ("CompletionReport.final_line_count", "log-completeness watermark; range-checked at the stamp (0/overflow → NULL)"),
             // ── BuildResult ─────────────────────────────────────
@@ -1899,14 +1891,14 @@ mod registration_writer_census {
             // matches this table's source text.
             (concat!("BuildResult.", "built_outputs"), "the W10-N taint object — shape/name/membership/evidence-gated per sched.trust.report-membership+4 (the per-consumer census above)"),
             ("BuildResult.store_degraded", "constructor-gated to the infra arm (C3); corroboration via the two-node sighting law before the uncharged class"),
-            ("BuildResult.failure_classification", "the bug_090 TYPED sizing channel — consumed ONLY through the corroboration gate (bump_floor_on_corroborated_claim: telemetry vs the assigned shape; refusals counted classify-only)"),
+            ("BuildResult.failure_classification", "the bug_090 TYPED sizing channel — consumed ONLY as the AttemptCloseReason::Infra(class) hard-event discriminant (observe_peaks: per-axis trust band vs the assigned shape; refusals counted classify-only)"),
             // ── FailureClassification ───────────────────────────
-            ("FailureClassification.class", "closed sizing alphabet; Unspecified/unknown decodes to NO claim (Q6 legacy)"),
-            ("FailureClassification.quota", "the DISK_FULL corroborant triple — verified against the assigned disk shape, never trusted bare"),
+            ("FailureClassification.class", "closed sizing alphabet; Unspecified/unknown decodes to NO hard claim (Q6 legacy)"),
+            ("FailureClassification.quota", "narration only (sh-041u — the disk-axis floor consumes final_resources.peak_disk_bytes, not QuotaTelemetry)"),
             // ── QuotaTelemetry ──────────────────────────────────
-            ("QuotaTelemetry.peak_used_bytes", "corroborant; must be ≥ half the claimed limit"),
-            ("QuotaTelemetry.hard_limit_bytes", "corroborant; must sit within [assigned/2, assigned×4]"),
-            ("QuotaTelemetry.node_free_bytes", "narration; the producer's predicate input (not re-verified — the limit/peak pair carries the corroboration)"),
+            ("QuotaTelemetry.peak_used_bytes", "narration only (sh-041u — no longer a floor-path consumer)"),
+            ("QuotaTelemetry.hard_limit_bytes", "narration only (sh-041u — the retired hard-limit band check is REPLACED by the peak_disk_bytes band)"),
+            ("QuotaTelemetry.node_free_bytes", "narration; the producer's predicate input (not re-verified)"),
             // ── BuiltOutput ─────────────────────────────────────
             ("BuiltOutput.output_name", "declared-name membership + dedup at both lanes"),
             ("BuiltOutput.output_path", "the flip axis — expected-set membership (IA/fixed) or production evidence (floating-CA), per the membership law"),

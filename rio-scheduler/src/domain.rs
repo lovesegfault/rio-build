@@ -171,7 +171,7 @@ pub struct BuildResult {
     /// uncharged pacing class at the completion intake.
     pub store_degraded: bool,
     /// bug_090: the typed sizing classification + corroboration
-    /// family — the ONLY channel `bump_resource_floor` consumes — quantifier: census(forged_free_text_never_moves_resource_floors) —
+    /// family — the ONLY channel `observe_resource_floor` consumes — quantifier: census(forged_free_text_never_moves_resource_floors) —
     /// (`error_msg` is display-only). Taint-preserving carry of the
     /// wire field; the corroboration gate in `completion.rs` is the
     /// consumer.
