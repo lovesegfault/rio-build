@@ -297,8 +297,9 @@ store:
     # `eks up` would have silently clobbered back. The clamp makes
     # the schedulable bound the deployed bound.
     # S3 is not a binding constraint: content-hashed chunk keys spread
-    # prefixes uniformly and ~46 replicas × chunkUploadMaxConcurrent=8
-    # ≈ 370 concurrent PUTs, orders below S3's per-prefix envelope.
+    # prefixes uniformly and ~46 replicas × the 256-permit replica-
+    # global gate ≈ 11.8k concurrent PUTs ceiling, well within S3's
+    # per-prefix envelope (≈3.5k/s; chunk-hash keys spread prefixes).
     # Replicas requested past node capacity simply stay Pending until
     # Karpenter mints a node or the pool limit is raised (the
     # AverageValue triggers divide by the scale subresource's count and
@@ -411,10 +412,10 @@ store:
   # admission (r[store.substitute.admission]) bounds how many
   # put_chunked calls run at once; this bounds fan-out WITHIN one.
   # Product `substituteAdmissionPermits × this` should sit under the
-  # aws-sdk's ~1024 connection pool with headroom — at the default
-  # admission=64 that's 512. Lower if DispatchFailure appears in
-  # store logs during large-NAR ingest (try s3MaxAttempts first).
-  chunkUploadMaxConcurrent: 8
+  # 64 per-ingest, capped by the replica-global 256-permit gate
+  # (opt-02). Lower if DispatchFailure appears in store logs during
+  # large-NAR ingest (try s3MaxAttempts first).
+  chunkUploadMaxConcurrent: 64
   # GetPath chunk-prefetch depth (.buffered(K)). Cold-cache throughput
   # ceiling ≈ K × 64KiB / s3_ttfb; per-stream memory ≤ K × 256KiB.
   # K=8 (the old hardcoded value) capped a cold 250MB path at ~3m
