@@ -251,13 +251,14 @@ mod label_tests {
             ("unspecified", "unspecified"),
             ("no_eligible_source", "no_eligible_source"),
         ]);
-        // Bidirectional pin (sh-042-r3): the loop below proves "every
-        // enum variant has a pinned row"; set-equality of pinned keys
-        // vs the enum's label image proves "every pinned row is
-        // reachable via some variant's label" — a stale entry or a
-        // label-collision orphan fails here. Count-equality alone
-        // does not: under a label collision the orphaned key is never
-        // `.get()`-ed and |P|=|V| still holds.
+        // Bidirectional pin (sh-042-r3): set-equality of pinned keys
+        // vs the enum's label image proves BOTH directions — every
+        // variant's label has a pinned row AND every pinned row is
+        // some variant's label (a stale entry or a label-collision
+        // orphan fails here; count-equality alone does not: under a
+        // label collision the orphaned key is never indexed and
+        // |P|=|V| still holds). The loop only checks VALUES — that
+        // each label's human rendering matches its pin.
         assert_eq!(
             pinned.keys().copied().collect::<HashSet<_>>(),
             AttemptTerminalKind::iter()
@@ -266,12 +267,9 @@ mod label_tests {
         );
         for kind in AttemptTerminalKind::iter() {
             let label = attempt_terminal_reason_label(kind);
-            let want = pinned
-                .get(label)
-                .unwrap_or_else(|| panic!("pinned human for new variant {kind:?} ({label:?})"));
             assert_eq!(
                 attempt_terminal_reason_human(label),
-                *want,
+                pinned[label],
                 "human rendering of label {label:?}"
             );
         }

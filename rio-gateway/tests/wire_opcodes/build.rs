@@ -1153,7 +1153,7 @@ async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
 /// supersede). Pre-fix RED: the duplicate-Started arm emitted nothing
 /// at all — `result_log_lines` is empty.
 #[tokio::test]
-async fn started_with_predecessor_emits_retry_marker_on_existing_aid() -> anyhow::Result<()> {
+async fn started_carrying_predecessor_emits_retry_marker_on_existing_aid() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     let target = "/nix/store/ccc-sh042.drv".to_string();
     let exec_a = "00000000-0000-0000-0000-00000000aaaa";
