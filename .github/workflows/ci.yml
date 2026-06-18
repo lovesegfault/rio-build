@@ -53,7 +53,7 @@ jobs:
       coverage: ${{ steps.gen.outputs.coverage }}
       coverage-paths: ${{ steps.gen.outputs.coverage-paths }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
       - name: Generate matrices from flake
         id: gen
@@ -143,7 +143,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.gen-matrix.outputs.warm) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
         with:
           drv-cache: 'true'
@@ -179,7 +179,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.gen-matrix.outputs.checks) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
         with:
           drv-cache: 'true'
@@ -209,7 +209,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.gen-matrix.outputs.checks-nowait) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
         with:
           drv-cache: 'true'
@@ -274,7 +274,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.gen-matrix.outputs.formal) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
         with:
           drv-cache: 'true'
@@ -310,7 +310,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.gen-matrix.outputs.formal-nowait) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
         with:
           drv-cache: 'true'
@@ -340,7 +340,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.gen-matrix.outputs.fuzz) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
         with:
           drv-cache: 'true'
@@ -362,7 +362,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.gen-matrix.outputs.vm-test) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
         with:
           kvm: true
@@ -390,7 +390,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.gen-matrix.outputs.coverage) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
         with:
           kvm: ${{ startsWith(matrix.name, 'vm-') }}
@@ -426,7 +426,7 @@ jobs:
     runs-on: rio-ci
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
       # gen-matrix already evaluated every coverage outPath; pass them
       # through so this step does zero flake eval — just parallel
