@@ -105,6 +105,30 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     })
     .await?;
 
+    // ── 3c. Delete completed rio-migrate Jobs ───────────────────────
+    // The migrate Job carries `helm.sh/resource-policy: keep` and lives
+    // in NS (excluded from WIPE_NAMESPACES), so it survives uninstall
+    // and the namespace wipe. Its name is content-hashed from the
+    // rendered pod template, so a same-tag redeploy after step 6 below
+    // empties the schema renders the IDENTICAL Job name → helm adopts
+    // the already-Complete Job → migrations never re-run →
+    // store/scheduler crash-loop on `assert_current` against the empty
+    // DB. (Mirrors the same-tag k3s/mod.rs guard, which deletes by
+    // label for the same content-hash reason.)
+    ui::step("delete completed rio-migrate Jobs", || async {
+        k(&[
+            "-n",
+            NS,
+            "delete",
+            "job",
+            "-l",
+            "app.kubernetes.io/name=rio-migrate",
+            "--ignore-not-found",
+        ])
+        .await
+    })
+    .await?;
+
     // ── 4. Wipe tenant keys ─────────────────────────────────────────
     // The only `rio-system` Secret we touch. The deploy phase recreates
     // it with just the operator's RIO_SSH_PUBKEY.
