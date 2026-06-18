@@ -1476,10 +1476,13 @@ mod bw8s1_budget {
         }
 
         // PutPath chunk whose charge exceeds the remainder: parks,
-        // then sheds typed within 10× the wait grace.
-        let chunk_len = 1000usize;
-        assert!(chunk_len > budget_bytes - d, "sizing pin: chunk > B − D");
-        let nar_b: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(15, chunk_len);
+        // then sheds typed within 10× the wait grace. The NAR must be
+        // structurally valid: persist_nar's `ParsedNar::parse` runs
+        // synchronously inside the first poll of the envelope-guarded
+        // tail, so a garbage payload short-circuits to InvalidArgument
+        // before the timeout this test asserts can fire.
+        let (nar_b, _h) = make_nar(&rio_test_support::fixtures::pseudo_random_bytes(15, 1000));
+        assert!(nar_b.len() > budget_bytes - d, "sizing pin: chunk > B − D");
         let path_b = test_store_path("bw8s1-r4-up");
         let info_b = make_path_info_for_nar(&path_b, &nar_b);
         let (tx_b, rx_b, _trailer) = holder_stream(info_b.clone().into(), nar_b.clone());
@@ -1531,14 +1534,15 @@ mod bw8s1_budget {
         let (client, _server) = spawn_store_server(service).await?;
 
         // Uncontended: a full upload succeeds under zero grace (the
-        // acquire is granted on first poll).
-        let nar_ok: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(16, 1024);
+        // acquire is granted on first poll). NARs are structurally
+        // valid (see `chunk_acquire_sheds_typed_after_wait_grace`).
+        let (nar_ok, _h) = make_nar(&rio_test_support::fixtures::pseudo_random_bytes(16, 1024));
         let info_ok = make_path_info_for_nar(&test_store_path("bw8s1-wg-ok"), &nar_ok);
         let mut c1 = client.clone();
         assert!(put_path(&mut c1, info_ok, nar_ok).await?);
 
         // Contended (holder pins most of the pool): immediate shed.
-        let nar_hold: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(17, 3500);
+        let (nar_hold, _h) = make_nar(&rio_test_support::fixtures::pseudo_random_bytes(17, 3500));
         let info_hold = make_path_info_for_nar(&test_store_path("bw8s1-wg-hold"), &nar_hold);
         let (tx, rx, _t) = holder_stream(info_hold.into(), nar_hold.clone());
         let mut c2 = client.clone();
@@ -1552,7 +1556,7 @@ mod bw8s1_budget {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let nar_b: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(18, 1000);
+        let (nar_b, _h) = make_nar(&rio_test_support::fixtures::pseudo_random_bytes(18, 1000));
         let info_b = make_path_info_for_nar(&test_store_path("bw8s1-wg-b"), &nar_b);
         let (_tx_b, rx_b, _t2) = holder_stream(info_b.into(), nar_b);
         let mut c3 = client.clone();

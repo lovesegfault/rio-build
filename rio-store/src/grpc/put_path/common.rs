@@ -2139,8 +2139,13 @@ mod drop_before_abort_tests {
             });
         let full = svc.nar_budget().available_permits();
 
-        // The placeholder the abort will try to reap.
-        let nar = vec![0u8; 1024 * 1024];
+        // The placeholder the abort will try to reap. The NAR must be
+        // structurally valid: persist_nar's `ParsedNar::parse` runs
+        // synchronously BEFORE the envelope-guarded PG writes, so a
+        // garbage payload short-circuits to InvalidArgument before the
+        // timeout this test asserts can fire.
+        let payload = vec![0u8; 1024 * 1024];
+        let (nar, _h) = rio_test_support::fixtures::make_nar(&payload);
         let mut info = make_path_info_for_nar(&test_store_path("w10j"), &nar);
         let claim = crate::metadata::insert_manifest_uploading(
             &db.pool,

@@ -1002,10 +1002,10 @@ mod tests {
         let _claim = claim_owned(&db.pool, &hash, "/nix/store/b2-dead").await;
         set_progress(&db.pool, &hash, 100).await;
         set_phase(&db.pool, &hash, Some("downloading")).await;
-        // Progress stale AND liveness stale (200s) — dead, pre-reap.
+        // Progress stale AND liveness stale (70s) — dead, pre-reap.
         sqlx::query(
-            "UPDATE manifests SET last_progress_at = now() - make_interval(secs => 200), \
-             updated_at = now() - make_interval(secs => 200) WHERE store_path_hash = $1",
+            "UPDATE manifests SET last_progress_at = now() - make_interval(secs => 70), \
+             updated_at = now() - make_interval(secs => 70) WHERE store_path_hash = $1",
         )
         .bind(&hash)
         .execute(&db.pool)
@@ -1028,10 +1028,10 @@ mod tests {
             _ => panic!("pre-reap dead owner must read Concurrent"),
         }
 
-        // Past the 300s reap threshold: the death arm reaps and the
-        // fresh claim carries ZERO strikes.
+        // Past the 90s reap threshold (SUBSTITUTE_STALE_THRESHOLD): the
+        // death arm reaps and the fresh claim carries ZERO strikes.
         sqlx::query(
-            "UPDATE manifests SET updated_at = now() - make_interval(secs => 400) \
+            "UPDATE manifests SET updated_at = now() - make_interval(secs => 120) \
              WHERE store_path_hash = $1",
         )
         .bind(&hash)
@@ -1066,10 +1066,10 @@ mod tests {
         let _claim = claim_owned(&db.pool, &hash, "/nix/store/b9-zero").await;
         set_phase(&db.pool, &hash, Some("downloading")).await;
         // NO set_progress: fetched_bytes/last_progress_at stay NULL —
-        // the claim-then-no-first-byte shape. Dead 200s (> the 60s
-        // test window, < the 300s reap threshold — the blind band).
+        // the claim-then-no-first-byte shape. Dead 70s (> the 60s
+        // test window, < the 90s reap threshold — the blind band).
         sqlx::query(
-            "UPDATE manifests SET updated_at = now() - make_interval(secs => 200) \
+            "UPDATE manifests SET updated_at = now() - make_interval(secs => 70) \
              WHERE store_path_hash = $1",
         )
         .bind(&hash)
@@ -1084,7 +1084,7 @@ mod tests {
             PlaceholderClaim::Owned(g) => g.defuse(),
             PlaceholderClaim::Concurrent => panic!(
                 "zero-progress dead claim must be takeover-eligible at the \
-                 stall window — Concurrent means the 300s blind spot is back"
+                 stall window — Concurrent means the 90s blind spot is back"
             ),
             PlaceholderClaim::AlreadyComplete => panic!("unexpected AlreadyComplete"),
         }
