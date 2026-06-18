@@ -683,64 +683,19 @@ pub struct Substituter {
     /// (e.g. `Some(ZERO)` = the pre-subscription immediate-Raced
     /// observable) via [`Self::with_raced_park`].
     raced_park_budget: Option<Duration>,
-    /// Test-only gate INSIDE the hash `spawn_blocking` closure: lets a
-    /// test hold the detached digest task mid-flight so the W-6a
-    /// reservation-residency law (budget credited back only after the
-    /// blocking task — which owns the NAR bytes — completes) is
-    /// assertable deterministically.
-    #[cfg(test)]
-    hash_gate: Option<HashGate>,
-    /// Test-only async gate at the head of `persist_nar`'s span (the
-    /// `hash_gate` seam form, one step later): models a black-holed
-    /// persist backend — rio-common's S3 client ships NO TimeoutConfig
-    /// by design (per-operation deadlines are the caller's duty,
-    /// Q-108), so an established-then-black-holed connection awaits
-    /// response headers forever. The W8-B′ red parks here and asserts
-    /// the call-site tail timeout releases the reservation by the hold
-    /// deadline. Async (`Notify`) so the tail `timeout` can CANCEL the
-    /// park — unlike the hash gate, whose `spawn_blocking` host tokio
-    /// never cancels (that lag is priced, not enforced).
+    /// Test-only async gate at the head of `persist_nar`'s span:
+    /// models a black-holed persist backend — rio-common's S3 client
+    /// ships NO TimeoutConfig by design (per-operation deadlines are
+    /// the caller's duty, Q-108), so an established-then-black-holed
+    /// connection awaits response headers forever. The W8-B′ red
+    /// parks here and asserts the call-site tail timeout releases the
+    /// reservation by the hold deadline. Also the W-6a in-frame
+    /// reservation-residency seam: with the digest folded into the
+    /// read loop the persist span is the only post-read park left,
+    /// and async `Notify` means the tail `timeout` (and a test
+    /// `abort()`) can cancel it.
     #[cfg(test)]
     persist_gate: Option<Arc<tokio::sync::Notify>>,
-}
-
-/// Test hook: a sync gate the hash `spawn_blocking` closure holds on.
-/// `hold()` signals entry (tokio unbounded send — sync, callable from
-/// the blocking thread) then parks on a condvar until `release()`.
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct HashGate {
-    entered: tokio::sync::mpsc::UnboundedSender<()>,
-    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-}
-
-#[cfg(test)]
-impl HashGate {
-    pub(crate) fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<()>) {
-        let (entered, rx) = tokio::sync::mpsc::unbounded_channel();
-        (
-            Self {
-                entered,
-                release: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
-            },
-            rx,
-        )
-    }
-
-    fn hold(&self) {
-        let _ = self.entered.send(());
-        let (m, c) = &*self.release;
-        let mut released = m.lock().unwrap();
-        while !*released {
-            released = c.wait(released).unwrap();
-        }
-    }
-
-    pub(crate) fn release(&self) {
-        let (m, c) = &*self.release;
-        *m.lock().unwrap() = true;
-        c.notify_all();
-    }
 }
 
 /// Default NAR-buffer budget when no shared semaphore is wired:
@@ -1044,6 +999,11 @@ impl NarBudgetReservation {
 /// no semaphore, so an incremental per-read acquire does not
 /// typecheck here.
 ///
+/// Returns the buffered bytes AND their incremental sha256 — the
+/// digest is folded into the read (one `update` per 64 KiB, same
+/// shape as PutPath's `accumulate_chunk`), so the caller never
+/// re-walks the buffer.
+///
 /// Caps, in precedence order per read: a stream exceeding its DECLARED
 /// size fails as `SizeMismatch` during the read (the reservation
 /// covers exactly `declared`, so buffered bytes stay ≤ reservation by
@@ -1062,7 +1022,8 @@ async fn read_nar_capped(
     progress_handle: Option<&ingest::ProgressHandle>,
     upstream_base: &str,
     reservation: &NarBudgetReservation,
-) -> Result<Vec<u8>, SubstituteError> {
+) -> Result<(Vec<u8>, [u8; 32]), SubstituteError> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
     let stalled = || SubstituteError::Stalled { window: stall };
     let envelope = reservation.envelope();
     let deadline_exceeded = || SubstituteError::HoldDeadlineExceeded {
@@ -1073,8 +1034,24 @@ async fn read_nar_capped(
     // heap for the buffer is bounded by the reservation (+1 sentinel
     // byte) at every instant — no doubling overshoot.
     let mut out = Vec::with_capacity((declared.min(cap) as usize).saturating_add(1));
+    let mut hasher = sha2::Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut last_progress = 0u64;
+    // opt-04(yield): on multi_thread (production — `main.rs` is bare
+    // `#[tokio::main]`), shed the tokio worker for the xz/zstd decode
+    // inside `capped.read()` via `block_in_place(|| block_on(…))`. The
+    // per-read `timeout` MUST live INSIDE `block_on` — a `timeout`
+    // outside `block_in_place` cannot preempt the synchronous wrap, so
+    // the Stalled/HoldDeadlineExceeded discrimination would never
+    // fire on a wedged read. On current_thread / no-runtime keep the
+    // plain `.await` verbatim: `block_in_place` panics there, and
+    // `block_on` from inside an already-driven runtime panics
+    // independently — `cas::cpu_bound` cannot host this because its
+    // inline fallback would still hit the second panic.
+    let shed_decode = matches!(
+        Handle::try_current().map(|h| h.runtime_flavor()),
+        Ok(f) if f != RuntimeFlavor::CurrentThread
+    );
     loop {
         // r[impl store.substitute.stall-abort+2]
         // Per-read stall clock: each successful read restarts it, so a
@@ -1087,7 +1064,12 @@ async fn read_nar_capped(
         // deadline can never preempt a single healthy read's window
         // until integral slowness has already burned the grace.
         let per_read = stall.min(envelope.remaining());
-        let n = match tokio::time::timeout(per_read, capped.read(&mut buf)).await {
+        let read_once = tokio::time::timeout(per_read, capped.read(&mut buf));
+        let n = match if shed_decode {
+            tokio::task::block_in_place(|| Handle::current().block_on(read_once))
+        } else {
+            read_once.await
+        } {
             Ok(r) => r.map_err(|e| SubstituteError::Fetch(format!("{nar_url} body: {e}")))?,
             // Which clock fired? If the hold deadline has passed, this
             // is the envelope abort (typed; credits the budget back by
@@ -1108,6 +1090,10 @@ async fn read_nar_capped(
             return Err(deadline_exceeded());
         }
         out.extend_from_slice(&buf[..n]);
+        // Incremental digest, post-re-adoption: 64 KiB sha256 ≈ tens
+        // of µs — negligible on the worker, so only the decode is
+        // shed.
+        hasher.update(&buf[..n]);
         if out.len() as u64 > declared {
             // Over-delivery against the declaration: fail DURING the
             // read (pre-fix this was caught only after full buffering).
@@ -1139,7 +1125,7 @@ async fn read_nar_capped(
             }
         }
     }
-    Ok(out)
+    Ok((out, hasher.finalize().into()))
 }
 
 /// The placeholder-listener retry budget (bug_172): the
@@ -1255,8 +1241,6 @@ impl Substituter {
             raced_park_fallback: RACED_PARK_FALLBACK_POLL,
             raced_park_budget: None,
             #[cfg(test)]
-            hash_gate: None,
-            #[cfg(test)]
             persist_gate: None,
         }
     }
@@ -1275,15 +1259,9 @@ impl Substituter {
         self
     }
 
-    /// Test-only: install the hash gate (see [`HashGate`]).
-    #[cfg(test)]
-    pub(crate) fn with_hash_gate(mut self, gate: HashGate) -> Self {
-        self.hash_gate = Some(gate);
-        self
-    }
-
     /// Test-only: install the persist gate (see the field doc) — the
-    /// W8-B′ black-holed-persist seam.
+    /// W8-B′ black-holed-persist seam and the W-6a in-frame
+    /// reservation-residency seam.
     #[cfg(test)]
     pub(crate) fn with_persist_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
         self.persist_gate = Some(gate);
@@ -2368,7 +2346,7 @@ impl Substituter {
             .await?;
             IngestStage::BudgetPark.record(t);
             let nar_url = format!("{base}/{}", ni.url);
-            let (nar_bytes, reservation) = self
+            let (nar_bytes, got_hash, reservation) = self
                 .fetch_nar(
                     http,
                     tenant_id,
@@ -2411,57 +2389,33 @@ impl Substituter {
             // reservation by drop (the drop-guard above owns
             // placeholder cleanup on the implicit-drop path;
             // `put_chunked`'s internal rollback contract is
-            // unchanged). The one remaining NAMED premise is the hash
-            // compute bound (~10 s / 4 GiB): the `spawn_blocking`
-            // digest task is non-cancellable, so on timeout its
-            // completion still drops the moved reservation — that lag
-            // is PRICED slack on top of the enforced deadline, never
-            // a replacement for it (W-6a's credit-back-at-free
-            // property is preserved).
+            // unchanged). The hash check is now an inline 32-byte
+            // compare (the digest was folded into the read loop), so
+            // there is no detached compute span left to price.
             let tail_envelope = *reservation.envelope();
             let tail = async {
-                // Hash-check the decompressed NAR against the
-                // narinfo's claim — off the async runtime (4 GiB ≈
-                // 8-10s of pure compute would otherwise stall a tokio
-                // worker). `Bytes` is cheap-clone; move it in and back
-                // out alongside the digest.
-                //
                 // r[impl store.put.nar-bytes-budget+6]
-                // §3.2 step 4 (live_047/R-C): the RESERVATION rides
-                // the bytes through the detach. tokio never cancels
-                // blocking tasks, so dropping this future at the
-                // JoinHandle await leaves the digest task owning the
-                // full buffer — were the reservation parked in this
-                // frame, cancellation would credit the budget back
-                // while the bytes remain resident. Moving it into the
-                // closure ties credit-back to the moment the memory
-                // actually frees (the task's output drops). W-6a
-                // asserts this.
-                #[cfg(test)]
-                let hash_gate = self.hash_gate.clone();
+                // §3.2 step 4 (live_047/R-C): `nar_bytes` and the
+                // reservation co-reside in this ONE cancellable async
+                // frame — cancelling the leg drops both atomically,
+                // and `cas::cpu_bound` (the only post-read compute
+                // span) is `block_in_place`, not `spawn_blocking`, so
+                // it cannot outlive a cancel. There is no detach
+                // point left where the buffer can survive a dropped
+                // reservation; W-6a (rewritten to gate at
+                // `persist_gate`) asserts the in-frame hold.
+                let _reservation = reservation;
+                // opt-07 stage emit, re-homed: brackets the inline
+                // 32-byte compare (records ~µs — that IS the proof
+                // opt-04 worked).
                 let t = Instant::now();
-                // `_reservation`: re-bound here and held to the end of
-                // this block — the budget is credited back only after
-                // `persist_nar` returns (today's permit lifetime).
-                let (nar_bytes, _reservation, got_hash) = tokio::task::spawn_blocking(
-                    move || -> (Bytes, NarBudgetReservation, [u8; 32]) {
-                        #[cfg(test)]
-                        if let Some(g) = &hash_gate {
-                            g.hold();
-                        }
-                        let h = sha2::Sha256::digest(&nar_bytes).into();
-                        (nar_bytes, reservation, h)
-                    },
-                )
-                .await
-                .map_err(|e| SubstituteError::Ingest(format!("hash task join: {e}")))?;
-                IngestStage::Sha256.record(t);
                 if got_hash != expected_hash {
                     return Err(SubstituteError::HashMismatch {
                         expected: hex::encode(expected_hash),
                         got: hex::encode(got_hash),
                     });
                 }
+                IngestStage::Sha256.record(t);
 
                 // Size + hash verified — `info.nar_size` (set in
                 // `narinfo_to_validated` from `ni.nar_size`) now
@@ -2591,8 +2545,9 @@ impl Substituter {
     /// GET the NAR body and decompress. Takes the caller's whole-NAR
     /// [`NarBudgetReservation`] (acquired BEFORE the GET — the budget
     /// park never rides an open upstream socket) and returns it with
-    /// the raw NAR bytes; the caller carries the reservation through
-    /// the hash detach and holds it until after `persist_nar`.
+    /// the raw NAR bytes plus their incremental sha256; the caller
+    /// holds the reservation through the inline hash compare and
+    /// `persist_nar`.
     ///
     /// Accumulates fully before ingest — `cas::put_chunked` needs the
     /// whole `&[u8]` for FastCDC. Streaming-chunker would avoid the
@@ -2609,7 +2564,7 @@ impl Substituter {
         progress: Option<&SubstProgressFn>,
         progress_handle: Option<&ingest::ProgressHandle>,
         reservation: NarBudgetReservation,
-    ) -> Result<(Bytes, NarBudgetReservation), SubstituteError> {
+    ) -> Result<(Bytes, [u8; 32], NarBudgetReservation), SubstituteError> {
         let t = Instant::now();
         // r[impl store.substitute.stall-abort+2]
         // Owner-side stall watchdog: the NAR GET deliberately has no
@@ -2687,7 +2642,7 @@ impl Substituter {
             }
         };
 
-        let out = read_nar_capped(
+        let (out, digest) = read_nar_capped(
             &mut capped,
             declared,
             cap,
@@ -2705,7 +2660,7 @@ impl Substituter {
             cb(out.len() as u64, expected_nar_size, upstream_base);
         }
         IngestStage::Fetch.record(t);
-        Ok((Bytes::from(out), reservation))
+        Ok((Bytes::from(out), digest, reservation))
     }
 
     // r[impl store.substitute.sig-mode]
@@ -8070,16 +8025,15 @@ fn rogue_reserve(budget: &std::sync::Arc<tokio::sync::Semaphore>, declared: u64)
     }
 
     // r[verify store.put.nar-bytes-budget+6]
-    /// W-6a reservation-residency: cancelling the substitute leg at
-    /// the hash-verify detach point MUST NOT credit the budget back
-    /// while the DETACHED blocking task (tokio never cancels blocking
-    /// tasks) still owns the NAR bytes — the reservation rides the
-    /// bytes INTO the `spawn_blocking` closure and is credited back
-    /// only when the hash task's output drops. Without the coupling
-    /// the permits lived in the dropped future's frame: budget freed
-    /// while the full buffer was still resident in the detached task
-    /// (§3.2 step 4 — the regime the abort-latch cancellation makes
-    /// steady-state at F>1).
+    /// W-6a reservation-residency, in-frame form: with the digest
+    /// folded into the read loop there is no detach point — `nar_bytes`
+    /// and the reservation co-reside in ONE cancellable async frame.
+    /// Property: while a leg is parked in the post-read tail (the
+    /// persist seam) the reservation is held; cancelling the leg drops
+    /// bytes AND reservation atomically, crediting the budget back.
+    /// Regression guard for §3.2 step 4: were the reservation rebound
+    /// outside the `tail` block it would drop at fetch-return and the
+    /// parked-phase assertion below would see a fully restored pool.
     #[tokio::test]
     async fn budget_reservation_rides_the_hash_bytes_across_cancel() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -8091,49 +8045,86 @@ fn rogue_reserve(budget: &std::sync::Arc<tokio::sync::Semaphore>, declared: u64)
 
         let budget_size = 4096usize;
         let budget = crate::budget::NarBudget::new(budget_size);
-        let (gate, mut entered) = HashGate::new();
+        let persist_gate = Arc::new(tokio::sync::Notify::new());
         let sub = Arc::new(
             test_substituter(db.pool.clone())
                 .with_nar_budget(budget.clone())
-                .with_hash_gate(gate.clone()),
+                .with_persist_gate(persist_gate.clone()),
         );
         let reserve = (nar.len() as u64).max(MIN_NAR_CHUNK_CHARGE as u64) as usize;
 
         let sub2 = Arc::clone(&sub);
         let p = path.clone();
         let task = tokio::spawn(async move { sub2.try_substitute(tid, &p).await });
-        entered.recv().await.expect("hash task entered");
+        // Wait until the leg has reserved and reached the post-read
+        // tail (persist seam — past the inline hash compare).
+        let wait = tokio::time::Instant::now() + Duration::from_secs(10);
+        while budget.available_permits() == budget_size {
+            assert!(tokio::time::Instant::now() < wait, "leg never reserved");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             budget.available_permits(),
             budget_size - reserve,
-            "the reservation is held while the hash task owns the bytes"
+            "the reservation is held while the leg sits in the post-read tail"
         );
-        // Cancel the leg at the hash-verify detach point.
+        // Cancel the leg parked at the persist gate: bytes and
+        // reservation co-reside in the dropped frame.
         task.abort();
         let _ = task.await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Snapshot BEFORE releasing the gate (the release must happen
-        // unconditionally or the parked blocking thread outlives the
-        // test runtime), then assert on the snapshot.
-        let resident = budget.available_permits();
-        // Let the detached hash finish: its output (bytes + reservation
-        // + digest) drops inside tokio, crediting the budget back.
-        gate.release();
-        assert_eq!(
-            resident,
-            budget_size - reserve,
-            "budget credited back while the detached hash task still owns the \
-             NAR bytes — the reservation must ride the bytes through \
-             spawn_blocking, not drop with the cancelled future"
-        );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while budget.available_permits() != budget_size {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "reservation never credited back after the hash task completed"
+                "cancelled leg failed to credit back — reservation outlived the \
+                 NAR bytes' frame"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let _ = persist_gate;
+    }
+
+    /// opt-04 oracle: the incremental digest folded into
+    /// [`read_nar_capped`] equals the one-shot `Sha256::digest` over
+    /// the buffered output, across a multi-iteration (>64 KiB) read.
+    #[tokio::test]
+    async fn read_nar_capped_incremental_digest_matches_one_shot() {
+        let raw = rio_test_support::fixtures::pseudo_random_bytes(7, 200 * 1024);
+        let declared = raw.len() as u64;
+        let budget = crate::budget::NarBudget::new(MAX_NAR_SIZE as usize);
+        let env = NarHoldEnvelope::for_declared(
+            declared,
+            DEFAULT_SUBSTITUTE_STALL_WINDOW,
+            NAR_HOLD_FLOOR_RATE,
+        );
+        let reservation = NarBudgetReservation::reserve(
+            &budget,
+            Uuid::new_v4(),
+            TENANT_RESERVATION_CAP,
+            declared,
+            env,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut capped: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+            Box::new(std::io::Cursor::new(raw.clone()));
+        let (out, got) = read_nar_capped(
+            &mut capped,
+            declared,
+            declared,
+            DEFAULT_SUBSTITUTE_STALL_WINDOW,
+            "test://nar",
+            None,
+            None,
+            "test://",
+            &reservation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, raw);
+        let one_shot: [u8; 32] = sha2::Sha256::digest(&out).into();
+        assert_eq!(got, one_shot, "incremental digest must equal one-shot");
     }
 
     // r[verify store.substitute.untrusted-upstream+3]

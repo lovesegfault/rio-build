@@ -54,8 +54,9 @@ pub enum IngestStage {
     /// NAR body GET + decompress (`read_nar_capped`). Success path
     /// only; the three early-return error arms record nothing.
     Fetch,
-    /// Post-decompress hash-check `spawn_blocking` (`.await` bracket —
-    /// includes blocking-pool queue time).
+    /// NAR-hash verify — the inline 32-byte compare (the digest is
+    /// folded into `read_nar_capped`; opt-04). Records ~µs by design;
+    /// a non-µs reading means the second-pass digest regressed.
     Sha256,
     /// `chunker::chunk_nar` — FastCDC + per-chunk BLAKE3.
     Chunk,
