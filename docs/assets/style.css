@@ -44,8 +44,11 @@ body {
        local("NewComputerModernMath"),
        url("/assets/fonts/NewCMMath-Regular.otf") format("opentype");
 }
+/* MathML: additive only — UA stylesheet's `display: block math` and
+   centring are load-bearing; overriding `display` or `font-family` to
+   non-math values breaks the formatting context. */
 math { font-family: "NewComputerModernMath", math; font-size: 1.1em; }
-math[display="block"] { display: block; margin: 1.1em auto; text-align: center; }
+math[display="block"] { margin-block: 1.1em; }
 /* pagefind UI inherits theme via vars */
 .pagefind-ui { --pagefind-ui-primary: var(--accent); --pagefind-ui-text: var(--fg);
   --pagefind-ui-background: var(--bg); --pagefind-ui-border: var(--rule); }
