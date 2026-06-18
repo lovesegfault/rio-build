@@ -7,9 +7,10 @@
 # one `tofu apply`, terraform owns the lifecycle. The chart bundles its
 # own CRDs (prometheus-operator's) via the crds/ dir — helm installs
 # those on first `helm install` and never touches them on upgrade. A
-# major bump that changes CRDs needs a manual `kubectl apply
-# --server-side -f https://.../stripped-down-crds.yaml` first; see the
-# chart's UPGRADING.md.
+# chart-major bump that changes CRDs needs them re-applied first; the
+# crds.upgradeJob set below does that in-cluster (server-side apply +
+# --force-conflicts), so no manual `kubectl apply` step. See the chart's
+# UPGRADE.md for the per-major notes.
 
 resource "helm_release" "kube_prometheus_stack" {
   name             = "kube-prometheus-stack"
@@ -19,8 +20,9 @@ resource "helm_release" "kube_prometheus_stack" {
   chart            = "kube-prometheus-stack"
   # Hardcoded (not nix/pins.toml) — same as external-secrets: not exercised
   # by VM tests, so no nix↔tofu pin to keep in sync. Bump alongside
-  # kubernetes_version; check chart's kubeVersion constraint.
-  version = "83.7.0"
+  # kubernetes_version; check chart's kubeVersion constraint and UPGRADE.md
+  # (chart-major = prometheus-operator CRD bump; 86.x = operator v0.91.0).
+  version = "86.2.3"
 
   set = [
     # Chart-managed CRD migration. The Job runs `kubectl apply -f` of
