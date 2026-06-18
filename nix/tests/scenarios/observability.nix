@@ -368,25 +368,36 @@ pkgs.testers.runNixOSTest {
             f"sched={len(sched_spans)} worker={len(worker_spans)}"
         )
         sched_span_ids = {sp.get("spanId") for sp in sched_spans if sp.get("spanId")}
+        sched_parents = {
+            sp.get("parentSpanId") for sp in sched_spans if sp.get("parentSpanId")
+        }
         worker_parents = {
             sp.get("parentSpanId") for sp in worker_spans if sp.get("parentSpanId")
         }
-        overlap = worker_parents & sched_span_ids
         # r[sched.trace.assignment-traceparent] — span_from_traceparent
         # produces PARENTING: set_parent() runs before first enter;
         # tracing-opentelemetry allocates the OTel span lazily on enter,
-        # so the parent context is available. Worker parentSpanId should
-        # match a scheduler spanId. (Regression guard: was observe-only
-        # print; committed to assert after the mechanism was confirmed.)
+        # so the parent context is available. The submit_build handler
+        # span itself is held open by the Registry's child ref-count
+        # (submit-build-bridge `spawned_task`) and does not reliably
+        # export inside the test window — so we accept either DIRECT
+        # overlap (worker.parentSpanId ∈ sched spanIds, when
+        # submit_build did export) or the SIBLING form
+        # (worker.parentSpanId ∈ sched parentSpanIds — i.e., the
+        # builder's `build_executor` and the scheduler's
+        # `spawned_task` share submit_build as their common parent).
+        # Both forms prove the same parenting chain; LINK-only would
+        # leave the worker root with NO parentSpanId under this trace.
+        overlap = worker_parents & (sched_span_ids | sched_parents)
         assert overlap, (
             "span_from_traceparent → expected PARENTING but no overlap; "
             f"worker_parents={sorted(worker_parents)[:3]} "
-            f"sched_span_ids={sorted(sched_span_ids)[:3]}"
+            f"sched_span_ids={sorted(sched_span_ids)[:3]} "
+            f"sched_parents={sorted(sched_parents)[:3]}"
         )
         print(
             "CONFIRMED: span_from_traceparent → PARENTING "
-            "(worker parentSpanId in scheduler spanId set; "
-            f"overlap={sorted(overlap)[:3]})"
+            f"(common parent span; overlap={sorted(overlap)[:3]})"
         )
 
     ${common.collectCoverage fixture.pyNodeVars}

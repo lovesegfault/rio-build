@@ -550,7 +550,7 @@ pub enum AttemptEvent<Id> {
     /// the partition-aware provisionable max when this attempt
     /// corroborated compute-bound — the
     /// [`PoisonReason::ComputeBoundAtCap`] arm. The cores axis is the
-    /// ONLY floor dimension an `ExecutorVariant` row carries
+    /// only floor dimension an `ExecutorVariant` row carries
     /// (`corroborated_compute_bound` is the sole witness mint on the
     /// E3a path), so `floor_at_cap` on an executor-variant ledger row
     /// IS the compute-bound-at-cap signal — quantifier:

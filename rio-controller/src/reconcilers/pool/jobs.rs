@@ -2783,10 +2783,15 @@ pub(super) fn note_live_strike(pool: &candidate::PoolKey, uid: &str) {
 
 /// Is `(pool, uid)`'s live observation inside the wall floor?
 pub(super) fn live_strike_recent(pool: &candidate::PoolKey, uid: &str) -> bool {
+    // R29' deadline-shaped on the row's own monotonic stamp (same
+    // Instant domain as `note_live_strike`): `now − t < FLOOR`, the
+    // [`StrikeEntry::expired`] idiom — not `.elapsed() <` (the
+    // un-named-gate grammar). Clock row: live-strike-wall-floor.
+    let now = std::time::Instant::now();
     LIVE_STRIKES
         .lock()
         .get(pool, uid)
-        .is_some_and(|t| t.elapsed() < STRIKE_WALL_FLOOR)
+        .is_some_and(|t| now.saturating_duration_since(*t) < STRIKE_WALL_FLOOR)
 }
 
 /// Test seam (the [`backdate_strikes_for_test`] sibling): age every

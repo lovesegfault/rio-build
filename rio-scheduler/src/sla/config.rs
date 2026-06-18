@@ -846,7 +846,7 @@ impl SlaConfig {
     /// sh-031b: the partition-aware PROVISIONABLE cores cap — the
     /// largest [`Self::class_ceilings`] core ceiling over the hwClass
     /// partition that (i) [`Self::class_routes`] admits for `(arch,
-    /// features)` (the SAME feature/arch ∅-guard `h_all_filter` uses
+    /// features)` (the same feature/arch ∅-guard `h_all_filter` uses
     /// at solve time), AND (ii) is not fully ICE-masked (every
     /// configured `(h, cap)` cell masked → class excluded; one
     /// unmasked cell → class counts). Returns `0` when the routed
@@ -857,7 +857,7 @@ impl SlaConfig {
     /// This is the cap the cores `resource_floor` and the
     /// `ClampedFloor` projection bound against (replacing the
     /// catalog-absolute `Ceilings.max_cores`, which admits classes the
-    /// drv can never route to — sh-031b: a 191-core floor against a
+    /// drv cannot route to — sh-031b: a 191-core floor against a
     /// 96-core provisionable partition requeued forever).
     pub fn provisionable_max_cores(
         &self,

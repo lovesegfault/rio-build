@@ -7962,7 +7962,7 @@ async fn floor_cores_above_provisionable_with_metal_masked_solves_hi_class() {
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor =
         bare_actor_prov_max(db.pool.clone(), &[("metal-a", 192, &[]), ("hi-a", 96, &[])]);
-    // ICE-mask EVERY (metal-a, *) cell — `exhausted([metal-a])` = true.
+    // ICE-mask every (metal-a, *) cell — `exhausted([metal-a])` = true.
     for cap in CapacityType::ALL {
         actor.ice.mark(&("metal-a".into(), cap));
     }
@@ -8016,7 +8016,7 @@ async fn floor_cores_above_provisionable_with_metal_masked_solves_hi_class() {
 // r[verify sched.floor.compute-bound-provisionable]
 /// **sh-031b red-first (iii — the kvm feature partition)** —
 /// *proposition: `provisionable_max_cores` and the cores-floor bump
-/// respect the FEATURE partition (the SAME [`SlaConfig::class_routes`]
+/// respect the FEATURE partition (the same [`SlaConfig::class_routes`]
 /// `h_all_filter` uses), so a kvm drv whose only routable class
 /// (`metal-x86`, `provides=[kvm]`, 48c) is SMALLER than the
 /// featureless global max (`hi-x86`, 96c) caps at 48 — never at 96.*
@@ -8056,7 +8056,7 @@ async fn floor_cores_kvm_partition_caps_at_metal_max_not_featureless_global() {
     // Drive a corroborated ComputeBound bump from last_intent.cores=32
     // through `bump_floor_or_count` with the partition's prov_max
     // threaded (the production `bump_resource_floor` chokepoint
-    // computes the SAME `prov_max` from `(feat, arch, ice)` — its
+    // computes the same `prov_max` from `(feat, arch, ice)` — its
     // composition is census-pinned at
     // `bump_resource_floor_caller_census` and exercised by the
     // floor.rs unit-level jump-to-max test).

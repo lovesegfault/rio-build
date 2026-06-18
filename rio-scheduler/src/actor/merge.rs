@@ -1748,7 +1748,7 @@ impl DagActor {
                 Ok(Ok(r)) => {
                     self.cache_breaker.record_success();
                     let r = r.into_inner();
-                    // Extend EVERY response field — pre-S1 this arm
+                    // Extend every response field — pre-S1 this arm
                     // assigned `resp = r` whole. types.proto MUST treat
                     // `indeterminate_paths` optimistically; dropping
                     // the residual probe's `indeterminate` here would
@@ -3007,7 +3007,7 @@ impl DagActor {
     /// A handler-side failure is `Some(Err)`, never `None` —
     /// production never re-probes in-actor on a handler error.
     ///
-    /// Breaker fold ONLY (side effect, no data) — the response itself
+    /// Breaker fold only (side effect, no data) — the response itself
     /// is borrowed from `precomputed_probe.as_ref()` at every phase
     /// that reads it, so a 14k-node / ~29k-path response is never
     /// deep-cloned inside the actor turn.

@@ -2519,11 +2519,11 @@ impl DagActor {
         let want_arch = rio_common::k8s::system_to_k8s_arch(&state.system);
         // r[impl sched.floor.compute-bound-provisionable]
         // sh-031b: the partition-aware provisionable cores cap — the
-        // largest `class_ceilings(h).0` over the SAME (feat, arch,
+        // largest `class_ceilings(h).0` over the same (feat, arch,
         // ¬ICE-exhausted) partition `h_all_filter` admits below.
         // Threaded into every `ClampedFloor::of` cores projection in
         // this fn AND composed into `eff_min` so a `floor.cores` above
-        // the partition's max can never empty `h_all`. Time-varying
+        // the partition's max cannot empty `h_all`. Time-varying
         // (read fresh per solve, so an ICE re-open between bump and
         // dispatch re-admits the larger class).
         let prov_max = self.sla_config.provisionable_max_cores(

@@ -119,6 +119,12 @@ CLOCK_ROWS = {
     # degradation/recovery clock (R34-w does not apply — the warn never
     # CLEARS anything).
     "auth-rejection-warn-burst": ("landed", "S6", "rio-auth/src/jwt_interceptor.rs", r"REJECTION_WARN_BURST_WINDOW"),
+    # sh-037 S11 (LIVE_STRIKES): the live-observation wall-floor gate —
+    # deadline-shaped on the ledger row's own monotonic Instant (now −
+    # stamp vs STRIKE_WALL_FLOOR; same Instant domain as
+    # note_live_strike, the StrikeEntry::expired idiom). The clock
+    # description lives in the anchor's doc per the row convention.
+    "live-strike-wall-floor": ("landed", "S11", "rio-controller/src/reconcilers/pool/jobs.rs", r"STRIKE_WALL_FLOOR"),
 }
 
 # The lossy-witness-arithmetic grammar (live from birth): seconds
