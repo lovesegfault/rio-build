@@ -111,10 +111,12 @@ locals {
 resource "aws_rds_cluster" "rio" {
   cluster_identifier = "${var.cluster_name}-pg"
   engine             = "aurora-postgresql"
-  # 17.x: latest Aurora-supported major as of writing. Aurora lags
+  # 18.x: latest Aurora-supported major as of writing. Aurora lags
   # upstream PG by ~6 months. Check `aws rds describe-db-engine-
   # versions --engine aurora-postgresql` if this errors on apply.
-  engine_version              = "17.10"
+  # Major bumps on a live cluster: see docs/ops/eks-smoke.typ "Aurora
+  # major-version upgrade" — `terraform apply` alone is NOT enough.
+  engine_version              = "18.3"
   allow_major_version_upgrade = true
   # "provisioned" + serverlessv2_scaling_configuration = Serverless v2.
   # engine_mode "serverless" is Serverless V1 (deprecated, don't use).

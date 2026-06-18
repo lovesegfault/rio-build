@@ -168,6 +168,36 @@ kubectl -n rio-builders delete pool smoke-test
 helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for full teardown
 ```
 
+= Aurora major-version upgrade (17→18, 18→19, …)
+
+Bumping `engine_version` across a major in `infra/eks/rds.tf` and
+running `terraform apply` will *attempt* an in-place major upgrade
+(the cluster has `allow_major_version_upgrade = true` and
+`apply_immediately = true`). On a dev cluster that is fine — Aurora
+takes the writer offline for the upgrade window (minutes), and
+`skip_final_snapshot = true` so there is no pre-upgrade snapshot.
+
+For a cluster with data you care about, do NOT let terraform drive
+the upgrade. Instead:
+
++ Snapshot first: `aws rds create-db-cluster-snapshot
+  --db-cluster-identifier <name>-pg --db-cluster-snapshot-identifier
+  <name>-pg-preNN`.
++ Prefer Blue/Green: `aws rds create-blue-green-deployment
+  --source arn:aws:rds:...:cluster:<name>-pg --target-engine-version
+  NN.x` → validate the green cluster → switchover. Downtime is the
+  switchover window (\~1min), not the upgrade window.
++ In-place fallback: `aws rds modify-db-cluster --db-cluster-identifier
+  <name>-pg --engine-version NN.x --allow-major-version-upgrade
+  --apply-immediately`. Then `terraform apply` to reconcile state.
++ Post-upgrade: re-run the `xtask deploy` PG preflight (it asserts
+  `max_connections` against the modeled `pg_max_connections` output —
+  the value is keyed on ACU range, not engine major, so it should
+  match unchanged).
+
+No custom parameter group is defined (rds.tf), so Aurora uses
+`default.aurora-postgresqlNN` automatically — nothing to re-create.
+
 = Troubleshooting Matrix
 
 #table(
