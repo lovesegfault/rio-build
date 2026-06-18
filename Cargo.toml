@@ -197,6 +197,9 @@ governor = "0.10"
 fastcdc = "4"
 # Chunk addressing (internal only — never exposed to Nix).
 blake3 = "1"
+# Data-parallel per-chunk BLAKE3 (chunker.rs phase 2). Own global
+# pool — composes with tokio's block_in_place (cas.rs cpu_bound).
+rayon = "1"
 # In-process chunk cache. Lock-free, weight-based eviction — moka tracks
 # byte-size per entry so the 2GB cap is a real memory bound, not just an
 # entry count. Singleflight wraps the miss path.

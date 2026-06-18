@@ -50,6 +50,7 @@ server = [
   "dep:base64",
   "dep:fastcdc",
   "dep:blake3",
+  "dep:rayon",
   "dep:futures-util",
   "dep:moka",
   "dep:dashmap",
@@ -152,6 +153,7 @@ base64 = { workspace = true, optional = true }
 # Phase 2c chunked CAS
 fastcdc = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 # join_all for bounded-parallel S3 HeadObject batches (exists_batch).
 # Worker already uses this; not a new transitive dep.
 futures-util = { workspace = true, optional = true }
