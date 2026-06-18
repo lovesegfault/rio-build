@@ -1387,6 +1387,13 @@ impl DagActor {
                 floor = ?state.sched.resource_floor,
                 "resource_floor observed"
             );
+            // sh-041u r4: hard-wins precedence — a mixed-axis close
+            // (e.g. cores grow-to-cap `hard_grew=true` AND a soft disk
+            // bump) emits ONE `headroom="hard"` tick. r3's cores
+            // `hard_grew` fix reclassifies that input class from
+            // r2-and-prior `"soft"` → `"hard"`; the deploy-time
+            // step-down on `{headroom="soft"}` rate is label
+            // reclassification, not a soft-path behaviour change.
             metrics::counter!(
                 "rio_scheduler_resource_floor_bumps_total",
                 "reason" => reason_label,

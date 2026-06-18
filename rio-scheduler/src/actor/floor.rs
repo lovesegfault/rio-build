@@ -153,15 +153,19 @@ pub struct FloorOutcome {
 
 impl FloorOutcome {
     /// sh-041u r3: the ONE `(grew, at_cap) → {at_cap_axes, hard_grew,
-    /// hard_promoted}` fold law for a hard-headroom axis. ALL four
+    /// hard_promoted}` fold law for a hard-headroom axis. All four
     /// axes (mem/disk via [`observe_sizing_axis`], deadline, cores)
     /// route through this body so the kernel-disjointness invariant
     /// (`hard_promoted ⇒ !at_cap_axes∋axis` per axis) and the
     /// `hard_promoted ⇒ hard_grew` invariant are LEXICALLY singular —
     /// r2 open-coded the fold at three sites and missed the cores
     /// `grew` bit on the at-cap arm (the same persist-skip bug class
-    /// the split was meant to close).
-    fn fold_hard(&mut self, axis: Axis, grew: bool, at_cap: bool) {
+    /// the split was meant to close). r4: the input is the named
+    /// [`SetDimOutcome`] so a producer-side `(at_cap, grew)` reorder —
+    /// or a new axis helper that returns the swapped tuple by analogy
+    /// — is a type error, not a silent re-open of the persist-skip.
+    fn fold_hard(&mut self, axis: Axis, step: SetDimOutcome) {
+        let SetDimOutcome { grew, at_cap } = step;
         if at_cap {
             self.at_cap_axes.insert(axis);
         }
@@ -172,6 +176,22 @@ impl FloorOutcome {
             }
         }
     }
+}
+
+/// sh-041u r4: the chokepoint's input contract — what BOTH per-axis
+/// producers ([`set_dim`], [`bump_cores_to_provisionable`]) return and
+/// what [`FloorOutcome::fold_hard`] consumes. Named (not the r3
+/// positional `(bool, bool)`) so the contract is carried in the type:
+/// a positional bool-tuple is swap-silent, and a swap re-opens the
+/// exact persist-skip class r3 closed with zero compiler signal.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SetDimOutcome {
+    /// `*floor` strictly grew (`new > old`).
+    pub grew: bool,
+    /// `target ≥ cap` (mem/disk/deadline) or `base ≥ prov_max`
+    /// (cores). NOT disjoint with `grew` — a grow-to-cap clip is
+    /// `{grew: true, at_cap: true}`.
+    pub at_cap: bool,
 }
 
 /// Worker-reported peaks for one closed attempt. `None` = no signal
@@ -505,9 +525,9 @@ pub fn observe_peaks(
                 if wall_s >= u64::from(assigned) / 2 {
                     let target = wall_s.saturating_mul(2);
                     let mut f = u64::from(floor.deadline_secs);
-                    let (grew, at_cap) = set_dim(&mut f, target, u64::from(DEADLINE_CAP_SECS));
+                    let step = set_dim(&mut f, target, u64::from(DEADLINE_CAP_SECS));
                     floor.deadline_secs = f as u32;
-                    o.fold_hard(Axis::Deadline, grew, at_cap);
+                    o.fold_hard(Axis::Deadline, step);
                 } else {
                     count_refusal("timed_out");
                 }
@@ -542,9 +562,9 @@ pub fn observe_peaks(
             if cpu_util.is_nan() || cpu_util > TRUST_BAND_CORES {
                 count_refusal("cores");
             } else if cpu_util >= cfg.compute_bound_threshold {
-                let (grew, at_cap) =
+                let step =
                     bump_cores_to_provisionable(&mut floor.cores, last_cores, prov_max_cores);
-                o.fold_hard(Axis::Cores, grew, at_cap);
+                o.fold_hard(Axis::Cores, step);
             }
         }
     }
@@ -581,18 +601,24 @@ fn observe_sizing_axis(
         count_refusal(refusal_lo);
     }
     let target = (peak as f64 * if hard { 2.0 } else { 1.2 }) as u64;
-    let (grew, at_cap) = set_dim(floor, target, cap);
+    let step = set_dim(floor, target, cap);
     if hard {
-        o.fold_hard(axis, grew, at_cap);
+        o.fold_hard(axis, step);
     } else {
-        if at_cap {
+        if step.at_cap {
             o.at_cap_axes.insert(axis);
         }
         // sh-041u r3: `!at_cap` preserves the baseline disjoint
         // semantics — `set_dim`'s slot-0 widening to non-disjoint
         // `grew` (r2) would otherwise newly fire `soft_promoted` (and
         // the `headroom="soft"` bump metric) on a soft grow-to-cap.
-        if grew && !at_cap {
+        // r4: that leaves the in-memory `*floor = cap` mutation
+        // unlogged/uncounted by design — symmetric with the hard
+        // path's at_cap-not-promoted (kernel input stays disjoint;
+        // `soft_promoted` gates neither persist nor exemption, so the
+        // observability cost is the only effect, and the
+        // `headroom="soft"` series is documented as in-band only).
+        if step.grew && !step.at_cap {
             o.soft_promoted = true;
         }
     }
@@ -800,10 +826,13 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
 /// merged_bug_016: callers pass the SOLVE-domain mem cap
 /// ([`mem_solve_cap`]) so an at-cap floor renders a hostable
 /// container; the disk cap is the raw `ceil.max_disk`.
-fn set_dim(floor: &mut u64, target: u64, cap: u64) -> (bool, bool) {
+fn set_dim(floor: &mut u64, target: u64, cap: u64) -> SetDimOutcome {
     let old = *floor;
     *floor = old.max(target).min(cap);
-    (*floor > old, target >= cap)
+    SetDimOutcome {
+        grew: *floor > old,
+        at_cap: target >= cap,
+    }
 }
 
 // r[impl sched.floor.compute-bound-provisionable]
@@ -815,7 +844,7 @@ fn set_dim(floor: &mut u64, target: u64, cap: u64) -> (bool, bool) {
 /// `at_cap` poisons `ComputeBoundAtCap` — there is nothing larger to
 /// try and "shrink the regime" is the only remediation.
 ///
-/// Returns the SAME `(grew, at_cap)` shape as [`set_dim`] (sh-041u
+/// Returns the same [`SetDimOutcome`] shape as [`set_dim`] (sh-041u
 /// r3: the divergent `CoresOutcome{promoted}` shape missed `grew` on
 /// the at-cap arm, so a `floor=0, last=prov_max` initial dispatch
 /// strictly grew `cores` 0→prov_max in memory but skipped the M_044
@@ -837,14 +866,20 @@ fn set_dim(floor: &mut u64, target: u64, cap: u64) -> (bool, bool) {
 /// disclosure handles. Return the no-op so the caller's generic
 /// budget bounds it without a misleading `ComputeBoundAtCap`
 /// diagnostic naming `0c`.
-fn bump_cores_to_provisionable(floor: &mut u32, last: u32, prov_max: u32) -> (bool, bool) {
+fn bump_cores_to_provisionable(floor: &mut u32, last: u32, prov_max: u32) -> SetDimOutcome {
     if prov_max == 0 {
-        return (false, false);
+        return SetDimOutcome {
+            grew: false,
+            at_cap: false,
+        };
     }
     let old = *floor;
     let at_cap = old.max(last) >= prov_max;
     *floor = prov_max;
-    (prov_max > old, at_cap)
+    SetDimOutcome {
+        grew: prov_max > old,
+        at_cap,
+    }
 }
 
 #[cfg(test)]
@@ -1631,7 +1666,7 @@ mod tests {
     }
 
     // r[verify sched.retry.promotion-exempt+4]
-    /// sh-041u r2: [`set_dim`] returns `(grew, at_cap)` — NOT
+    /// sh-041u r2: [`set_dim`] returns `{grew, at_cap}` — NOT
     /// disjoint. A grow-to-cap clip sets BOTH (the floor strictly
     /// grew old→cap, AND target ≥ cap). The kernel's
     /// `FloorOutcomeView` disjointness is enforced at the
@@ -1649,9 +1684,9 @@ mod tests {
             (50, 100, 100, 100, true, true),   // target == cap: grow-to-cap
             (0, 0, 100, 0, false, false),      // zero target
         ] {
-            let (g, a) = set_dim(&mut f, target, cap);
+            let SetDimOutcome { grew, at_cap } = set_dim(&mut f, target, cap);
             assert_eq!(
-                (f, g, a),
+                (f, grew, at_cap),
                 (want_f, want_g, want_a),
                 "set_dim({target}, {cap})"
             );
