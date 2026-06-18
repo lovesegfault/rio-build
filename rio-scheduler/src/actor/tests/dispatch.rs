@@ -3594,7 +3594,7 @@ async fn emit_assignment_started_carries_predecessor_after_witnessed_close() -> 
     assert_eq!(
         p.floor_bumped(),
         PredecessorFloorAxis::Disk,
-        "axis_for_reason_label inverse of witnessed_disposition"
+        "predecessor axis is the inverse of witnessed_disposition"
     );
     assert_eq!(
         p.new_axis_bytes, solved_disk,

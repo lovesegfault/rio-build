@@ -104,7 +104,7 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
                  --tenant-token (the gateway-issued session JWT).",
             ));
         }
-        Err(e) => return Err(anyhow!("TailLog: {e}")),
+        Err(e) => return Err(anyhow::Error::from(e).context("TailLog")),
     };
 
     // Drain. `lines` is `repeated bytes` — may be non-UTF-8

@@ -1048,9 +1048,11 @@ impl DagActor {
         // stamped `state.sched.last_intent` (pull.rs:1227) and the
         // predecessor's close site pushed onto `attempt_history()` in
         // a PRIOR actor turn — both are readable here without DB.
-        // The owned `(exec_id, predecessor)` tuple is built BEFORE
-        // the `get_interested_builds` loop (drop-the-borrow shape)
-        // and cloned per build.
+        // The owned `DerivationEvent` is built BEFORE the
+        // `get_interested_builds` loop (drop-the-borrow shape) and
+        // cloned per build — N interested builds share one
+        // construction (one `executor_id.to_string()` Display-format,
+        // one predecessor clone) instead of N (sh-042-r1).
         let (exec_id, predecessor) = match self.dag.node(drv_hash) {
             Some(state) => (
                 state.exec_id.map(|id| id.to_string()).unwrap_or_default(),
@@ -1062,23 +1064,23 @@ impl DagActor {
             ),
             None => (String::new(), None),
         };
+        let event = match predecessor {
+            Some(p) => rio_proto::types::DerivationEvent::started_with_predecessor(
+                drv_path,
+                executor_id.to_string(),
+                exec_id,
+                p,
+            ),
+            None => rio_proto::types::DerivationEvent::started(
+                drv_path,
+                executor_id.to_string(),
+                exec_id,
+            ),
+        };
         for build_id in self.get_interested_builds(drv_hash) {
-            let event = match predecessor.clone() {
-                Some(p) => rio_proto::types::DerivationEvent::started_with_predecessor(
-                    drv_path.clone(),
-                    executor_id.to_string(),
-                    exec_id.clone(),
-                    p,
-                ),
-                None => rio_proto::types::DerivationEvent::started(
-                    drv_path.clone(),
-                    executor_id.to_string(),
-                    exec_id.clone(),
-                ),
-            };
             self.events.emit(
                 build_id,
-                rio_proto::types::build_event::Event::Derivation(event),
+                rio_proto::types::build_event::Event::Derivation(event.clone()),
             );
             // Progress snapshot: running count +1, worker set changed.
             // Critpath unchanged on dispatch (no completion) — but the

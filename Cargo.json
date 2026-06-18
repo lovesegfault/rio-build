@@ -19722,6 +19722,10 @@
           "packageId": "serde_json"
         },
         {
+          "name": "strum",
+          "packageId": "strum"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror"
         },

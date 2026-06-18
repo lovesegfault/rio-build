@@ -64,6 +64,9 @@ base64 = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 tower-http = { workspace = true }
 http = { workspace = true }
+# EnumIter on AttemptTerminalKind so the (label, human) pin test is
+# driven by the enum, not a hand-typed parallel list (sh-042-r1).
+strum = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

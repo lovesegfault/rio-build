@@ -88,7 +88,7 @@ mod tests {
 /// Crate-neutral mirror of the wire `AttemptTerminalReason` alphabet
 /// (`rio-proto` depends on `rio-common`, so the proto enum cannot
 /// appear here; the exhaustive `From` impl lives next to the enum).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub enum AttemptTerminalKind {
     /// Wire zero value — reason not stated.
     Unspecified,
@@ -169,7 +169,7 @@ pub fn attempt_terminal_reason_label(kind: AttemptTerminalKind) -> &'static str 
 /// string instead of failing; the `human_alphabet_pinned` test pins
 /// each `(label, human)` pair explicitly so a rename or dropped match
 /// arm fails CI rather than degrading.
-pub fn attempt_terminal_reason_human(label: &str) -> std::borrow::Cow<'static, str> {
+pub fn attempt_terminal_reason_human(label: &str) -> std::borrow::Cow<'_, str> {
     match label {
         "evicted_empty_dir_size_limit" => "evicted (emptyDir disk limit)".into(),
         "oom_killed" => "OOM-killed".into(),
@@ -184,38 +184,8 @@ pub fn attempt_terminal_reason_human(label: &str) -> std::borrow::Cow<'static, s
         "unreported" => "executor unreachable (unreported)".into(),
         // Fallback: an unknown label (or one whose human form IS the
         // raw label) renders as-is. Never empty unless the label is.
-        other => other.to_string().into(),
+        other => other.into(),
     }
-}
-
-/// Which resource floor a closed attempt's reason promotes — the
-/// inverse of `witnessed_disposition`'s promote arms
-/// (`rio-scheduler/src/actor/floor.rs`): only `OomKilled →
-/// PromoteMemFloor` and `EvictedEmptyDirSizeLimit → PromoteDiskFloor`
-/// do; every other reason (including `DeadlineExceeded`, which is
-/// `ClassifyOnly`) is `None`.
-///
-/// `None` ↔ proto `PREDECESSOR_FLOOR_AXIS_NONE` (no sizing suffix on
-/// the `rio: retry` marker). The DEADLINE axis is intentionally absent
-/// — see the `reserved 3` comment in `dag.proto`.
-pub fn axis_for_reason_label(label: &str) -> Option<FloorAxis> {
-    match label {
-        "oom_killed" => Some(FloorAxis::Mem),
-        "evicted_empty_dir_size_limit" => Some(FloorAxis::Disk),
-        _ => None,
-    }
-}
-
-/// The two floor axes the `rio: retry` marker's sizing suffix can
-/// name. Crate-neutral mirror of `rio_proto::types::PredecessorFloorAxis`
-/// minus `NONE` (which is [`Option::None`] here) — rio-common does not
-/// depend on rio-proto.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FloorAxis {
-    /// Memory (`SolvedIntent.mem_bytes`).
-    Mem,
-    /// Disk (`SolvedIntent.disk_bytes`).
-    Disk,
 }
 
 #[cfg(test)]
@@ -254,13 +224,17 @@ mod label_tests {
     /// sh-042: pin each `(label, expected_human)` pair explicitly.
     /// [`attempt_terminal_reason_human`] has a fallback arm (raw
     /// label) so a domain-coverage assertion would be vacuous — a
-    /// label rename or a dropped match arm would still pass it. The
-    /// pinned-pairs shape is the same as [`label_alphabet_pinned`]'s.
+    /// label rename or a dropped match arm would still pass it.
+    /// Driven by [`AttemptTerminalKind::iter`] (sh-042-r1): a new
+    /// variant fails this test at the `expect("pinned human ...")`
+    /// instead of silently falling through to the raw rendering.
     /// Labels whose human form IS the raw label are stated explicitly
     /// (the fallback is intentional, not an omission).
     #[test]
     fn human_alphabet_pinned() {
-        let pinned = [
+        use std::collections::HashMap;
+        use strum::IntoEnumIterator;
+        let pinned: HashMap<&str, &str> = HashMap::from([
             (
                 "evicted_empty_dir_size_limit",
                 "evicted (emptyDir disk limit)",
@@ -271,30 +245,29 @@ mod label_tests {
             ("evicted_other", "evicted"),
             ("reaped", "pod reaped"),
             ("deadline_exceeded", "deadline exceeded"),
-            ("unreported", "executor unreachable (unreported)"),
             // Intentional raw fallthrough (no dedicated human form):
             ("cancelled", "cancelled"),
             ("pod_error", "pod_error"),
             ("pod_completed", "pod_completed"),
             ("unspecified", "unspecified"),
             ("no_eligible_source", "no_eligible_source"),
-        ];
-        for (label, human) in pinned {
+        ]);
+        for kind in AttemptTerminalKind::iter() {
+            let label = attempt_terminal_reason_label(kind);
+            let want = pinned
+                .get(label)
+                .unwrap_or_else(|| panic!("pinned human for new variant {kind:?} ({label:?})"));
             assert_eq!(
                 attempt_terminal_reason_human(label),
-                human,
+                *want,
                 "human rendering of label {label:?}"
             );
         }
-        // The axis inverse pins the two promote arms only.
-        assert_eq!(axis_for_reason_label("oom_killed"), Some(FloorAxis::Mem));
+        // The one non-enum row (housekeeping.rs's no-witness backstop).
         assert_eq!(
-            axis_for_reason_label("evicted_empty_dir_size_limit"),
-            Some(FloorAxis::Disk)
+            attempt_terminal_reason_human("unreported"),
+            "executor unreachable (unreported)"
         );
-        assert_eq!(axis_for_reason_label("deadline_exceeded"), None);
-        assert_eq!(axis_for_reason_label("preempted"), None);
-        assert_eq!(axis_for_reason_label(""), None);
     }
 }
 

@@ -13,8 +13,11 @@
 /// over the input domain — a present NON-ZERO size never renders as
 /// zero at ANY unit — quantifier: census(present_nonzero_never_renders_zero_at_any_unit) — (the live incident's 45-69 MB
 /// raw-stamps read as "no memory assigned" during diagnosis; the
-/// header doc above forbids claiming a precision the banner doesn't
-/// have, and rounding a present value to zero is the inverse violation
+/// `header_lines` doc in `rio-builder/src/banner.rs` forbids claiming
+/// a precision the banner doesn't have — the cgroup clamp `ceil()`s
+/// fractional limits and would print a different number than the SLA
+/// model fitted — and rounding a present value to zero is the inverse
+/// violation
 /// — at every rung, not just the GiB one the incident happened to
 /// hit). The unit ladder descends to the first rung that preserves a
 /// non-zero magnitude and bottoms out at bytes; absent stays "? GiB".
