@@ -7628,6 +7628,15 @@ mod tests {
                 "admission gate semaphore (sibling pool; SUBSTITUTE_ADMISSION_WAIT-timed)",
             ),
             (
+                "backend.rs",
+                "acquire_owned",
+                1,
+                "S3ChunkBackend::put_gate (sibling pool; replica-global PUT \
+                 semaphore — parking acquire under the per-ingest \
+                 buffer_unordered, fd/connection bound only; zero \
+                 NAR-budget contact)",
+            ),
+            (
                 "logs/service.rs",
                 "try_acquire",
                 2,

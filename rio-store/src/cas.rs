@@ -47,24 +47,42 @@ pub fn should_chunk(
     backend.filter(|_| nar_len >= INLINE_THRESHOLD)
 }
 
-/// Default max concurrent S3 chunk uploads per `put_chunked` call.
+/// Default max concurrent S3 chunk uploads PER `put_chunked` call.
 ///
-/// Per-replica `r[store.substitute.admission+2]` bounds how many
-/// `put_chunked` calls run at once; this bounds fan-out WITHIN one.
-/// `substitute_admission_permits × this` is the per-replica in-flight
-/// PutObject ceiling — keep it under the aws-sdk's ~1024 connection
-/// pool with headroom. At helm-default `pg_max=20` → admission=64 →
-/// 64×8=512. Operators raising admission past ~128 should lower this
-/// proportionally.
+/// Two caps compose: this PER-INGEST `buffer_unordered` width, and
+/// the replica-global [`DEFAULT_CHUNK_UPLOAD_GLOBAL_PERMITS`] gate
+/// held by the one `S3ChunkBackend` instance. In-flight PutObject =
+/// `min(Σ per-ingest 64, global 256)` — the per-ingest width gives
+/// fairness (one giant NAR can't take all 256 global permits) and
+/// bounds the unbudgeted owned-`Bytes` overshoot at
+/// `max_concurrent × CHUNK_MAX` (16 MiB at 64; see
+/// `r[store.put.nar-bytes-budget+6]` at `do_upload`).
 ///
-/// Unbounded fan-out on large NARs (python3: 374 MB → ~1900 chunks)
-/// saturates the pool → `DispatchFailure` cascades → substitution
-/// rolls back and the rsb user sees `nix build` fail on a path that
-/// exists upstream. The 8 bound keeps throughput without the spike.
+/// Connection-pool note (re-derived for opt-02): the production S3
+/// client is `rio_common::s3::default_client` →
+/// `aws_sdk_s3::Client::new(&aws_config::from_env()…)` with NO
+/// `.http_client()` override. The default hyper-1.x legacy client has
+/// NO in-flight connection cap — only `pool_max_idle_per_host`
+/// (default `usize::MAX`), which bounds *idle* returned-to-pool
+/// conns; a request with no idle conn opens a new one and never
+/// queues. So the SDK never queues; the global semaphore IS the
+/// de-facto fd/connection bound for the chunk-PUT plane. (The
+/// pre-opt-02 prose here referenced an "~1024 connection pool" — that
+/// was doc fiction, NOT a configured value.)
 ///
 /// Overridable via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (`RIO_` env layer).
-// r[impl store.cas.upload-bounded]
-pub const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 8;
+// r[impl store.cas.upload-bounded+2]
+pub const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 64;
+
+/// Default replica-global gate on concurrent S3 PutObject — held as
+/// `S3ChunkBackend::put_gate`. With admission at its 128 ceiling
+/// (`derive_substitute_admission_cap`), the OLD arithmetic was
+/// 128×8=1024 in-flight; the NEW cap is hard-256 regardless of how
+/// many ingests fan out at once. 256 S3 conns + the PG pool (default
+/// 50) + reqwest + tonic stays well under typical 1024 fd ulimit.
+///
+/// Overridable via `RIO_CHUNK_UPLOAD_GLOBAL_PERMITS`.
+pub const DEFAULT_CHUNK_UPLOAD_GLOBAL_PERMITS: usize = 256;
 
 /// Run CPU-bound work without stalling the tokio worker. Uses
 /// `block_in_place` on the multi-thread runtime (production); falls
@@ -439,8 +457,11 @@ pub async fn stage_chunked(
 /// so the upfront collect can store `(hash, Range<usize>)` and defer
 /// the owned `Bytes` copy into the stream `.map()` closure — bounding
 /// unbudgeted overshoot to `max_concurrent × CHUNK_MAX` instead of
-/// ~the full to-upload set (`r[store.put.nar-bytes-budget+6]`).
-// r[impl store.cas.upload-bounded]
+/// ~the full to-upload set (`r[store.put.nar-bytes-budget+6]`). The
+/// per-ingest overshoot grew 8× with the opt-02 64 default; the
+/// worst-case at the 128 admission ceiling stays well inside the
+/// `nar_bytes_budget` reserve.
+// r[impl store.cas.upload-bounded+2]
 async fn do_upload(
     heartbeat_target: Option<(&PgPool, &[u8], uuid::Uuid)>,
     backend: &Arc<dyn ChunkBackend>,
@@ -1195,7 +1216,7 @@ mod cache_tests {
     }
 }
 
-// r[verify store.cas.upload-bounded]
+// r[verify store.cas.upload-bounded+2]
 #[cfg(test)]
 mod upload_tests {
     use super::*;
@@ -1347,6 +1368,96 @@ mod upload_tests {
             backend.high_water.load(Ordering::SeqCst),
             1,
             "max_concurrent=1 must serialize uploads"
+        );
+    }
+
+    /// [`HighWaterBackend`] with a replica-global gate at the seam
+    /// `S3ChunkBackend::put()` occupies in production: `put()`
+    /// acquires from a shared semaphore BEFORE counting in-flight.
+    struct GatedHighWaterBackend {
+        gate: Arc<tokio::sync::Semaphore>,
+        hw: HighWaterBackend,
+    }
+
+    #[async_trait::async_trait]
+    impl ChunkBackend for GatedHighWaterBackend {
+        async fn put(&self, h: &[u8; 32], d: Bytes) -> anyhow::Result<()> {
+            let _permit = self
+                .gate
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("never closed");
+            self.hw.put(h, d).await
+        }
+        async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
+            unimplemented!()
+        }
+        async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+            unimplemented!()
+        }
+        fn key_for(&self, _: &[u8; 32]) -> String {
+            unimplemented!()
+        }
+        async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    /// opt-02 composition law: a backend-level global gate composes
+    /// with per-ingest `buffer_unordered` to give in-flight =
+    /// `min(Σ per-ingest, global)`. Four concurrent
+    /// `do_upload(max_concurrent=64, 50 chunks)` against ONE shared
+    /// backend with a 4-permit gate → high-water ≤ 4 (not ≈64×4). At
+    /// `a8f15a9a4` (no gate on the backend) the equivalent setup
+    /// would observe hw≈64.
+    ///
+    /// `multi_thread` so the four `do_upload` futures actually run
+    /// concurrently (current_thread + `join!` is cooperative — would
+    /// pass trivially without ever stacking permits).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn put_chunked_global_gate_bounds_across_ingests() {
+        let backend = Arc::new(GatedHighWaterBackend {
+            gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            hw: HighWaterBackend::default(),
+        });
+        let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
+
+        // Four disjoint 50-chunk sets (hashes partitioned by high
+        // byte) so the per-ingest `seen` dedup never collapses them.
+        let ingest = |slot: u8| {
+            let backend_dyn = backend_dyn.clone();
+            async move {
+                let mut chunks = Vec::with_capacity(50);
+                let mut needs = HashSet::with_capacity(50);
+                for i in 0..50u64 {
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&i.to_le_bytes());
+                    hash[31] = slot;
+                    needs.insert(hash.to_vec());
+                    chunks.push(chunker::Chunk {
+                        hash,
+                        data: SYNTH_DATA,
+                    });
+                }
+                do_upload(None, &backend_dyn, SYNTH_DATA, &chunks, &needs, 64)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        tokio::join!(ingest(0), ingest(1), ingest(2), ingest(3));
+
+        let hw = backend.hw.high_water.load(Ordering::SeqCst);
+        assert!(
+            hw <= 4,
+            "global gate must bound across concurrent ingests: high-water {hw} > 4; \
+             per-ingest buffer_unordered(64) is not composing under the backend gate"
+        );
+        assert_eq!(
+            backend.hw.put_count.load(Ordering::SeqCst),
+            200,
+            "all 4×50 chunks dispatched"
         );
     }
 }

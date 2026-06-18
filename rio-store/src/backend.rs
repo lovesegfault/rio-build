@@ -25,11 +25,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use bytes::Bytes;
+use tokio::sync::Semaphore;
 use tracing::debug;
 
 /// Marker error: backend rejected the request due to auth/config, not a
@@ -484,10 +485,25 @@ pub struct S3ChunkBackend {
     client: Client,
     bucket: String,
     prefix: String,
+    /// Replica-global gate on concurrent PutObject. The aws-sdk's
+    /// default hyper client has NO in-flight connection cap (only
+    /// `pool_max_idle_per_host`, which bounds *idle* returned-to-pool
+    /// conns) — a request with no idle conn opens a new one and never
+    /// queues. This semaphore IS the de-facto fd/connection bound for
+    /// the chunk-PUT plane: at the default
+    /// [`DEFAULT_CHUNK_UPLOAD_GLOBAL_PERMITS`](crate::cas::DEFAULT_CHUNK_UPLOAD_GLOBAL_PERMITS)
+    /// (256), 256 concurrent PutObject → up to 256 TCP conns to the S3
+    /// endpoint, regardless of how many `put_chunked` callers fan out
+    /// at once. The per-ingest `buffer_unordered` width
+    /// ([`DEFAULT_CHUNK_UPLOAD_CONCURRENCY`](crate::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY))
+    /// composes UNDER this — fairness (one giant NAR can't take all
+    /// 256) plus the per-ingest `Bytes`-overshoot bound — so in-flight
+    /// PutObject = `min(Σ per-ingest, global)`.
+    put_gate: Arc<Semaphore>,
 }
 
 impl S3ChunkBackend {
-    pub fn new(client: Client, bucket: String, prefix: String) -> Self {
+    pub fn new(client: Client, bucket: String, prefix: String, global_put_permits: usize) -> Self {
         // Normalize: strip trailing slashes. `s3_key()` below joins with
         // a literal "/chunks/", so a prefix of "foo/" would produce
         // "foo//chunks/ab/..." — which S3 treats as a DISTINCT key from
@@ -502,6 +518,7 @@ impl S3ChunkBackend {
             client,
             bucket,
             prefix: normalized,
+            put_gate: Arc::new(Semaphore::new(global_put_permits)),
         }
     }
 
@@ -592,6 +609,19 @@ pub(crate) fn log_op_override() -> aws_sdk_s3::config::Builder {
 #[async_trait::async_trait]
 impl ChunkBackend for S3ChunkBackend {
     async fn put(&self, hash: &[u8; 32], data: Bytes) -> anyhow::Result<()> {
+        // Replica-global gate FIRST — before the requests-total counter
+        // (it measures *dispatched* PUTs, not parked) and before
+        // `chunk_op_override()` so the 5 s `CHUNK_OP_ATTEMPT_TIMEOUT`
+        // clocks the S3 op only, never the queue. `acquire_owned` so
+        // the permit's lifetime is tied to this future (cancel-drop
+        // releases). The semaphore is constructed in `new()` and never
+        // closed, so `expect` is unreachable.
+        let _permit = self
+            .put_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("put_gate never closed");
         let key = self.s3_key(hash);
         debug!(bucket = %self.bucket, key = %key, size = data.len(), "S3ChunkBackend: uploading");
         metrics::counter!("rio_store_s3_requests_total", "operation" => "put_object").increment(1);
@@ -612,6 +642,10 @@ impl ChunkBackend for S3ChunkBackend {
         Ok(())
     }
 
+    // TODO: gate `get()` under a replica-global semaphore too —
+    // `chunk_prefetch_k` (default 64) per concurrent GetPath stream is
+    // the read-side analogue of the per-ingest PUT fan-out, with no
+    // global cap. Out of scope for opt-02 (PUT plane only).
     async fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
         let key = self.s3_key(hash);
         metrics::counter!("rio_store_s3_requests_total", "operation" => "get_object").increment(1);
@@ -1126,7 +1160,12 @@ mod tests {
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
 
     fn make_s3_backend(client: Client) -> S3ChunkBackend {
-        S3ChunkBackend::new(client, "test-bucket".into(), "test-prefix".into())
+        S3ChunkBackend::new(
+            client,
+            "test-bucket".into(),
+            "test-prefix".into(),
+            Semaphore::MAX_PERMITS,
+        )
     }
 
     #[test]
@@ -1137,13 +1176,13 @@ mod tests {
             .build();
         let client = Client::from_conf(cfg);
 
-        let with_prefix = S3ChunkBackend::new(client.clone(), "b".into(), "myprefix".into());
+        let with_prefix = S3ChunkBackend::new(client.clone(), "b".into(), "myprefix".into(), 1);
         assert_eq!(
             with_prefix.s3_key(&HASH_C),
             format!("myprefix/chunks/ab/{}", "ab".repeat(32))
         );
 
-        let no_prefix = S3ChunkBackend::new(client.clone(), "b".into(), "".into());
+        let no_prefix = S3ChunkBackend::new(client.clone(), "b".into(), "".into(), 1);
         assert_eq!(
             no_prefix.s3_key(&HASH_C),
             format!("chunks/ab/{}", "ab".repeat(32))
@@ -1152,8 +1191,8 @@ mod tests {
         // Trailing slash normalized away at construction. I-040 regression
         // pin: an early Helm default of prefix="chunks/" produced
         // "chunks//chunks/ab/..." keys (current default is "").
-        let trailing = S3ChunkBackend::new(client.clone(), "b".into(), "chunks/".into());
-        let bare = S3ChunkBackend::new(client.clone(), "b".into(), "chunks".into());
+        let trailing = S3ChunkBackend::new(client.clone(), "b".into(), "chunks/".into(), 1);
+        let bare = S3ChunkBackend::new(client.clone(), "b".into(), "chunks".into(), 1);
         assert_eq!(
             trailing.s3_key(&HASH_C),
             bare.s3_key(&HASH_C),
@@ -1168,14 +1207,14 @@ mod tests {
         assert!(!trailing.s3_key(&HASH_C).contains("//"));
 
         // Multiple trailing slashes also stripped.
-        let multi_trailing = S3ChunkBackend::new(client.clone(), "b".into(), "prod///".into());
+        let multi_trailing = S3ChunkBackend::new(client.clone(), "b".into(), "prod///".into(), 1);
         assert_eq!(
             multi_trailing.s3_key(&HASH_C),
             format!("prod/chunks/ab/{}", "ab".repeat(32))
         );
 
         // Prefix of just "/" → same as empty.
-        let slash_only = S3ChunkBackend::new(client, "b".into(), "/".into());
+        let slash_only = S3ChunkBackend::new(client, "b".into(), "/".into(), 1);
         assert_eq!(
             slash_only.s3_key(&HASH_C),
             format!("chunks/ab/{}", "ab".repeat(32))
@@ -1227,6 +1266,45 @@ mod tests {
             result.is_err(),
             "transient error should be Err, not Ok(None)"
         );
+    }
+
+    /// opt-02: the replica-global PUT gate is wired into
+    /// `S3ChunkBackend::put()` itself (not just composed at the
+    /// `do_upload` layer). With `permits=1` and the one permit held
+    /// externally, `put()` parks at `acquire_owned().await` and never
+    /// reaches the SDK send — `tokio::time::timeout` observes the
+    /// park. Dropping the external permit unblocks the next `put()`.
+    #[tokio::test]
+    async fn s3_put_gate_parks_when_exhausted() {
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        use std::time::Duration;
+
+        let rule = mock!(Client::put_object).then_output(|| PutObjectOutput::builder().build());
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+        let backend = S3ChunkBackend::new(client, "b".into(), "".into(), 1);
+
+        // Exhaust the gate externally.
+        let held = backend.put_gate.clone().try_acquire_owned().expect("fresh");
+
+        let parked = tokio::time::timeout(
+            Duration::from_millis(50),
+            backend.put(&HASH_A, Bytes::from_static(b"x")),
+        )
+        .await;
+        assert!(
+            parked.is_err(),
+            "put() must park when the global gate is exhausted; \
+             completed instead — gate not wired before send"
+        );
+
+        drop(held);
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            backend.put(&HASH_A, Bytes::from_static(b"x")),
+        )
+        .await
+        .expect("put() must complete once a permit is available")
+        .expect("mock PutObject returns Ok");
     }
 
     #[tokio::test]

@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg.chunk_backend,
         cfg.chunk_cache_capacity_bytes,
         cfg.s3_max_attempts,
+        cfg.chunk_upload_global_permits,
     )
     .await?;
 

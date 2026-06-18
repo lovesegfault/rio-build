@@ -17,11 +17,15 @@ split.
     constants in `chunker.rs`)
 ]
 
-#r("store.cas.upload-bounded")[
+#r("store.cas.upload-bounded+2")[
   Chunk uploads within a single `put_chunked` call MUST be bounded to
-  `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (default 8) concurrent S3 operations.
-  Unbounded fan-out on large NARs (>1000 chunks) saturates the aws-sdk
-  connection pool and produces `DispatchFailure` errors.
+  `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (default 64) concurrent S3 operations,
+  AND the replica MUST gate all concurrent S3 chunk PutObject calls under a
+  single `RIO_CHUNK_UPLOAD_GLOBAL_PERMITS` (default 256) semaphore. The
+  aws-sdk's default hyper client has no in-flight connection cap (only an
+  idle-pool cap), so the global semaphore is the de-facto fd/connection
+  bound for the chunk-PUT plane; the per-ingest width gives fairness and
+  bounds the per-ingest owned-`Bytes` overshoot.
 ]
 
 #r("store.cas.s3-retry")[

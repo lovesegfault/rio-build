@@ -116,14 +116,23 @@ pub struct Config {
     /// honoured (PutPath HMAC-bypass and `x-rio-probe-tenant-id` gate).
     /// Default: `["rio-gateway", "rio-scheduler"]`.
     pub service_bypass_callers: Vec<String>,
-    /// Max concurrent S3 chunk uploads per `put_chunked` call.
-    /// Default 8. Per-replica `r[store.substitute.admission+2]` bounds
-    /// concurrent `put_chunked` calls; `substitute_admission_permits
-    /// × this` is the per-replica in-flight PutObject ceiling. Raise
-    /// if the store runs with a larger aws-sdk pool; lower (min 1)
-    /// if you see `DispatchFailure` in store logs during large-NAR
-    /// ingest. Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.
+    /// Max concurrent S3 chunk uploads PER `put_chunked` call.
+    /// Default 64. Composes under
+    /// [`chunk_upload_global_permits`](Self::chunk_upload_global_permits)
+    /// — in-flight PutObject = `min(Σ per-ingest, global)` — so this
+    /// knob is fairness (one giant NAR can't take the whole global
+    /// gate) plus the per-ingest owned-`Bytes` overshoot bound, NOT
+    /// the connection ceiling. Lower (min 1) if you see
+    /// `DispatchFailure` in store logs during large-NAR ingest. Set
+    /// via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.
     pub chunk_upload_max_concurrent: usize,
+    /// Replica-global gate on concurrent S3 PutObject across every
+    /// ingest (substitute leaders + PutPath gRPC). Default 256. The
+    /// aws-sdk's default hyper client has no in-flight connection cap
+    /// — only an idle-pool cap — so this semaphore IS the de-facto
+    /// fd/connection bound for the chunk-PUT plane. Set via
+    /// `RIO_CHUNK_UPLOAD_GLOBAL_PERMITS`.
+    pub chunk_upload_global_permits: usize,
     /// Max aws-sdk retry attempts per S3 operation (PutObject,
     /// GetObject, HeadObject). Default 10 — raised from the aws-sdk
     /// default of 3 because S3-compatible backends (rustfs, MinIO)
@@ -313,6 +322,7 @@ impl Default for Config {
             service_hmac_key_path: None,
             service_bypass_callers: vec!["rio-gateway".into(), "rio-scheduler".into()],
             chunk_upload_max_concurrent: crate::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
+            chunk_upload_global_permits: crate::cas::DEFAULT_CHUNK_UPLOAD_GLOBAL_PERMITS,
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
             max_batch_paths: crate::grpc::DEFAULT_MAX_BATCH_PATHS,
             chunk_prefetch_k: crate::grpc::DEFAULT_CHUNK_PREFETCH_K,
@@ -397,9 +407,10 @@ pub const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
 /// gives headroom for the (typical) case where most admitted calls are
 /// parked on upstream I/O; the `[64, 128]` clamp keeps tiny dev pools
 /// from throttling to single digits and huge pools from admitting
-/// unbounded HTTP fan-out. 128 (not 256) keeps the per-replica S3
-/// fan-out self-consistent: 128 admitted × `S3_PUT_CONCURRENCY` (8) =
-/// 1024, the S3 single-prefix steady-state ceiling.
+/// unbounded HTTP fan-out. The per-replica S3 PUT ceiling is now the
+/// replica-global `chunk_upload_global_permits` gate (default 256),
+/// independent of admission — the 128 ceiling here bounds upstream
+/// HTTP fan-out and resident NAR-buffer count, not S3.
 pub fn derive_substitute_admission_cap(pg_max: u32) -> usize {
     (pg_max as usize * 3).clamp(64, 128)
 }
@@ -488,6 +499,13 @@ impl rio_common::config::ValidateConfig for Config {
             self.chunk_upload_max_concurrent >= 1,
             "chunk_upload_max_concurrent must be >= 1 (0 hangs uploads); \
              set RIO_CHUNK_UPLOAD_MAX_CONCURRENT"
+        );
+        // 0 → Semaphore::new(0) parks every S3ChunkBackend::put()
+        // forever (no permits, never closed → no error path).
+        anyhow::ensure!(
+            self.chunk_upload_global_permits >= 1,
+            "chunk_upload_global_permits must be >= 1 (0 parks every S3 PUT forever); \
+             set RIO_CHUNK_UPLOAD_GLOBAL_PERMITS"
         );
         // 0 → aws-sdk RetryConfig::with_max_attempts(0) makes zero
         // attempts: every S3 op fails immediately.
@@ -764,6 +782,7 @@ pub async fn init_chunk_backend(
     kind: &ChunkBackendKind,
     cache_capacity_bytes: u64,
     s3_max_attempts: u32,
+    global_put_permits: usize,
 ) -> anyhow::Result<Option<Arc<ChunkCache>>> {
     Ok(match kind {
         ChunkBackendKind::Inline => {
@@ -801,8 +820,12 @@ pub async fn init_chunk_backend(
             // services don't drift on credential/endpoint/retry
             // resolution.
             let client = rio_common::s3::default_client(s3_max_attempts).await;
-            let backend: Arc<dyn ChunkBackend> =
-                Arc::new(S3ChunkBackend::new(client, bucket.clone(), prefix.clone()));
+            let backend: Arc<dyn ChunkBackend> = Arc::new(S3ChunkBackend::new(
+                client,
+                bucket.clone(),
+                prefix.clone(),
+                global_put_permits,
+            ));
             Some(Arc::new(ChunkCache::with_capacity(
                 backend,
                 cache_capacity_bytes,
@@ -1566,7 +1589,8 @@ mod tests {
         r#"
         nar_buffer_budget_bytes = 99999
         chunk_cache_capacity_bytes = 123456
-        chunk_upload_max_concurrent = 64
+        chunk_upload_max_concurrent = 96
+        chunk_upload_global_permits = 512
         s3_max_attempts = 5
 
         [chunk_backend]
@@ -1579,7 +1603,8 @@ mod tests {
         |cfg: Config| {
             assert_eq!(cfg.nar_buffer_budget_bytes, Some(99999));
             assert_eq!(cfg.chunk_cache_capacity_bytes, 123456);
-            assert_eq!(cfg.chunk_upload_max_concurrent, 64);
+            assert_eq!(cfg.chunk_upload_max_concurrent, 96);
+            assert_eq!(cfg.chunk_upload_global_permits, 512);
             assert_eq!(cfg.s3_max_attempts, 5);
             assert!(
                 matches!(cfg.chunk_backend, ChunkBackendKind::Filesystem { .. }),
