@@ -61,10 +61,21 @@ pkgs.testers.runNixOSTest {
     # mints claims for the build's cohort, the worker's PutPath
     # stamps (path, tenant), the consult finds the evidence, and the
     # realisation lands exactly as the law demands.
+    # gc_retention_hours=0: opts cutoff-tenant into the
+    # rio_vmtest_tenant_backfill trigger (common.tenantStopgapSeedSql),
+    # so the already-uploaded busybox input gets a path_tenants row for
+    # this tenant — without it the c88 castore-read tenant scoping
+    # (DirectoryService junction probe) refuses the input DAG, and the
+    # sig-fallback never fires (busybox already has a vmtest junction
+    # row, failing the substitution-only NOT EXISTS precondition).
+    # Test-infra only: the bug_155 evidence chain (PutPath stamping
+    # OUTPUT path_tenants for the realisation consult) still runs the
+    # production path; the trigger backfill at INSERT-time only sees
+    # the seeded inputs.
     ${gatewayHost}.succeed(
         "psql -h 127.0.0.1 -U postgres -d rio -c \"INSERT INTO tenants "
-        "(tenant_id, tenant_name) VALUES "
-        "('c07f0f00-0000-4000-8000-000000000001', 'cutoff-tenant') "
+        "(tenant_id, tenant_name, gc_retention_hours) VALUES "
+        "('c07f0f00-0000-4000-8000-000000000001', 'cutoff-tenant', 0) "
         "ON CONFLICT (tenant_id) DO NOTHING\""
     )
     client.succeed(
