@@ -335,11 +335,11 @@
               shiroaPkg = pkgs.callPackage ./nix/shiroa.nix { };
 
               # Typst design-book pipeline: hermetic typst env (rioTypst),
-              # PDF (docs-pdf), shiroa HTML (docs). See nix/docs.nix.
+              # PDF (docs-pdf), bundle HTML (docs). See nix/docs.nix.
               # `xtaskBin` forward-references crateBuild (defined below) —
               # nix let-bindings are mutually recursive so this is fine.
               docsLib = import ./nix/docs.nix {
-                inherit pkgs shiroaPkg;
+                inherit pkgs;
                 inherit (pkgs) lib;
                 inherit (inputs) tracey-src self;
                 xtaskBin = crateBuild.memberBins.xtask;
