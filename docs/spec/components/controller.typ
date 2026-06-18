@@ -213,7 +213,7 @@ gone.
   deadline), so the fires-first contract holds for every lawful wait:
   the worker fires at `wait + window − 90 < window + envelope`. A
   `DeadlineExceeded` kill triggers
-  #rref("ctrl.terminated.deadline-exceeded") → `bump_floor_or_count`
+  #rref("ctrl.terminated.deadline-exceeded") → `observe_peaks`
   doubles `floor.deadline_secs` → the next intent gets a longer
   `activeDeadlineSeconds`. The 5× headroom is scheduler-side. Backstop
   purpose: a wrong-pool spawn (executor heartbeats in, never matches

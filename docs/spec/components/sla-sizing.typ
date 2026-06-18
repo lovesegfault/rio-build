@@ -291,7 +291,7 @@ $ "headroom"(n_"eff") = 1.25 + 0.7 / sqrt(n_"eff") $
 
 The $1 slash sqrt(n_"eff")$ term tracks the standard error of the fitted percentile — parameter uncertainty, which shrinks as $sqrt(n)$ — and the 1.25 floor covers irreducible run-to-run noise. Coverage of $1.25 times M_"p90"$ is $Phi(z_0.9 + ln 1.25 slash sigma_M)$, where the $z_0.9$ term is the p90 fit's own quantile (@fig-headroom-cov): $>=$ p99 when $sigma_M <= 0.12$, $tilde.op$ p97 at $sigma_M = 0.4$. Memory residuals are plausibly tighter than duration's $sigma in [0.1, 0.4]$, since peak RSS is near-deterministic for a fixed input set.
 
-#memo[Neither the duration-residual $sigma$ range $[0.1, 0.4]$ used throughout this document nor the $sigma_M$ range is *measured*. The duration range is an assumption pending live `build_samples` data; gate (d) in §Implementation Phasing is the empirical check. The 1.25 floor is provisional pending the same data, and the OOM-reactive penalty-bump (§Exploration, last paragraph; spec marker `r[sched.sla.reactive-floor+5]`) is the safety net if it proves too low.]
+#memo[Neither the duration-residual $sigma$ range $[0.1, 0.4]$ used throughout this document nor the $sigma_M$ range is *measured*. The duration range is an assumption pending live `build_samples` data; gate (d) in §Implementation Phasing is the empirical check. The 1.25 floor is provisional pending the same data, and the OOM-reactive penalty-bump (§Exploration, last paragraph; spec marker `r[sched.sla.reactive-floor+6]`) is the safety net if it proves too low.]
 
 Autopilot's evaluation @rzadca2020[§4.3] suggests that aggressive learned limits cut slack but raise @oom rate; widening the margin while the fit is young pays a small cost premium for stability.
 
@@ -1219,26 +1219,27 @@ The fit, percentile evaluator, and bisection solve are pure functions covered by
 Requirements without a natural home in the design prose above (wire-level
 and operational invariants).
 
-#r("sched.sla.reactive-floor+5")[
+#r("sched.sla.reactive-floor+6")[
   `SchedHint.resource_floor: ResourceFloor { mem_bytes, disk_bytes, deadline_secs, cores }`
   (default zeros) is the per-dimension reactive floor for cold-start safety.
-  An explicit worker-reported resource-exhaustion signal (`CgroupOom` --- the
-  build cgroup hit `memory.max` while the pod survived to report it --- or
-  `TimedOut`) MUST call `bump_floor_or_count`: if the relevant
-  dimension is already at its ceiling (`Ceilings.max_{mem,disk,cores}` /
-  `86400` for deadline), increment `infra_count` (or `timeout_count` for
-  deadline) and return `promoted=false`; otherwise set the dimension to
-  `min(max(floor, last_intent) * 2, ceiling)` and return `promoted=true`.
-  `last_intent` is `state.sched.last_intent.{mem,disk,deadline,cores}_*`,
-  stamped by the pull mint (the mint is the dispatch decision; the
-  stream-era dispatch writer is gone --- live_040). `solve_intent_for` MUST clamp its solved
-  (cores, mem, disk) at `resource_floor` before returning, and MUST clamp
-  (cores, mem, disk) at `Ceilings.max_{cores,mem,disk}`. Persisted as
-  `derivations.floor_*` (`M_044` + `M_106`) so failover doesn't reset to
-  zero. The `cores` floor doubles only on a `ComputeBound` corroboration
-  witness --- `cpu_seconds_total / (assigned_deadline * assigned_cores) >=
-  compute_bound_threshold` (default 0.8) --- never on bare exit$!=$0; the SLA
-  model still owns INITIAL core selection.
+  Every NON-SUCCESS worker-reported close MUST call `observe_peaks`: for each
+  axis the report carries, set the dimension to `min(max(floor, peak ×
+  headroom(reason, axis)), ceiling)` where `headroom = 2.0` if a corroborated
+  hard event fired on that axis (mem $arrow.r$ `CgroupOom`/witnessed-OOM with
+  `peak >= assigned/2`; disk $arrow.r$ `DiskFull`/witnessed-emptyDir with
+  `peak >= overlay(assigned, H_MIN)/2`; deadline $arrow.r$ `TimedOut` with
+  `wall >= assigned_deadline/2`; cores $arrow.r$ `cpu_util >= threshold` jumps
+  to `prov_max`), else `1.2` (mem/disk soft) or `1.0` (deadline --- no soft
+  headroom). Success skips: `record_build_sample` already feeds the SLA fit's
+  `p90 × headroom`, which dominates the soft floor at the solve. The CEILING
+  band (`peak <= assigned × TRUST_BAND_MEM`; disk `peak <= overlay(assigned,
+  H_MAX) + slack`) refuses forged-HIGH peaks; the FLOOR band degrades a
+  forged-LOW hard claim to soft. `last_intent` is the corroboration anchor
+  (stamped by the pull mint --- live_040), NOT the doubling base.
+  `solve_intent_for` MUST clamp its solved (cores, mem, disk) at
+  `resource_floor` before returning, and at `Ceilings.max_{cores,mem,disk}`.
+  Persisted as `derivations.floor_*` (`M_044` + `M_106`) ONLY on
+  `hard_promoted` --- soft observations are in-memory only.
 ]
 The controller-reported arm of the previous revision (k8s
 `OomKilled`/`EvictedDiskPressure`/`DeadlineExceeded` promoting the floor via

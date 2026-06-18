@@ -202,7 +202,7 @@ submitter-controlled attributes (the CA-ness of one's own drv) convert
 per-face residuals into adversary-chosen bypasses; the CA face therefore
 joins the law's domain with its own evidence base rather than an exemption.
 
-#r("sched.trust.report-corroboration+4")[
+#r("sched.trust.report-corroboration+5")[
   A worker report's claim MUST NOT move scheduler-persisted state without
   corroboration the scheduler can verify against evidence it (or the store)
   owns. Two faces:
@@ -229,8 +229,12 @@ joins the law's domain with its own evidence base rather than an exemption.
   scheduler's own attempt clock (attempt-open duration at least half the
   assigned deadline --- `running_since` vs the reconciled dispatch deadline,
   neither mintable by a worker). The demand is enforced INSIDE the floor
-  mutation (the witness parameter --- an ungated axis cannot compile) and
-  the writer population is MACHINE-DERIVED (the floor-mutation census
+  mutation (the per-axis trust band: `peak_X <= assigned_X × band` else the
+  axis observes nothing --- the gate-inside-mutation shape; the
+  witness-required-to-compile demand narrows to the HARD arm, with soft
+  consequence bounded by `hard_promoted` gating promotion-exempt and the
+  M_044 persist) and the writer population is MACHINE-DERIVED (the
+  floor-mutation census
   quantifies over mutation sites, never over one wire enum --- the
   carrier-keyed census was the wave-11 evasion's door). Untyped or
   uncorroborated claims are classify-only, counted
@@ -1214,12 +1218,12 @@ no-followups directive forbids.
   and the drv requeued forever.
 ]
 
-#r("sched.retry.promotion-exempt+3")[
-  Any failure path that bumps `resource_floor` (#rref("sched.sla.reactive-floor"))
-  and returns `promoted=true` MUST NOT increment `retry_count` and MUST NOT
+#r("sched.retry.promotion-exempt+4")[
+  Any failure path where `observe_peaks` (#rref("sched.sla.reactive-floor"))
+  returns `hard_promoted=true` MUST NOT increment `retry_count` and MUST NOT
   record into `failed_builders` / `failure_count`. Doubling is bounded by
-  `Ceilings`; once a dimension reaches its ceiling, `bump_floor_or_count`
-  returns `promoted=false` and the call-site increments `infra_count` instead,
+  `Ceilings`; once a dimension reaches its ceiling, `observe_peaks`
+  returns `hard_promoted=false` and the call-site increments `infra_count` instead,
   so `RetryPolicy.max_infra_retries` becomes a budget for failures AT the
   ceiling. `max_timeout_retries` is different (I-200,
   #rref("sched.timeout.promote-on-exceed")): EVERY timeout consumes budget
@@ -5914,7 +5918,7 @@ sources — r34 merged_bug_006's caveat carries unchanged).
 - #src("rio-scheduler/src/assignment.rs") --- Hard-filter executor selection
   (`best_executor`)
 - #src("rio-scheduler/src/actor/floor.rs") --- D4 reactive `resource_floor`
-  doubling (`bump_floor_or_count`)
+  observe (`observe_peaks`)
 - #src("rio-scheduler/src/grpc/") --- SchedulerService + ExecutorService gRPC
   implementations
 - #src("rio-scheduler/src/db/") --- PostgreSQL persistence (derivations,

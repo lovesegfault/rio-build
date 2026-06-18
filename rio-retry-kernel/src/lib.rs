@@ -94,7 +94,7 @@
 //!   the transient arm carries no exemption (the as-built
 //!   `handle_transient_failure` has no floor/promotion guard).
 //!   Regression coverage for the promotion-exempt ladder stays with the
-//!   existing `sched.retry.promotion-exempt+3` unit tests in
+//!   existing `sched.retry.promotion-exempt+4` unit tests in
 //!   rio-scheduler (`test_transient_failure_promotion_exempt_from_max_retries`);
 //!   the floor oracle is NOT extended to transient events and the model
 //!   deliberately does not encode one (NOT-ENC).
@@ -525,7 +525,7 @@ pub enum AttemptEvent<Id> {
     /// cgroup setup failure, CgroupOom) or an unsolicited `Cancelled`.
     ///
     /// `exempt` is the entry point's `exempt_from_cap`: the error message
-    /// contains CONCURRENT_PUTPATH, or `bump_resource_floor` returned
+    /// contains CONCURRENT_PUTPATH, or `observe_resource_floor` returned
     /// `promoted = true` for a CgroupOom. `at_cap` is the floor outcome's
     /// `at_cap` (the relevant dimension is already at its ceiling).
     /// `promoted` and `at_cap` are mutually exclusive; both are false for
@@ -549,12 +549,13 @@ pub enum AttemptEvent<Id> {
     /// `at_cap` (sh-031b): the cores `resource_floor` was already at
     /// the partition-aware provisionable max when this attempt
     /// corroborated compute-bound — the
-    /// [`PoisonReason::ComputeBoundAtCap`] arm. The cores axis is the
-    /// only floor dimension an `ExecutorVariant` row carries
-    /// (`corroborated_compute_bound` is the sole witness mint on the
-    /// E3a path), so `floor_at_cap` on an executor-variant ledger row
-    /// IS the compute-bound-at-cap signal — quantifier:
-    /// census(bump_resource_floor_caller_census).
+    /// [`PoisonReason::ComputeBoundAtCap`] arm. sh-041u: the E3a
+    /// handler stamps `floor_at_cap` from
+    /// `at_cap_axes.contains(Cores)` ONLY (the per-handler narrowing
+    /// at the chokepoint-#2 stamp site), so `floor_at_cap` on an
+    /// executor-variant ledger row IS the compute-bound-at-cap
+    /// signal regardless of mem/disk at-cap — quantifier:
+    /// census(observe_resource_floor_caller_census).
     ExecutorVariant {
         at: AbsTime,
         executor: Option<Id>,

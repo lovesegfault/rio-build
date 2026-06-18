@@ -117,8 +117,8 @@ pub(crate) struct FooterPeaks {
 
 impl FooterPeaks {
     /// `cpu_seconds_total / (wall × assigned_cores)` — the same
-    /// formula the scheduler's compute-bound corroborator uses
-    /// (`rio_scheduler::actor::floor::corroborated_compute_bound`).
+    /// formula the scheduler's compute-bound gate uses
+    /// (`rio_scheduler::actor::floor::observe_peaks`' cores arm).
     /// `None` when any input is absent or `wall`/`cores` are zero —
     /// the absent-field discipline applies (don't claim a precision
     /// we don't have).
@@ -498,8 +498,8 @@ mod tests {
 
     /// sh-038 Tier 2: `cpu_util = cpu_seconds_total / (wall ×
     /// assigned_cores)` — the same formula the scheduler's
-    /// compute-bound corroborator uses (`floor.rs
-    /// corroborated_compute_bound`). Omitted when any input is absent
+    /// compute-bound gate uses (`floor.rs observe_peaks`' cores
+    /// arm). Omitted when any input is absent
     /// or zero — the banner doesn't claim a precision it doesn't have.
     #[test]
     fn footer_peaks_line_carries_cpu_util() {
