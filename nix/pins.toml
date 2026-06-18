@@ -28,7 +28,7 @@ kubernetes_version = "1.35"
 # Chart version == app version. 1.19+ required (IPv6 tunnel underlay
 # first-class only since PR #40324). Same pin as nix/cilium-render.nix
 # (k3s VM tests) and infra/eks/addons.tf.
-version = "1.19.4"
+version = "1.19.5"
 # live_056-a identity-label exclusion filter — THE single source
 # (bug_104: one value, three consumers). Consumed by:
 #   - nix/cilium-render.nix (k3s/VM chart render),
@@ -38,7 +38,7 @@ version = "1.19.4"
 #     infra/eks/generated.auto.tfvars.json; the variables.tf object
 #     type carries the field).
 # EXCLUSIONS-ONLY ("!"-prefixed = subtract from cilium's default
-# identity-relevant set, v1.19.4 additive semantics): one non-"!"
+# identity-relevant set, v1.19+ additive semantics): one non-"!"
 # inclusion pattern flips the whole filter to whitelist-mode and
 # REPLACES the default set — the check's exclusions-only guard makes
 # that shape unshippable. Per-Job labels are excluded so the

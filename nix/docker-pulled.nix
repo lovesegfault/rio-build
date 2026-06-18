@@ -45,27 +45,27 @@
 
   # Cilium L7 proxy (standalone DaemonSet). Only loaded when
   # cilium-render.nix gatewayEnabled=true — provides the envoy that
-  # Cilium spawns per-Gateway. Tag is the chart 1.19.4 default
+  # Cilium spawns per-Gateway. Tag is the chart 1.19.5 default
   # (envoy.image.tag in the chart's values.yaml). envoy.image.
   # useDigest=false in cilium-render.nix → bare-tag match.
   cilium-envoy = pkgs.dockerTools.pullImage {
     imageName = "quay.io/cilium/cilium-envoy";
-    imageDigest = "sha256:71d4fa0ec45e8d546dbd5604e169dc77fe92be63b799313bff031d00d89762e3";
+    imageDigest = "sha256:326f872e19ce8aa45170efbf583b3f301586ba3feead14b864676d4baf3b45ed";
     finalImageName = "quay.io/cilium/cilium-envoy";
-    finalImageTag = "v1.36.6-1778235340-b87d1e32f522b33bd51701c6476d199326f01496";
-    hash = "sha256-Aw9DkgCxvcnDE+5YwBbmFeyTT+krYUUhBZE3iSHNIdU=";
+    finalImageTag = "v1.36.8-1781157951-a7f42a3390781539911b5b9107881b35ecc4e752";
+    hash = "sha256-KSApiYQ42KpNuVVW/UfrihzEEcI1WjVjqw4MT/Jgr6I=";
     os = "linux";
     arch = "amd64";
   };
 
-  # Cilium agent (DaemonSet). Chart 1.19.4. image.useDigest=false in
+  # Cilium agent (DaemonSet). Chart 1.19.5. image.useDigest=false in
   # cilium-render.nix → chart renders bare tag, must match finalImageTag.
   cilium-agent = pkgs.dockerTools.pullImage {
     imageName = "quay.io/cilium/cilium";
-    imageDigest = "sha256:2eb67991eaa9368ba199c2fac2c573cb0ffdeb79184533344f42fc9a7ff6af3c";
+    imageDigest = "sha256:20fbbc14ac20b55a292c0dcda5571bf31cde30a7dbc68c29db3e709390ab0732";
     finalImageName = "quay.io/cilium/cilium";
-    finalImageTag = "v1.19.4";
-    hash = "sha256-w8rCYuiF6TmF5aOlZSn6MjyT1XquWCh0eKR0rNXgkfM=";
+    finalImageTag = "v1.19.5";
+    hash = "sha256-nUDyat/hQc72dw6WCq5ajEisvPhrn/+dhNHBVBnzFNU=";
     os = "linux";
     arch = "amd64";
   };
@@ -74,10 +74,10 @@
   # defaults to "-generic" when no cloud provider is set.
   cilium-operator-generic = pkgs.dockerTools.pullImage {
     imageName = "quay.io/cilium/operator-generic";
-    imageDigest = "sha256:1aa2b62735e7d8ab49ee840ae59c346932024c88901579121395c1271b435f71";
+    imageDigest = "sha256:be848a365776e07d0c5a895eda7aec928ddc52a5a1fa2f432fd7a286609e1db4";
     finalImageName = "quay.io/cilium/operator-generic";
-    finalImageTag = "v1.19.4";
-    hash = "sha256-fcvRwzp9TEOnJJv5P/TCCSFABzoGQEhz3Ue8z7NuBIw=";
+    finalImageTag = "v1.19.5";
+    hash = "sha256-TIiLGfqDtH2bUF+7FvMcaqbuVjsUVM6s3oum5BNfR3A=";
     os = "linux";
     arch = "amd64";
   };

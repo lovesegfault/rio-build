@@ -118,7 +118,7 @@ resource "helm_release" "cilium" {
       # per-build object identity — fleet churn must not grow the
       # policy universe.
       #
-      # v1.19.4 SEMANTICS (source-verified): `!`-prefixed patterns
+      # v1.19+ SEMANTICS (source-verified): `!`-prefixed patterns
       # are EXCLUSIONS-ARE-ADDITIVE — they SUBTRACT from the default
       # identity-relevant set. WARNING: any NON-`!` inclusion pattern
       # flips the whole filter to whitelist-mode and REPLACES the

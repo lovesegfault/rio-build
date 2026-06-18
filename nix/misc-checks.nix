@@ -3071,7 +3071,7 @@ in
   # bump re-validates the filter semantics by ritual) and asserts:
   #   (i)  the cilium-config carries the labels filter line;
   #   (ii) the filter is EXCLUSIONS-ONLY — every pattern is
-  #        `!`-prefixed (v1.19.4 semantics: exclusions SUBTRACT from
+  #        `!`-prefixed (v1.19+ semantics: exclusions SUBTRACT from
   #        the default identity-relevant set; ONE non-`!` inclusion
   #        pattern flips the whole filter to whitelist-mode and
   #        REPLACES the default set — the unsafe shape this guard
@@ -3138,7 +3138,7 @@ in
             *)
               echo "FAIL: labels filter contains a non-exclusion pattern '$tok' —" >&2
               echo "one inclusion pattern flips cilium to whitelist-mode and" >&2
-              echo "REPLACES the default identity-relevant set (v1.19.4 semantics)." >&2
+              echo "REPLACES the default identity-relevant set (v1.19+ semantics)." >&2
               exit 1
               ;;
           esac
