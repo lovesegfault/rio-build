@@ -7,12 +7,12 @@
 # https://github.com/connectrpc/connect-es/blob/main/MIGRATING.md (v1→v2).
 #
 # Both packages land from nixpkgs:
-#   - pkgs.buf (1.64.0) — the CLI, no network needed for `generate`
-#   - pkgs.protoc-gen-es (2.11.0) — Node-wrapped, nixpkgs already handles the
+#   - pkgs.buf (1.70.0) — the CLI, no network needed for `generate`
+#   - pkgs.protoc-gen-es (2.12.0) — Node-wrapped, nixpkgs already handles the
 #     postinstall-binary trap that would break under fetchPnpmDeps --ignore-scripts
 #
-# Version lock-step: protoc-gen-es 2.11.0 expects @bufbuild/protobuf 2.11.0 at
-# runtime for codegenv2 imports. pnpm-lock.yaml already resolved ^2.2.3 → 2.11.0,
+# Version lock-step: protoc-gen-es 2.12.0 expects @bufbuild/protobuf 2.12.0 at
+# runtime for codegenv2 imports. pnpm-lock.yaml already resolved ^2.12.0 → 2.12.0,
 # so the sandbox's generator and the SPA's runtime agree. If nixpkgs bumps
 # protoc-gen-es past what the lockfile carries, the svelte-check step in
 # nix/dashboard.nix will catch the type mismatch — bump package.json + lockfile
