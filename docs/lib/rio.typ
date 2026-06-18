@@ -572,16 +572,10 @@
         attrs: (class: "rio-footnote"),
         [ (#it.body)],
       )
-      // Page <h1> from the chapter manifest title. QA2-h1.
-      context {
-        let t = _chapter-nav().title
-        if t != "" {
-          html.elem("h1", attrs: (class: "rio-chapter-title"), t)
-        }
-      }
       // Chapters do NOT carry a leading `= <Title>` heading — the
-      // synthetic <h1> above renders the manifest title; chapter body
-      // starts at level-1 sections (`= Responsibilities`, …). QA4-B:
+      // page-shell wrapper (lib/html/page.typ) emits the manifest
+      // title as the sole <h1>; chapter body starts at level-1
+      // sections (`= Responsibilities`, …). QA4-B:
       // the QA3 show-rule suppression had three failure modes
       // (false-positive prefix match ate `= Deployment Order`; H1→H3
       // skip; §-starts-at-2); the 14 title-dup chapters are now
