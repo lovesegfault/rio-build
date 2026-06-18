@@ -37,14 +37,14 @@ let
   # Upstream kube-scheduler matching `pins.cluster.kubernetes_version`. The
   # kube-build-scheduler Deployment (templates/kube-build-scheduler.yaml)
   # `image:` is set via `buildScheduler.image` in extraValues by the
-  # consumer. v1.35.x latest patch — k3s-full pins the SAME minor so
+  # consumer. v1.36.x latest patch — k3s-full pins the SAME minor so
   # API surface matches.
   kubeSchedulerImage = pkgs.dockerTools.pullImage {
     imageName = "registry.k8s.io/kube-scheduler";
-    imageDigest = "sha256:51a32afb3c6966c974cd3b351042b1cb1b15af0619cb25e006c409d91367ea2e";
+    imageDigest = "sha256:94dfc9f285718a06bb873947959b8514ed95dddaa7c74d765cc346fdfa684859";
     finalImageName = "registry.k8s.io/kube-scheduler";
-    finalImageTag = "v1.35.6";
-    hash = "sha256-OchPtISpXI9/ekM2Lp3exsYcz+VB7Dj91a1KlWeAzBY=";
+    finalImageTag = "v1.36.2";
+    hash = "sha256-TSyV0UW+2eZQSgAweY177H5i2UnFQr8wLPjdFSY/eyo=";
     os = "linux";
     arch = "amd64";
   };

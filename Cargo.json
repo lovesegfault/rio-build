@@ -13392,7 +13392,7 @@
       "resolvedDefaultFeatures": [
         "default",
         "std",
-        "v1_35"
+        "v1_36"
       ],
       "libCrateTypes": [
         "lib"

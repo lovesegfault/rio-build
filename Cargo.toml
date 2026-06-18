@@ -301,10 +301,10 @@ kube = { version = "4.0", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = [
   "aws-lc-rs",
 ] }
-# k8s-openapi types are feature-gated by K8s API version. v1_35 is the
+# k8s-openapi types are feature-gated by K8s API version. v1_36 is the
 # highest this release supports. The feature pins which struct fields
 # exist (e.g., ephemeralContainers moved GA in different versions).
-k8s-openapi = { version = "0.28", features = ["v1_35"] }
+k8s-openapi = { version = "0.28", features = ["v1_36"] }
 # schemars 1.x NOT 0.8 — kube 3.0 requires the major break. CRD JSON
 # schema generation for #[derive(JsonSchema)].
 schemars = "1"

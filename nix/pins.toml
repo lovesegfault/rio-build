@@ -20,7 +20,7 @@
 # k8s-openapi (Cargo.toml) tracks this via the v1_NN feature, and the k3s
 # VM tests derive `k3s_1_NN` from it so they exercise the same API
 # surface as the reference deploy.
-kubernetes_version = "1.35"
+kubernetes_version = "1.36"
 
 # ── Cluster addons (helm charts / manifests applied to the cluster) ────
 
@@ -104,6 +104,6 @@ src_hash = "sha256-P6CpgkbUvWyQJOb4EB8rlpapn0kzcywD+gLNeDUxBkk="
 # nodeadm REQUIRES this on disk before it will finish kubelet config
 # (stat()s the path; no skip flag). Tracks cluster.kubernetes_version's
 # minor.
-rev = "v1.35.1"
-src_hash = "sha256-kCDhkwcxYNDAmYrrk+dnHkVG2Qzcw8USPcaxHKZwxzs="
-vendor_hash = "sha256-eW9vsuhDaudnq34onV5LH1hY9S7Zt2jkzhL5UhbUlHY="
+rev = "v1.36.0"
+src_hash = "sha256-V41E5jdb4dibfFUkm3xdnzTRSAbi9gVGqjD15eoBMhY="
+vendor_hash = "sha256-yL1HVRPf1BHqSluzcE6MSlmUQx/7LbjndiDFvtIREgM="

@@ -249,7 +249,7 @@ let
         # The kubelet half (live_060-a): the gate the fleet never
         # set. The drop-in carrier on the fleet is eks-node.nix's
         # 30-rio-fsquota.conf; k3s threads it as a kubelet arg.
-        # NOTE: no `--kubelet-arg=v=N` here — k3s 1.35's embedded
+        # NOTE: no `--kubelet-arg=v=N` here — k3s 1.36's embedded
         # kubelet crash-loops on a verbosity re-init ("the logging
         # configuration should not be changed after setting it
         # once"); the uid_map and projid-registry subtests below are

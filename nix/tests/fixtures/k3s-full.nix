@@ -35,7 +35,7 @@
 let
   # k3s minor pinned to the EKS control-plane version so VM tests
   # exercise the same API surface as the reference deploy. Derives
-  # `k3s_1_35` from `cluster.kubernetes_version = "1.35"` — eval fails if
+  # `k3s_1_36` from `cluster.kubernetes_version = "1.36"` — eval fails if
   # nixpkgs lacks that attr (k3s lagging EKS), which is the desired
   # signal: don't bump pins.toml past what we can test.
   pins = import ../../pins.nix;
