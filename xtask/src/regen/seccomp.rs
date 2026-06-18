@@ -74,8 +74,11 @@ pub async fn run(tag: &str) -> Result<()> {
         "checked-in profile not found at {} — path moved? update PROFILE_PATH",
         ours.display()
     );
-    let url =
-        format!("https://raw.githubusercontent.com/moby/moby/{tag}/profiles/seccomp/default.json");
+    // moby 29.x split seccomp profiles into github.com/moby/profiles
+    // and vendors it back; the in-tree path moved.
+    let url = format!(
+        "https://raw.githubusercontent.com/moby/moby/{tag}/vendor/github.com/moby/profiles/seccomp/default.json"
+    );
 
     info!("fetching moby {tag} default.json");
     let mut v: Value = reqwest::get(&url).await?.error_for_status()?.json().await?;
