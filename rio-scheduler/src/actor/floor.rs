@@ -151,6 +151,29 @@ pub struct FloorOutcome {
     pub at_cap_axes: AxisSet,
 }
 
+impl FloorOutcome {
+    /// sh-041u r3: the ONE `(grew, at_cap) → {at_cap_axes, hard_grew,
+    /// hard_promoted}` fold law for a hard-headroom axis. ALL four
+    /// axes (mem/disk via [`observe_sizing_axis`], deadline, cores)
+    /// route through this body so the kernel-disjointness invariant
+    /// (`hard_promoted ⇒ !at_cap_axes∋axis` per axis) and the
+    /// `hard_promoted ⇒ hard_grew` invariant are LEXICALLY singular —
+    /// r2 open-coded the fold at three sites and missed the cores
+    /// `grew` bit on the at-cap arm (the same persist-skip bug class
+    /// the split was meant to close).
+    fn fold_hard(&mut self, axis: Axis, grew: bool, at_cap: bool) {
+        if at_cap {
+            self.at_cap_axes.insert(axis);
+        }
+        if grew {
+            self.hard_grew = true;
+            if !at_cap {
+                self.hard_promoted = true;
+            }
+        }
+    }
+}
+
 /// Worker-reported peaks for one closed attempt. `None` = no signal
 /// (axis untouched). `wall` is the SCHEDULER's own
 /// `running_since.elapsed()` (stamped at the Running transition; a
@@ -213,7 +236,8 @@ impl ObservedPeaks {
 /// SHAPE survives; the witness-required-to-compile demand narrows to
 /// the HARD arm — soft 1.2× is ceiling-band-checked only, with
 /// consequence bounded by `hard_promoted` gating promotion-exempt and
-/// the M_044 persist. The variants below are the ONLY producers — quantifier: census(floor_mutation_census).
+/// `hard_grew` gating the M_044 persist. The variants below are the
+/// ONLY producers — quantifier: census(floor_mutation_census).
 #[derive(Debug, Clone, Copy)]
 pub enum AttemptCloseReason {
     /// E2 worker `InfrastructureFailure` carrying a typed
@@ -483,15 +507,7 @@ pub fn observe_peaks(
                     let mut f = u64::from(floor.deadline_secs);
                     let (grew, at_cap) = set_dim(&mut f, target, u64::from(DEADLINE_CAP_SECS));
                     floor.deadline_secs = f as u32;
-                    if at_cap {
-                        o.at_cap_axes.insert(Axis::Deadline);
-                    }
-                    if grew {
-                        o.hard_grew = true;
-                        if !at_cap {
-                            o.hard_promoted = true;
-                        }
-                    }
+                    o.fold_hard(Axis::Deadline, grew, at_cap);
                 } else {
                     count_refusal("timed_out");
                 }
@@ -518,23 +534,17 @@ pub fn observe_peaks(
         let wall_s = wall.as_secs_f64();
         if wall_s >= cfg.compute_bound_min_wall_secs {
             let cpu_util = cpu / (wall_s * f64::from(last_cores));
-            // sh-041u r2: `!(x ≤ band)` is true for NaN (IEEE-754
-            // unordered), so a NaN that bypasses the `from_report`
-            // intake filter is band-refused here as the
-            // `TRUST_BAND_CORES` doc claims — `x > band` would be
-            // false and silently no-op.
-            #[allow(clippy::neg_cmp_op_on_partial_ord)]
-            if !(cpu_util <= TRUST_BAND_CORES) {
+            // sh-041u r2: a NaN that bypasses the `from_report` intake
+            // filter is band-refused here as the `TRUST_BAND_CORES`
+            // doc claims — explicit `is_nan()` so clippy's
+            // `neg_cmp_op_on_partial_ord` autofix can't silently
+            // re-open the hole.
+            if cpu_util.is_nan() || cpu_util > TRUST_BAND_CORES {
                 count_refusal("cores");
             } else if cpu_util >= cfg.compute_bound_threshold {
-                let r = bump_cores_to_provisionable(&mut floor.cores, last_cores, prov_max_cores);
-                if r.at_cap {
-                    o.at_cap_axes.insert(Axis::Cores);
-                }
-                if r.promoted {
-                    o.hard_grew = true;
-                    o.hard_promoted = true;
-                }
+                let (grew, at_cap) =
+                    bump_cores_to_provisionable(&mut floor.cores, last_cores, prov_max_cores);
+                o.fold_hard(Axis::Cores, grew, at_cap);
             }
         }
     }
@@ -546,12 +556,10 @@ pub fn observe_peaks(
 /// forged-HIGH (`count_refusal(hi)`, axis observes nothing); else a
 /// `hard_claim` with `peak < floor_band` degrades to soft
 /// (`count_refusal(lo)`); `target = peak × {2.0|1.2}` feeds
-/// [`set_dim`]; the `(grew, at_cap, hard)` triple folds into `o`
-/// (`hard_grew` on any hard grow; `hard_promoted` only when also
-/// `!at_cap` — the kernel-disjoint bit). Extracted so a band-law
-/// tweak (soft headroom, the `at_cap`/`grew` fold) edits one body,
-/// not two — the mem and disk arms were byte-identical modulo their
-/// bands.
+/// [`set_dim`]; hard outcomes route through [`FloorOutcome::fold_hard`]
+/// (the chokepoint for the `at_cap`/`grew` law). Extracted so a
+/// band-law tweak (soft headroom, the fold law) edits one body, not
+/// two — the mem and disk arms were byte-identical modulo their bands.
 #[allow(clippy::too_many_arguments)]
 fn observe_sizing_axis(
     floor: &mut u64,
@@ -574,16 +582,17 @@ fn observe_sizing_axis(
     }
     let target = (peak as f64 * if hard { 2.0 } else { 1.2 }) as u64;
     let (grew, at_cap) = set_dim(floor, target, cap);
-    if at_cap {
-        o.at_cap_axes.insert(axis);
-    }
-    if grew {
-        if hard {
-            o.hard_grew = true;
-            if !at_cap {
-                o.hard_promoted = true;
-            }
-        } else {
+    if hard {
+        o.fold_hard(axis, grew, at_cap);
+    } else {
+        if at_cap {
+            o.at_cap_axes.insert(axis);
+        }
+        // sh-041u r3: `!at_cap` preserves the baseline disjoint
+        // semantics — `set_dim`'s slot-0 widening to non-disjoint
+        // `grew` (r2) would otherwise newly fire `soft_promoted` (and
+        // the `headroom="soft"` bump metric) on a soft grow-to-cap.
+        if grew && !at_cap {
             o.soft_promoted = true;
         }
     }
@@ -785,8 +794,8 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
 /// The kernel's `FloorOutcomeView` disjointness invariant (the
 /// `decide()` fold's `ControllerTermination` arm /
 /// `decide_requeue_within_caps` predicate) is enforced at the
-/// [`FloorOutcome`] fold — `hard_promoted` is set only when `grew &&
-/// !at_cap` per axis — NOT here.
+/// [`FloorOutcome::fold_hard`] chokepoint — `hard_promoted` is set
+/// only when `grew && !at_cap` per axis — NOT here.
 ///
 /// merged_bug_016: callers pass the SOLVE-domain mem cap
 /// ([`mem_solve_cap`]) so an at-cap floor renders a hostable
@@ -795,11 +804,6 @@ fn set_dim(floor: &mut u64, target: u64, cap: u64) -> (bool, bool) {
     let old = *floor;
     *floor = old.max(target).min(cap);
     (*floor > old, target >= cap)
-}
-
-struct CoresOutcome {
-    promoted: bool,
-    at_cap: bool,
 }
 
 // r[impl sched.floor.compute-bound-provisionable]
@@ -811,12 +815,21 @@ struct CoresOutcome {
 /// `at_cap` poisons `ComputeBoundAtCap` — there is nothing larger to
 /// try and "shrink the regime" is the only remediation.
 ///
-/// `base = max(floor, last)` tests the DISPATCHED shape (live_040 —
-/// the retired per-axis body's at_cap derivation), so a stale floor or a
-/// clamped-at-cap `last_intent` reads as already-at-cap. This is the
-/// cores axis's `at_cap` derivation — NOT [`set_dim`]'s `target ≥
-/// cap` (which would mark at_cap on the FIRST jump and break the
-/// two-attempt semantics).
+/// Returns the SAME `(grew, at_cap)` shape as [`set_dim`] (sh-041u
+/// r3: the divergent `CoresOutcome{promoted}` shape missed `grew` on
+/// the at-cap arm, so a `floor=0, last=prov_max` initial dispatch
+/// strictly grew `cores` 0→prov_max in memory but skipped the M_044
+/// persist — the same bug class r2 closed for mem/disk/deadline).
+/// `grew = prov_max > old` (strict in-memory grow); `at_cap = base ≥
+/// prov_max` where `base = max(floor, last)` tests the DISPATCHED
+/// shape (live_040 — the retired per-axis body's at_cap derivation),
+/// so a stale floor or a clamped-at-cap `last_intent` reads as
+/// already-at-cap. This is the cores axis's `at_cap` derivation — NOT
+/// [`set_dim`]'s `target ≥ cap` (which would mark at_cap on the FIRST
+/// jump and break the two-attempt semantics). The at-cap heal-down
+/// (`old > prov_max → floor = prov_max`) is `grew=false`: the M_044
+/// persist is a GREATEST ratchet so the row stays high; the read-time
+/// [`ClampedFloor::of`] projection covers the durable row.
 ///
 /// `prov_max == 0` (the routed partition is empty or fully
 /// ICE-exhausted) is NOT compute-bound-at-cap — it's "nothing
@@ -824,32 +837,14 @@ struct CoresOutcome {
 /// disclosure handles. Return the no-op so the caller's generic
 /// budget bounds it without a misleading `ComputeBoundAtCap`
 /// diagnostic naming `0c`.
-fn bump_cores_to_provisionable(floor: &mut u32, last: u32, prov_max: u32) -> CoresOutcome {
+fn bump_cores_to_provisionable(floor: &mut u32, last: u32, prov_max: u32) -> (bool, bool) {
     if prov_max == 0 {
-        return CoresOutcome {
-            promoted: false,
-            at_cap: false,
-        };
+        return (false, false);
     }
-    let base = (*floor).max(last);
-    if base >= prov_max {
-        // The at-cap heal: a stale floor above the live provisionable
-        // max heals DOWN so the M_044 persist (a GREATEST ratchet —
-        // the row stays high) and the in-memory state diverge in the
-        // SAFE direction; the read-time [`ClampedFloor::of`]
-        // projection covers the durable row.
-        *floor = prov_max;
-        CoresOutcome {
-            promoted: false,
-            at_cap: true,
-        }
-    } else {
-        *floor = prov_max;
-        CoresOutcome {
-            promoted: true,
-            at_cap: false,
-        }
-    }
+    let old = *floor;
+    let at_cap = old.max(last) >= prov_max;
+    *floor = prov_max;
+    (prov_max > old, at_cap)
 }
 
 #[cfg(test)]
@@ -1002,8 +997,8 @@ mod tests {
     /// sh-041u red-first (e) — bug_090 floor band: a `CgroupOom` claim
     /// with a forged-LOW peak (100 MiB on a 4 GiB assigned —
     /// implausible for a real OOM) DEGRADES to soft 1.2×: never
-    /// `hard_promoted`, never rides promotion-exempt, never
-    /// M_044-persists.
+    /// `hard_grew` (so never M_044-persists), never `hard_promoted`
+    /// (so never rides promotion-exempt).
     #[test]
     fn observe_peaks_forged_low_peak_oom_degrades_to_soft() {
         let mut s = st();
@@ -1198,7 +1193,7 @@ mod tests {
             48,
             &CFG,
         );
-        assert!(!o.hard_promoted && o.at_cap_axes.contains(Axis::Cores));
+        assert!(!o.hard_grew && !o.hard_promoted && o.at_cap_axes.contains(Axis::Cores));
         assert_eq!(s.sched.resource_floor.cores, 48);
         // ICE re-opens: prov_max grows past base → promotes again.
         let o = observe_peaks(
@@ -1242,8 +1237,36 @@ mod tests {
             96,
             &CFG,
         );
-        assert!(!o.hard_promoted && o.at_cap_axes.contains(Axis::Cores));
+        assert!(!o.hard_grew && !o.hard_promoted && o.at_cap_axes.contains(Axis::Cores));
         assert_eq!(s.sched.resource_floor.cores, 96);
+    }
+
+    /// sh-041u r3: cores grow-to-cap — `floor=0, last=prov_max`
+    /// (initial dispatch sized at the partition max via the SLA p90).
+    /// `base=max(0,prov_max)≥prov_max` → at_cap, AND `floor`
+    /// strictly grows 0→prov_max → `hard_grew=true` so the M_044
+    /// persist fires. r2's `CoresOutcome{promoted}` shape returned
+    /// `promoted=false` here and skipped the persist — the bug class
+    /// the `hard_grew` split closed for mem/disk survived on cores.
+    #[test]
+    fn compute_bound_grow_to_cap_sets_hard_grew() {
+        let mut s = st();
+        s.sched.last_intent = Some(intent(0, 0, PROV_MAX, 600));
+        let o = observe(
+            &mut s,
+            ObservedPeaks {
+                cpu_seconds: Some(f64::from(PROV_MAX) * 600.0 * 0.9),
+                wall: Some(Duration::from_secs(600)),
+                ..Default::default()
+            },
+            AttemptCloseReason::ExecutorVariant,
+        );
+        assert!(
+            o.hard_grew && !o.hard_promoted && o.at_cap_axes.contains(Axis::Cores),
+            "grow-to-cap: hard_grew gates persist; hard_promoted stays \
+             kernel-disjoint with at_cap (got {o:?})"
+        );
+        assert_eq!(s.sched.resource_floor.cores, PROV_MAX);
     }
 
     #[test]
@@ -1682,7 +1705,8 @@ mod tests {
     // r[verify sched.executor.input-bounds+2]
     /// sh-041u r1 — *proposition: a forged-HIGH `cpu_seconds` (∞,
     /// NaN, or any `cpu_util > TRUST_BAND_CORES`) refuses on the
-    /// cores axis — never `hard_promoted`, never M_044-persists.*
+    /// cores axis — never `hard_grew` (so never M_044-persists),
+    /// never `hard_promoted`.*
     #[test]
     fn cores_trust_band_refuses_forged_cpu_seconds() {
         let probe = |cpu: f64| -> (FloorOutcome, u32) {
@@ -1701,12 +1725,11 @@ mod tests {
         };
         // ∞ / NaN: refused at intake (`from_report` filters
         // non-finite); a direct ObservedPeaks bypass still refuses
-        // via the band — `!(cpu_util ≤ 1.05)` is true for ∞ AND NaN
-        // (IEEE-754 unordered; sh-041u r2).
+        // via the explicit `is_nan() || > band` guard (sh-041u r3).
         for cpu in [f64::INFINITY, f64::NAN, 1e18, 600.0 * 4.0 * 1.5] {
             let (o, cores) = probe(cpu);
             assert!(
-                !o.hard_promoted && cores == 0,
+                !o.hard_promoted && !o.hard_grew && cores == 0,
                 "cpu_seconds={cpu}: forged-HIGH cpu_util refused"
             );
         }

@@ -1365,7 +1365,6 @@ impl DagActor {
                 0
             };
         let cfg = super::floor::ObserveCfg::from(&self.sla_config);
-        let mut new_floor = None;
         // sh-041u r2: presence proven by the `node()` guard above; no
         // `.await` between, no dag mutation in this span. The retired
         // `if let … else { default() }` was a dead arm.
@@ -1404,9 +1403,7 @@ impl DagActor {
         // `target < last_intent`; persisting it via the GREATEST()
         // ratchet would never heal downward, and the SLA fit's
         // pname-keyed p90 already covers the same evidence).
-        if outcome.hard_grew {
-            new_floor = Some(state.sched.resource_floor);
-        }
+        let new_floor = outcome.hard_grew.then_some(state.sched.resource_floor);
         // M_044: persist the floor so failover doesn't reset it →
         // re-OOM at probe defaults. Outside the node_mut borrow
         // (await point); best-effort — a lost write degrades to one
