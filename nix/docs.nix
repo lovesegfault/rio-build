@@ -275,14 +275,16 @@ let
         done
         # Static search index over the emitted HTML.
         pagefind --site $out --output-subdir pagefind
-        # `nix run .#docs` → serve the built tree. Only --index and the
-        # docs path are baked in; everything else (port, interface,
-        # auth, tls) passes through, e.g. `nix run .#docs -- -p 9000`.
+        # `nix run .#docs` → serve the built tree. Only the root and 404
+        # page are baked in; everything else (port, host, tls) passes
+        # through, e.g. `nix run .#docs -- -p 9000`. static-web-server
+        # serves --page404 with a real 404 status (miniserve can't —
+        # its --spa would return 200 + index.html). QA H3.
         mkdir -p $bin/bin
-        makeWrapper ${pkgs.miniserve}/bin/miniserve $bin/bin/rio-docs \
-          --add-flags "--index index.html" \
-          --add-flags "--header Cache-Control:no-cache" \
-          --add-flags "$out"
+        makeWrapper ${pkgs.static-web-server}/bin/static-web-server $bin/bin/rio-docs \
+          --add-flags "--root $out" \
+          --add-flags "--page404 404.html" \
+          --add-flags "--cache-control-headers false"
       '';
 
   # Placeholder-SHA builds for the checks gate. Distinct attrs (not
