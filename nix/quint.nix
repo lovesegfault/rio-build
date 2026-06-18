@@ -8700,14 +8700,14 @@ rec {
     # refuses an exec-pinned close whose attempt is no longer the open
     # one; newest-open-wins resolution for synthesized verdicts is the
     # falsified as-built law.
-    # r[verify sched.attempt.synthesized-verdict+3]
+    # r[verify sched.attempt.synthesized-verdict+4]
     quint-spawn-coherence-falsify-synth-close-asbuilt = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-synth-close-asbuilt";
       spec = "spawnCoherence";
       main = "spawnCoherenceSynthCloseAsBuilt";
       witness = "closeTargetsIssuedAttempt";
     };
-    # r[verify sched.attempt.synthesized-verdict+3]
+    # r[verify sched.attempt.synthesized-verdict+4]
     # r[verify ctrl.drain.disruption-target+4]
     quint-spawn-coherence-synth-close-pinned = mkQuintCheck {
       name = "spawn-coherence-synth-close-pinned";

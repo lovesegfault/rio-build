@@ -277,7 +277,7 @@ async fn establishment_window_anchored_to_dispatched_deadline() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// (f) An attempt closed charge-free by a controller-synthesized verdict
 /// is never re-established: the sweep adds no executor_crash row and no
 /// charge for that exec, even far past the window.
@@ -1189,7 +1189,7 @@ async fn witnessed_oom_promotes_mem_floor_at_establishment() -> TestResult {
 }
 
 // r[verify sched.attempt.witnessed-terminal+2]
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// sh-039 — both walls in one scenario, the live incident shape: a
 /// kubelet emptyDir-sizeLimit eviction (witnessed
 /// `EvictedEmptyDirSizeLimit`) is FOLLOWED by the controller's
@@ -1202,18 +1202,19 @@ async fn witnessed_oom_promotes_mem_floor_at_establishment() -> TestResult {
 /// by hygiene and never reached the charge arm.
 ///
 /// After the fix: the witnessed report records the mark
-/// (`Unresolved`); the synthesized `Reaped` over a recorded mark DOES
-/// NOT close — it ages the mark to `witnessed_at = 0.0` and returns
-/// `Unresolved` (the establishment sweep stays the ONE classifier;
-/// next tick charges + bumps); the next housekeeping tick establishes
-/// the attempt as `executor_crash` (NOT `disconnected`/`reaped`) and
-/// the disk floor doubles from the dispatched base
-/// (`40<<30 → 80<<30`).
+/// (`Unresolved`); the synthesized `Reaped` over a recorded mark
+/// ESTABLISHES the attempt SYNCHRONOUSLY via the witnessed reason —
+/// the durable `executor_crash` row commits and the disk floor
+/// doubles BEFORE `Resolved` returns and the controller deletes the
+/// Job (the earlier defer-to-mark shape returned `Unresolved` with
+/// the only establishment trigger in volatile memory; a leader
+/// restart in the ~5s window re-created the deadline-anchor
+/// pathology). No housekeeping tick is needed.
 #[tokio::test]
-async fn witnessed_emptydir_eviction_doubles_disk_floor_and_reaped_defers() -> TestResult {
+async fn witnessed_emptydir_eviction_doubles_disk_floor_and_reaped_establishes() -> TestResult {
     let (db, handle, _task) = setup().await;
-    let _ev = merge_single_node(&handle, Uuid::new_v4(), "wit-e", PriorityClass::Scheduled).await?;
-    let assignment = pull_deliver(&handle, "wit-e").await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "wit-f", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "wit-f").await;
     let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
     // The doubling base on the DISK dimension (1 GiB — under the
     // fixture's 6 GiB max_disk ceiling so the at-cap arm cannot mask
@@ -1222,7 +1223,7 @@ async fn witnessed_emptydir_eviction_doubles_disk_floor_and_reaped_defers() -> T
     // the bump is observable.
     assert!(
         handle
-            .debug_seed_sched_hint("wit-e", Some(1 << 28), Some(1 << 30), None, None)
+            .debug_seed_sched_hint("wit-f", Some(1 << 28), Some(1 << 30), None, None)
             .await?
     );
 
@@ -1243,7 +1244,8 @@ async fn witnessed_emptydir_eviction_doubles_disk_floor_and_reaped_defers() -> T
     // (b) The controller's terminal-absent reap fires at strikes=2
     // (~10 s) — the live incident's race. With a recorded witnessed
     // mark, the synthesized Reaped is a Job-gone handshake, NOT new
-    // evidence: it ages the mark and DOES NOT close.
+    // evidence: it establishes the attempt via the WITNESSED reason
+    // synchronously (the durable row commits before this returns).
     let res = report_attempt_outcome(
         &handle,
         exec_id,
@@ -1252,38 +1254,30 @@ async fn witnessed_emptydir_eviction_doubles_disk_floor_and_reaped_defers() -> T
     .await
     .expect("synthesized Reaped acked");
     assert!(
-        matches!(res, crate::actor::pull::AttemptResolution::Unresolved),
-        "Reaped over a witnessed mark defers to the establishment sweep \
-         (RED at base: returned Resolved)"
+        matches!(res, crate::actor::pull::AttemptResolution::Resolved),
+        "Reaped over a witnessed mark establishes synchronously and \
+         returns Resolved (the durable row is committed before the \
+         controller deletes the Job)"
     );
-    assert!(
-        attempt_rows_for(&db.pool, "wit-e").await.is_empty(),
-        "Reaped over a witnessed mark writes NO row \
-         (RED at base: wrote {{Disconnected, reaped}})"
-    );
-
-    // (c) The defer aged the mark to 0.0 — the next tick establishes
-    // immediately (no debug_backdate needed; ≤5s latency vs the
-    // hourly loop sh-039 observed).
-    tick(&handle).await?;
-    let rows = attempt_rows_for(&db.pool, "wit-e").await;
+    let rows = attempt_rows_for(&db.pool, "wit-f").await;
     assert_eq!(
         rows.len(),
         1,
-        "established exactly once on the aged witnessed clock"
+        "established exactly once, synchronously (no housekeeping tick)"
     );
     assert_eq!(
         rows[0].outcome_class,
         OutcomeClass::ExecutorCrash.as_str(),
-        "the establishment sweep classifies (NOT the charge-free \
+        "the witnessed path classifies (NOT the charge-free \
          Disconnected the synthesized Reaped wrote at base)"
     );
-    assert_ne!(
+    assert_eq!(
         rows[0].termination_reason.as_deref(),
-        Some("reaped"),
-        "the persisted reason is the sweep's, never the pre-empted Reaped"
+        Some("evicted_empty_dir_size_limit"),
+        "the persisted reason is the WITNESSED letter (RED at base: \
+         {{Disconnected, reaped}})"
     );
-    let info = expect_drv(&handle, "wit-e").await;
+    let info = expect_drv(&handle, "wit-f").await;
     assert_eq!(
         info.sched.resource_floor.disk_bytes,
         2 << 30,
@@ -1299,9 +1293,25 @@ async fn witnessed_emptydir_eviction_doubles_disk_floor_and_reaped_defers() -> T
     assert_eq!(
         info.status,
         crate::state::DerivationStatus::Ready,
-        "the drv requeues after the witnessed-clock establishment"
+        "the drv requeues after the witnessed establishment"
     );
     assert_eq!(info.retry.failure_count, 1, "charged once (C2)");
+
+    // (c) Idempotence over the consumed mark: a re-fired Reaped after
+    // the mark is consumed and the attempt is closed acks `Resolved`
+    // (matched-already-recorded — the C-2 iff) and writes nothing.
+    let res = report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("re-fired Reaped acked");
+    assert!(
+        matches!(res, crate::actor::pull::AttemptResolution::Resolved),
+        "re-fired Reaped over the closed attempt acks Resolved (idempotent)"
+    );
+    assert_eq!(attempt_rows_for(&db.pool, "wit-f").await.len(), 1);
     Ok(())
 }
 

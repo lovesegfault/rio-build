@@ -2043,7 +2043,7 @@ impl DagActor {
             }
             ReportAdmission::Process(admission) => {
                 let executor_id = ExecutorId::from(b.core.executor_id.as_str());
-                // r[impl sched.attempt.synthesized-verdict+3]
+                // r[impl sched.attempt.synthesized-verdict+4]
                 // AD5 abort charge class: a pod reporting `Cancelled`
                 // for a derivation the scheduler still wants is the
                 // SIGTERM-abort report (preemption, scale-down,
@@ -2142,7 +2142,7 @@ impl DagActor {
     /// the derivation if this attempt was still the in-flight one.
     /// Idempotent: a row already present for the exec (any classifier
     /// won first) makes the append a no-op and nothing else changes.
-    // r[impl sched.attempt.synthesized-verdict+3]
+    // r[impl sched.attempt.synthesized-verdict+4]
     /// Takes the BUILD witness: a materialization attempt cannot be
     /// closed by this path — the cross-kind call no longer typechecks
     /// (merged_bug_146's structural half).
@@ -2231,6 +2231,145 @@ impl DagActor {
                 .await;
         }
     }
+
+    /// sh-039 (revised): SYNCHRONOUS witnessed-clock establishment for
+    /// one open pull-mode attempt — the controller-synthesized verdict
+    /// arrived over a recorded witnessed-terminal mark, so the
+    /// witnessed reason is known NOW and the controller is about to
+    /// delete the Job (`delete_job_with_synthesized_report` deletes
+    /// unconditionally). Runs the establishment sweep's C2 charge arm
+    /// (`housekeeping.rs`) inline — `append_and_decide_in_tx` +
+    /// `witnessed_disposition` + `bump_resource_floor` — so the durable
+    /// row commits BEFORE the ack returns and the controller deletes
+    /// the Job. The earlier defer-to-mark shape (age `witnessed_at` to
+    /// 0.0, return `Unresolved`) left a ~5s window where the Job was
+    /// gone, the attempt was open, and the only establishment trigger
+    /// was the in-memory mark — a leader restart in that window
+    /// re-created the deadline-anchor pathology (sh-039 wall B
+    /// re-formed one failover over).
+    ///
+    /// Consumes the mark on commit; on tx failure or fence the mark
+    /// stays in place and the establishment sweep backstops (same
+    /// posture as [`Self::close_pull_attempt_uncharged`]).
+    // r[impl sched.attempt.witnessed-terminal+2]
+    async fn establish_from_witnessed(
+        &mut self,
+        attempt: &crate::db::open_attempts::BuildAttempt,
+        exec_id: Uuid,
+        witnessed_reason: rio_proto::types::AttemptTerminalReason,
+        node_name: Option<String>,
+    ) {
+        let drv_hash = DrvHash::from(attempt.core.drv_hash.as_str());
+        let executor = ExecutorId::from(attempt.core.executor_id.as_str());
+        let serving_generation = self.serving_generation;
+        let verdict_eligible = self.dag.node(&drv_hash).is_some_and(|s| {
+            matches!(
+                s.status(),
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+            )
+        });
+        let mut row = crate::db::attempts::AttemptRow::new(
+            attempt.core.derivation_id,
+            crate::state::OutcomeClass::ExecutorCrash,
+            crate::state::ReportingParty::Scheduler,
+            crate::state::AttemptKind::Build,
+        );
+        row.exec_id = Some(exec_id);
+        row.executor_id = Some(executor.clone());
+        // AD2c: prefer the controller-reported node from this very
+        // report, else the in-memory spawn-ack binding.
+        row.source_node = node_name.or_else(|| self.pull_attempt_source_node(&drv_hash));
+        // The witnessed reason's label — the row carries the
+        // controller-witnessed letter (the report this path stands in
+        // for), never the synthesized handshake's `reaped`/`cancelled`.
+        row.termination_reason = Some(attempt_terminal_reason_label(witnessed_reason).to_owned());
+        type ChargeOutcome = Option<(bool, crate::retry_policy::Decision)>;
+        let result: Result<ChargeOutcome, sqlx::Error> = async {
+            // r[impl sched.lease.generation-fence+3]
+            let mut tx = match self.db.begin_fenced(serving_generation).await? {
+                crate::db::FencedBegin::Fenced { .. } => return Ok(None),
+                crate::db::FencedBegin::Open(ftx) => ftx,
+            };
+            let (won, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
+            if won
+                && verdict_eligible
+                && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
+            {
+                crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), &drv_hash).await?;
+            }
+            tx.close_assignment(exec_id, crate::db::AssignmentCloseStatus::Failed)
+                .await?;
+            tx.commit().await?;
+            Ok(Some((won, decision)))
+        }
+        .await;
+        let (won, decision) = match result {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                info!(drv_hash = %drv_hash, serving_generation = serving_generation.as_i64(),
+                      "witnessed establishment: serving generation below the claims floor; \
+                       nothing written");
+                return;
+            }
+            Err(e) => {
+                warn!(drv_hash = %drv_hash, %exec_id, error = %e,
+                      "witnessed establishment failed; the mark stays in place \
+                       (the establishment sweep backstops)");
+                return;
+            }
+        };
+        // The charging transaction committed: the witnessed mark is
+        // consumed with the attempt.
+        self.witnessed_terminal.remove(&exec_id);
+        if !won {
+            return;
+        }
+        // The witnessed reason feeds the per-reason disposition table
+        // (the same `witnessed_disposition` + `bump_resource_floor`
+        // path the establishment sweep's witnessed arm runs;
+        // `bump_resource_floor_caller_census` files this row).
+        if let Some(witness) = super::floor::CorroborationWitness::witnessed(
+            super::floor::witnessed_disposition(witnessed_reason),
+        ) {
+            let _ = self.bump_resource_floor(&drv_hash, witness).await;
+        }
+        metrics::histogram!(
+            "rio_scheduler_attempt_requeue_seconds",
+            "cause" => "establishment"
+        )
+        .record((crate::db::attempts::epoch_now() - row.occurred_at_epoch_secs).max(0.0));
+        metrics::counter!("rio_scheduler_pull_establishments_total").increment(1);
+        if let Some(state) = self.dag.node_mut(&drv_hash) {
+            state.push_attempt_record(row.to_record());
+        }
+        self.refresh_retry_view(&drv_hash);
+        info!(
+            drv_hash = %drv_hash,
+            %exec_id,
+            executor_id = %executor,
+            witnessed_reason = attempt_terminal_reason_label(witnessed_reason),
+            "synthesized verdict over a witnessed mark: established synchronously \
+             (charged; the controller may now delete the Job)"
+        );
+        if !verdict_eligible {
+            return;
+        }
+        match decision.verdict {
+            crate::retry_policy::Verdict::Poison(_) => {
+                self.poison_already_recorded(
+                    &drv_hash,
+                    "poison threshold reached after unreported executor crashes",
+                    None,
+                    rio_proto::VerdictBacking::FreshExecution,
+                )
+                .await;
+            }
+            _ => {
+                self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+                    .await;
+            }
+        }
+    }
 }
 
 /// 124(d): how long after an `AckSpawnedIntents{spawned}` covering an
@@ -2266,16 +2405,20 @@ pub(crate) fn attempt_terminal_reason_label(
 
 impl DagActor {
     /// Handle one `ReportAttemptOutcome` (the unified pod-terminal
-    /// intake, scheduler half). Idempotent: the only writes it ever
-    /// performs are the reason-only second-installment fill on an
-    /// existing, still-unfilled classification row and the in-memory
-    /// witnessed-terminal MARK for an unclassified open attempt
-    /// (first-witnessed-wins — a level-triggered re-report re-creates
-    /// an absent mark and otherwise changes nothing); it never inserts
-    /// a row, never consumes budget, and never bumps a floor. The
-    /// intake MARKS; the establishment sweep ACTS — on the witnessed
-    /// clock (`witnessed_at + establishment_report_slack`) for marked
-    /// attempts, on the dispatch deadline for everything else.
+    /// intake, scheduler half). Idempotent: a pod-terminal letter for
+    /// an unclassified open attempt records the in-memory
+    /// witnessed-terminal MARK (first-witnessed-wins — a
+    /// level-triggered re-report re-creates an absent mark and
+    /// otherwise changes nothing); a worker-reported row's
+    /// second-installment reason-only fill writes once. The intake
+    /// MARKS; the establishment sweep ACTS — on the witnessed clock
+    /// (`witnessed_at + establishment_report_slack`) for marked
+    /// attempts, on the dispatch deadline for everything else. The
+    /// only intake arm that inserts a row, charges budget, or bumps a
+    /// floor is the synthesized verdict OVER a recorded witnessed
+    /// mark, which establishes synchronously
+    /// ([`Self::establish_from_witnessed`] — the durable write must
+    /// commit before the controller deletes the Job).
     ///
     /// The no-attempt arm (a pod that died without ever completing a
     /// pull) acknowledges and charges nothing; its only permitted side
@@ -2320,7 +2463,7 @@ impl DagActor {
                 .handle_no_eligible_source(&identity, resubmit_cycle)
                 .await;
         }
-        // r[impl sched.attempt.synthesized-verdict+3]
+        // r[impl sched.attempt.synthesized-verdict+4]
         // Synthesized verdicts (cancelled / preempted / reaped) REQUIRE
         // the attempt's exec_id (merged_bug_135): the controller holds
         // it from the same ListOpenAttempts read that justified the
@@ -2519,8 +2662,9 @@ impl DagActor {
         //     own PRIOR pod-terminal classification, recorded as a
         //     witnessed mark below. A synthesized verdict over a
         //     recorded witnessed mark is a Job-gone handshake, never
-        //     new evidence: it DEFERS to the mark (sh-039 wall B —
-        //     the terminal-absent reap at strikes=2 ≈ 10s otherwise
+        //     new evidence: it ESTABLISHES the attempt via the
+        //     witnessed reason synchronously (sh-039 wall B — the
+        //     terminal-absent reap at strikes=2 ≈ 10s otherwise
         //     pre-empted the witnessed slack=120s and closed
         //     charge-free as `disconnected`/`reaped`, so the floor
         //     never moved and the budget never charged). Absent a
@@ -2531,38 +2675,29 @@ impl DagActor {
         //     deadline, plain error) keep waiting: the establishment
         //     sweep stays their classifier (the 1b gate text), because
         //     the worker's own classifying report may still arrive.
-        // r[impl sched.attempt.synthesized-verdict+3]
+        // r[impl sched.attempt.synthesized-verdict+4]
         use rio_proto::types::AttemptTerminalReason as R;
         if b.core.assignment_active && matches!(reason, R::Cancelled | R::Preempted | R::Reaped) {
-            // sh-039: defer to a recorded witnessed mark — age it to
-            // `witnessed_at = 0.0` (the in-memory twin of
-            // `debug_backdate_witnessed_mark`, handle.rs) so the NEXT
-            // housekeeping tick (~5s) establishes immediately, and
-            // return Unresolved. The establishment sweep stays the
-            // ONE classifier (no second `bump_resource_floor` caller,
-            // no second `won`-flag consumer; the
-            // `bump_resource_floor_caller_census` audit at
-            // db/live_pins.rs holds). Idempotent: a re-fired Reaped
-            // re-ages the same mark and re-returns Unresolved; the
-            // controller deletes the Job unconditionally
-            // (`delete_job_with_synthesized_report`), so Unresolved
-            // here causes neither a controller hang nor a retry loop
-            // — `VerdictWitness::from_resolved_ack` correctly
-            // withholds the futility-breaker reset on Unresolved (the
-            // merged_bug_080(2b) "a charge-free ack witnesses
-            // nothing" semantics; the verdict surfaces one tick later
-            // via the sweep, scheduler-internal).
-            if let Some(mark) = self.witnessed_terminal.get_mut(&exec_id) {
-                mark.witnessed_at = 0.0;
-                debug!(
-                    %exec_id,
-                    drv_hash = %b.core.drv_hash,
-                    ?reason,
-                    witnessed_reason = ?mark.reason,
-                    "controller-synthesized verdict over a recorded witnessed mark: \
-                     deferring to the establishment sweep (mark aged; next tick charges)"
-                );
-                return Ok(AttemptResolution::Unresolved);
+            // sh-039 (revised): a recorded witnessed mark means the
+            // controller already classified this attempt (the
+            // pod-terminal letter); the synthesized verdict is the
+            // Job-gone handshake, and the controller deletes the Job
+            // UNCONDITIONALLY on return
+            // (`delete_job_with_synthesized_report`). The earlier
+            // defer-to-mark shape (age the mark, return `Unresolved`)
+            // left the only establishment trigger in volatile memory
+            // while the Job was being deleted — a leader restart in
+            // the ~5s window re-created the deadline-anchor pathology
+            // sh-039 set out to fix. Establish synchronously instead:
+            // the durable row commits BEFORE the controller deletes
+            // the Job (`establish_from_witnessed` runs the
+            // establishment sweep's C2 charge arm + the
+            // witnessed-disposition floor bump inline), the mark is
+            // consumed, and `Resolved` returns truthfully.
+            if let Some(mark) = self.witnessed_terminal.get(&exec_id).copied() {
+                self.establish_from_witnessed(b, exec_id, mark.reason, node_name)
+                    .await;
+                return Ok(AttemptResolution::Resolved);
             }
             let drv_hash = DrvHash::from(b.core.drv_hash.as_str());
             // AD2c: prefer the controller-reported node from this very

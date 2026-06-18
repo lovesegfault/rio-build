@@ -3065,10 +3065,14 @@ pub(super) async fn reap_stale_for_intents(
                 // The ladder is gated on `StaleTerminal` alone (the
                 // still-WANTED arm). `TerminalAbsent` (sh-021) is
                 // excluded BY CONSTRUCTION: its discriminator is the
-                // open attempt existing (`source_node`-agnostic), so
-                // the synthesized close is `ReportedVerdict` →
-                // `no_verdict_at_delete=false` AND the chokepoint's
-                // `note_resolution` already CLEARED the streak. A
+                // open attempt existing (`source_node`-agnostic), and
+                // the synthesized close resolves via the
+                // witnessed-mark path (sh-039: synchronous witnessed
+                // establishment) when a mark exists, else the
+                // charge-free close — both return `Resolved` →
+                // `ReportedVerdict` → `no_verdict_at_delete=false`
+                // AND the chokepoint's `note_resolution` already
+                // CLEARED the streak. A
                 // spot-churn loop that repeatedly kills pods after
                 // pull is therefore unbounded by the ladder — the
                 // standing E5 charge-free `Requeue` contract every

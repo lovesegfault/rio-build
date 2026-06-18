@@ -1198,6 +1198,13 @@ mod registration_writer_census {
             // axis on E3a).
             ("actor/completion.rs".to_string(), 3),
             ("actor/housekeeping.rs".to_string(), 1),
+            // sh-039 (revised): the synchronous witnessed-clock
+            // establishment (`establish_from_witnessed`) — the
+            // synthesized verdict over a recorded witnessed mark runs
+            // the same witnessed-disposition bump the establishment
+            // sweep does, inline, so the durable row commits before
+            // the controller deletes the Job.
+            ("actor/pull.rs".to_string(), 1),
         ]
         .into();
         assert_census(&hits, &expected, "bump_resource_floor callers")

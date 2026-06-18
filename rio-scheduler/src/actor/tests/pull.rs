@@ -889,7 +889,7 @@ async fn exec_charge_facts(
     .expect("exec charge facts")
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+5]
 /// A controller-synthesized Preempted verdict (exec-pinned — the
 /// disruption watcher resolves the open attempt first, merged_bug_135)
@@ -968,7 +968,7 @@ async fn attempt_outcome_synthesized_preempted_closes_uncharged_and_requeues() -
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// The same close keyed by exec_id with reason Reaped (the
 /// synthesize-on-delete shape used by the controller's reap arms).
 #[tokio::test]
@@ -998,7 +998,7 @@ async fn attempt_outcome_synthesized_reaped_by_exec_id_closes_uncharged() -> Tes
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// Pod-terminal reasons that are NOT controller-synthesized verdicts
 /// (OOM, eviction, deadline, plain error) keep the as-built behavior on
 /// an unclassified open attempt: acknowledged, nothing written — the
@@ -1032,7 +1032,7 @@ async fn attempt_outcome_pod_terminal_reason_still_waits_for_establishment() -> 
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// The builder's AD5 SIGTERM-abort report (`BuildResultStatus::Cancelled`
 /// on a still-wanted derivation) resolves the pull attempt charge-free
 /// and requeues it — never an infrastructure-failure charge.
@@ -1091,7 +1091,7 @@ async fn report_outcome_worker_abort_still_wanted_closes_uncharged() -> TestResu
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// A genuinely-cancelled (no-longer-wanted) derivation keeps the cancel
 /// arm's exact shape: the worker's abort report after CancelBuild writes
 /// nothing, charges nothing, and the drv stays Cancelled (never
@@ -1863,7 +1863,7 @@ async fn report_attempt_outcome_both(
         .expect("actor alive")
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// The disruption-watcher shape (intent id + Job name, no exec) for a
 /// PULL-mode pod still resolves and closes the pull attempt — the
 /// stream-identity routing guard must not divert reports whose job
@@ -2005,7 +2005,7 @@ async fn build_mint_floors_deadline_at_carried_rendered() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// merged_bug_135's recorded red, kept as the regression pin: a
 /// synthesized verdict (Preempted here) WITHOUT an exec_id — the
 /// pre-fix disruption-watcher shape — is REFUSED: acknowledged, nothing
@@ -2055,7 +2055,7 @@ async fn synthesized_verdict_requires_exec_id() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+3]
+// r[verify sched.attempt.synthesized-verdict+4]
 /// §4.R4's four-cell conjunction, pinned in one test: the AD2c
 /// source-node fill runs iff (Build witness) AND (exec_id-resolved).
 /// Cells: (build, exec) ⇒ fills; (build, intent) ⇒ skipped;
@@ -2298,7 +2298,7 @@ async fn oom_floor_doubles_from_minted_intent() -> TestResult {
 /// resolution PER ARM. Census generator: rustc exhaustiveness over the
 /// `Result<AttemptResolution, PullRejection>` returns of BOTH fns — a
 /// new return site does not compile without stating its resolution;
-/// this table enumerates the live sites (14 = 11 Unresolved + 3
+/// this table enumerates the live sites (14 = 10 Unresolved + 4
 /// Resolved at sh-039).
 ///
 /// Witness strength: certifies the bit's truthfulness at its producer
@@ -2310,7 +2310,7 @@ async fn oom_floor_doubles_from_minted_intent() -> TestResult {
 /// |-----|--------------------------------------------|------------|
 /// | F2  | no matching attempt                        | Unresolved |
 /// | F4  | unclassified open attempt, pod-terminal    | Unresolved |
-/// | F11 | synthesized verdict over a witnessed mark  | Unresolved |
+/// | T4  | synthesized verdict over a witnessed mark  | Resolved   |
 /// | T3  | synthesized close of an open attempt       | Resolved   |
 /// | F1  | synthesized verdict without exec_id        | Unresolved |
 /// | T2  | second-installment reason fill             | Resolved   |
@@ -2326,7 +2326,7 @@ async fn oom_floor_doubles_from_minted_intent() -> TestResult {
 /// Row F3 is asserted in its harness home —
 /// `materialize.rs::controller_verdict_never_consumes_materialization_attempt`
 /// (the arm requires a store-claim attempt; the assertion there is
-/// this table's thirteenth row). The wire mapping of the typed reply
+/// this table's fourteenth row). The wire mapping of the typed reply
 /// (`Resolved ⇒ attempt_resolved=true`, else false) is a single
 /// `matches!` at the admin response constructor, exercised by the
 /// admin handler path; proto3 absent-field skew reads false (bounded
@@ -2344,7 +2344,7 @@ async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
         "F2: no-matching-attempt acks Unresolved"
     );
 
-    // Open attempt for F4/T3.
+    // Open attempt for F4/T4.
     let _ev = merge_single_node(
         &handle,
         Uuid::new_v4(),
@@ -2361,16 +2361,17 @@ async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
         "F4: unclassified-open-attempt ack is Unresolved (establishment \
          sweep remains the classifier)"
     );
-    // F11 (sh-039) — synthesized verdict over a recorded witnessed
-    // mark: DEFERS to the establishment sweep (the mark holds the
-    // controller's REAL classification; Reaped/Cancelled is the
-    // Job-gone handshake, never new evidence). The mark is aged to 0
-    // and the attempt stays open.
+    // T4 (sh-039) — synthesized verdict over a recorded witnessed
+    // mark: ESTABLISHES the attempt via the witnessed reason
+    // synchronously (the mark holds the controller's REAL
+    // classification; Reaped/Cancelled is the Job-gone handshake,
+    // never new evidence). The durable row commits before the ack
+    // returns; the controller may now delete the Job.
     assert_eq!(
         report_attempt_outcome(&handle, None, Some(exec_open), Reason::Cancelled).await,
-        Ok(R::Unresolved),
-        "F11: synthesized verdict over a witnessed mark defers \
-         (sh-039 — the establishment sweep remains the classifier)"
+        Ok(R::Resolved),
+        "T4: synthesized verdict over a witnessed mark establishes \
+         synchronously via the witnessed reason (sh-039)"
     );
 
     // T3 — synthesized close of an open attempt with NO prior

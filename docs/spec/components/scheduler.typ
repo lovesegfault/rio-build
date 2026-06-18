@@ -3668,7 +3668,7 @@ This carries forward the as-built rule that never-assigned/assigned-only pod
 deaths never count (the `recently_disconnected` no-entry no-op arms), re-keyed
 onto the durable open-attempt view.
 
-#r("sched.attempt.synthesized-verdict+3")[
+#r("sched.attempt.synthesized-verdict+4")[
   A controller-synthesized terminal report (reason cancelled, preempted, or
   reaped) MUST name the attempt by `exec_id`: the scheduler refuses
   (acknowledges charge-free, resolves nothing) a synthesized verdict that
@@ -3681,7 +3681,14 @@ onto the durable open-attempt view.
   generation-fenced appending transaction --- exactly one uncharged terminal
   row whose `termination_reason` carries the synthesized reason, with the
   assignment row closed --- and MUST requeue a still-wanted derivation at
-  that fold, never at the establishment sweep. A worker `ReportOutcome`
+  that fold, never at the establishment sweep --- EXCEPT over a recorded
+  witnessed-terminal mark, in which case the synthesized verdict MUST
+  establish the attempt via the witnessed reason synchronously (not defer):
+  one charged `ExecutorCrash` row plus the witnessed-disposition floor bump
+  in one generation-fenced transaction, committed BEFORE the ack returns,
+  so the controller's unconditional Job deletion never leaves an open
+  attempt whose only establishment trigger is the in-memory mark. A worker
+  `ReportOutcome`
   whose result is `Cancelled` for a still-wanted open pull-mode build
   attempt (the AD5 SIGTERM-abort report) MUST resolve the same way ---
   charge-free closure and requeue, never an infrastructure-failure charge
