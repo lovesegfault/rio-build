@@ -1,83 +1,37 @@
-// shiroa book manifest. `shiroa build` reads `<shiroa-book-meta>` from
-// this file to discover the chapter list; chapter paths are resolved
-// relative to this file (and absolute `/lib/...` imports inside
-// chapters resolve against `--root`).
-//
-// print.html: intentionally not generated — `nix build .#docs-pdf`
-// (the stitched book-pdf.typ aggregate) is the print equivalent.
-// shiroa-mdbook hardcodes `print-enable = false` anyway.
-//
-// Known console warning: shiroa.js:4262 "deprecated parameters for
-// initSync()" — wasm-bindgen API churn in the typst.ts renderer
-// bundle (rio-pin's vendored assets/artifacts/shiroa.js). Benign;
-// patching the generated bundle is fragile. Tracked at
-// Myriad-Dreamin/typst.ts for the next renderer release.
-#import "@preview/shiroa:0.3.1": *
+// docs/book.typ — native typst bundle entry point.
+// `typst compile --features bundle,html --format bundle` walks the
+// chapter manifest and emits one `document()` per page plus static
+// assets. Each chapter `.typ` applies `#show: rio.with(...)` itself,
+// so this file only routes + wraps in the page shell. PDF stitching
+// is `book-pdf.typ`.
+#import "/lib/html/meta.typ": chapters, flatten-chapters, route-for
+#import "/lib/html/page.typ": page-shell
+#import "/lib/rio.typ": bundle-mode
 
-#show: book
+// Bundle mode shares one label/state space across all `document()`
+// calls; tell rio() to skip per-chapter `_gloss-anchors` so
+// glossary.typ's `print-glossary` is the sole `<key>` emitter.
+#bundle-mode()
 
-// Default dest-dir is `./dist` (= docs/dist/, gitignored). shiroa's
-// watcher is typst-dependency-based, not directory-recursive, so
-// writing here does NOT trigger spurious rebuilds. nix/docs.nix
-// passes `-d $out` explicitly so this only matters for local builds.
-#build-meta(dest-dir: "./dist")
+#for c in flatten-chapters(chapters).filter(c => c.path != none) {
+  let route = route-for(c.path)
+  document(
+    route + ".html",
+    title: c.title,
+    page-shell(route, c.title, c.path)[#include "/" + c.path],
+  )
+}
 
-#book-meta(
-  title: "rio-build design book",
-  repository: "https://github.com/lovesegfault/rio-build",
-  repository-edit: "https://github.com/lovesegfault/rio-build/edit/main/docs/{path}",
-  summary: [
-    #chapter("intro.typ")[Introduction]
-    = Guide
-    #chapter("guide/setup.typ")[Setup]
-    #chapter("guide/ci.typ")[CI Integration]
-    #chapter("guide/programmatic.typ")[Programmatic Access]
-    = Architecture
-    #chapter("architecture.typ")[System Architecture]
-    // Nested parts work since shiroa-mdbook is built from our fork
-    // (rio-pin → PR #239: items.sum(default: [])); upstream 0.3.1
-    // crashes on a `=` part with no direct chapters.
-    = Spec
-    == System
-    #chapter("spec/system/observability.typ")[Observability]
-    #chapter("spec/system/security.typ")[Security & Threat Model]
-    #chapter("spec/system/tenancy.typ")[Multi-Tenancy]
-    #chapter("spec/system/failure-modes.typ")[Failure Modes]
-    #chapter("spec/system/verification.typ")[Verification]
-    #chapter("spec/system/deployment.typ")[Deployment]
-    #chapter("spec/system/crate-structure.typ")[Crate Structure]
-    == Components
-    #chapter("spec/components/proto.typ")[Protocol]
-    #chapter("spec/components/gateway.typ")[Gateway]
-    - #chapter("spec/components/scheduler.typ")[Scheduler]
-      - #chapter("spec/components/sla-sizing.typ")[SLA-Driven Sizing]
-    #chapter("spec/components/builder.typ")[Builder]
-    #chapter("spec/components/fetcher.typ")[Fetcher]
-    - #chapter("spec/components/store.typ")[Store]
-      - #chapter("spec/components/lazy-store.typ")[Lazy Store Filesystem]
-    #chapter("spec/components/controller.typ")[Controller]
-    #chapter("spec/components/dashboard.typ")[Dashboard]
-    #chapter("spec/components/cli.typ")[CLI]
-    = Reference
-    #chapter("ref/configuration.typ")[Configuration]
-    #chapter("ref/errors.typ")[Error Taxonomy]
-    #chapter("ref/metrics.typ")[Metric Reference]
-    #chapter("ref/alerts.typ")[Alert Rules]
-    = Ops
-    #chapter("ops/capacity-planning.typ")[Capacity Planning]
-    #chapter("ops/gc-enablement.typ")[GC Enablement]
-    #chapter("ops/eks-smoke.typ")[EKS Smoke Test]
-    #chapter("ops/sla-model.typ")[SLA Model Runbook]
-    #chapter("ops/hung-node-manual-reap.typ")[Hung-Node Manual Reap]
-    #chapter("ops/pull-rollout-checklist.typ")[Pull Rollout Checklist]
-    #chapter(
-      "ops/gateway-deployment-checklist.typ",
-    )[Gateway Deployment Checklist]
-    #chapter(
-      "ops/materialization-deployment-checklist.typ",
-    )[Materialization Deployment Checklist]
-    = Appendix
-    #chapter("glossary.typ")[Glossary]
-    #chapter("contributing.typ")[Contributing]
+#asset("style.css", read("/assets/style.css", encoding: none))
+#asset("theme.js", read("/assets/theme.js", encoding: none))
+
+// 404: minimal shell, no chapter body.
+#document(
+  "404.html",
+  title: "Not Found",
+  page-shell("404", "Not Found", "intro.typ")[
+    The page you are looking for does not exist.
+    #linebreak()
+    #html.elem("a", attrs: (href: "/"))[← rio-build design book]
   ],
 )

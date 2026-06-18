@@ -233,6 +233,13 @@
 // the `target` check in rio() — the state is the fallback for direct CLI.
 #let _book-mode = state("rio-book-mode", false)
 #let book-pdf-mode() = _book-mode.update(true)
+// True when compiling the multi-document HTML bundle (book.typ). In
+// bundle mode all `document()` calls share ONE label/state space, so
+// per-chapter `_gloss-anchors` would collide with glossary.typ's
+// `print-glossary` — book.typ sets this and glossary.typ becomes the
+// sole `<key>` emitter (cross-document `@key` refs resolve there).
+#let _bundle-mode = state("rio-bundle-mode", false)
+#let bundle-mode() = _bundle-mode.update(true)
 
 // glossarium per-chapter wiring. `@key`/`#gls("key")` resolve via
 // `link(label(key), …)` to a `figure(kind: "glossarium_entry")<key>` —
@@ -828,7 +835,9 @@
   // here so they land after all show rules. Gated on `_gloss-done` (one
   // set per document) and `_book-mode` (book-pdf's included
   // sla-sizing.typ prints the real glossary, supplying the labels).
-  context if not _gloss-done.get() and not _book-mode.get() {
+  context if (
+    not _gloss-done.get() and not _book-mode.get() and not _bundle-mode.get()
+  ) {
     _gloss-anchors
   }
   _gloss-done.update(true)

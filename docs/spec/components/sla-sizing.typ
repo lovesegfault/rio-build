@@ -9,6 +9,11 @@
 // Notation / Terms), so it owns the `<key>` anchors — tell `rio()` not
 // to emit its hidden anchor set.
 #provides-glossary()
+// In the HTML bundle (book.typ) all chapters share one label space, so
+// this chapter's `print-glossary` calls would collide with
+// glossary.typ's. `_pg` no-ops there; `@key` refs resolve to
+// glossary.html instead.
+#let _pg(..a) = context if _bundle-mode.get() [] else { print-glossary(..a) }
 
 #show: rio.with(
   domains: ("sched.sla", "sched.admin"),
@@ -31,7 +36,7 @@
 
 #heading(level: 2, numbering: none, outlined: false)[Rio concepts]
 
-#print-glossary(
+#_pg(
   glossary-entries,
   groups: ("Rio concepts",),
   show-all: true,
@@ -43,7 +48,7 @@
 
 Hatted symbols ($hat(S)$, $hat(theta)$, $hat(sigma)$) denote fitted estimates of the corresponding true quantity.
 
-#print-glossary(
+#_pg(
   glossary-entries,
   groups: ("Notation",),
   show-all: true,
@@ -1313,7 +1318,7 @@ pull, so no scheduler-side override exists to apply.
 
 = Glossary
 
-#print-glossary(
+#_pg(
   glossary-entries,
   groups: ("Terms",),
   show-all: true,
