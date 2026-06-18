@@ -7,7 +7,7 @@
 # path runs through self-authorizing callees, e.g. the consulted
 # placeholder reap). Regenerate by running destructive_body_census
 # and pasting the failure output's derived rows.
-backend.rs	exists_batch	via:run
+backend/mod.rs	exists_batch	via:run
 gc/collect.rs	collect_cycle	in-loop
 gc/collect.rs	run_post_drain_tail	in-loop
 gc/drain.rs	drain_once	in-loop
@@ -15,8 +15,12 @@ gc/orphan.rs	scan_once	in-loop
 gc/sweep.rs	sweep	in-loop
 gc/sweep.rs	sweep	via:drop
 grpc/admin.rs	verify_chunks	via:exists_batch
+grpc/put_path/common.rs	wait_for_concurrent_upload	via:claim_placeholder
 grpc/put_path_batch.rs	commit_batch	via:drop
 grpc/put_path_batch.rs	put_path_batch_impl	via:claim_placeholder,stage_nar_for_batch
+grpc/put_path_chunked/mod.rs	claim_ca_placeholders	via:claim_placeholder
+grpc/put_path_chunked/mod.rs	commit_chunked	via:drop
+grpc/put_path_chunked/mod.rs	put_path_chunked_impl	via:claim_placeholder,wait_for_concurrent_upload
 logs/service.rs	cut_while_due	via:do_cut
 logs/service.rs	drain	via:cut_bounded
 logs/service.rs	drive	via:cut_once_if_nonempty,on_inbound

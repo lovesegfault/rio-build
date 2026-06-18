@@ -1742,8 +1742,9 @@ async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
     //   die with their session); loops INSIDE a fn that itself
     //   demands `BatchAuthority` are within the one batch that token
     //   funds (`sweep_one_batch`'s lock/delete passes); loops inside
-    //   the sink-layer fns (`delete_batch`/`delete_by_key` backend
-    //   impls) are intra-sink — the caller's token funded the call.
+    //   the sink-layer fns (`delete_batch`/`delete_by_key`/
+    //   `delete_by_keys` backend impls) are intra-sink — the caller's
+    //   token funded the call.
 
     /// Durable-victim refusal: `DELETE FROM <ident>` over anything
     /// NOT in the session-temp exemption list is a durable sink; an
@@ -1901,6 +1902,10 @@ async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
         "manifests",
         "manifest_data",
         "pending_s3_deletes",
+        // Castore directory refcounts: `decrement_directory_refs`
+        // hard-deletes zeroed digests inside `sweep_one_batch` (which
+        // takes BatchAuthority by value) — gc-victim, same hold law.
+        "directories",
     ];
     const DUAL_TABLES: &[&str] = &["log_ingest_sessions"];
 
@@ -2228,8 +2233,16 @@ async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
                     continue;
                 }
                 // Typed exemption: the sink-layer impls themselves
-                // (the caller's token funded the call).
-                if fn_name == "delete_batch" || fn_name == "delete_by_key" {
+                // (the caller's token funded the call). The trait
+                // cannot demand BatchAuthority — backend → gc::hold
+                // would be circular — so the type-level demand sits
+                // at the production CALLERS (`drain_one_batch`,
+                // `sweep_one_batch`), and the sink-layer fn names are
+                // the typed exemption boundary.
+                if fn_name == "delete_batch"
+                    || fn_name == "delete_by_key"
+                    || fn_name == "delete_by_keys"
+                {
                     continue;
                 }
                 for lbody in loops_in(&fbody) {
