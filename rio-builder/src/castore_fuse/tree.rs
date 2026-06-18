@@ -332,7 +332,25 @@ impl InoMap {
             });
             crate::upload::common::attach_assignment_token(&mut req, assignment_token)?;
             let fetch = async {
-                let mut stream = client.get_directory(req).await?.into_inner();
+                // streaming-open-ban: bound the open itself; the outer
+                // tokio::time::timeout below still bounds open+consume
+                // together at the same `timeout`, so the inner TimedOut
+                // arm is dominated and serves as the structural witness.
+                let open = rio_common::transport::bounded_open(
+                    std::future::pending(),
+                    timeout,
+                    client.get_directory(req),
+                )
+                .await;
+                let mut stream = match open {
+                    rio_common::transport::OpenOutcome::Opened(r) => r?.into_inner(),
+                    rio_common::transport::OpenOutcome::TimedOut { .. }
+                    | rio_common::transport::OpenOutcome::Aborted => {
+                        return Err(tonic::Status::deadline_exceeded(
+                            "GetDirectory open timed out",
+                        ));
+                    }
+                };
                 let mut out = Vec::new();
                 while let Some(dir) = stream.message().await? {
                     out.push(dir);

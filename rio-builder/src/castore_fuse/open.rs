@@ -804,7 +804,23 @@ impl Opener {
         attach_token(&mut req, &self.assignment_token).map_err(StreamBlobError::Fatal)?;
         let fetched = self.runtime.block_on(async {
             tokio::time::timeout(timeout, async {
-                let mut stream = client.read_blob(req).await?.into_inner();
+                // streaming-open-ban: bound the open itself; the outer
+                // tokio::time::timeout still bounds open+consume at the
+                // same `timeout`, so the inner TimedOut arm is dominated
+                // and serves as the structural witness.
+                let open = rio_common::transport::bounded_open(
+                    std::future::pending(),
+                    timeout,
+                    client.read_blob(req),
+                )
+                .await;
+                let mut stream = match open {
+                    rio_common::transport::OpenOutcome::Opened(r) => r?.into_inner(),
+                    rio_common::transport::OpenOutcome::TimedOut { .. }
+                    | rio_common::transport::OpenOutcome::Aborted => {
+                        return Err(tonic::Status::deadline_exceeded("ReadBlob open timed out"));
+                    }
+                };
                 let mut hasher = blake3::Hasher::new();
                 let mut written: u64 = 0;
                 while let Some(chunk) = stream.message().await? {

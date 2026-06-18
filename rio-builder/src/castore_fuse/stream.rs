@@ -613,16 +613,25 @@ impl RemoteChunks {
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let mut req = tonic::Request::new(stream);
         attach_token(&mut req, assignment_token)?;
-        match tokio::time::timeout(timeout, client.get_chunks(req)).await {
-            Err(_elapsed) => {
+        // FUSE callback context has no abort token — pending() degrades
+        // bounded_open to a pure deadline race (streaming-open-ban).
+        match rio_common::transport::bounded_open(
+            std::future::pending(),
+            timeout,
+            client.get_chunks(req),
+        )
+        .await
+        {
+            rio_common::transport::OpenOutcome::TimedOut { .. }
+            | rio_common::transport::OpenOutcome::Aborted => {
                 tracing::warn!(?timeout, "GetChunks stream open timed out");
                 Err(Errno::EIO)
             }
-            Ok(Err(status)) => {
+            rio_common::transport::OpenOutcome::Opened(Err(status)) => {
                 tracing::warn!(%status, "GetChunks stream open failed");
                 Err(Errno::EIO)
             }
-            Ok(Ok(resp)) => Ok(Self {
+            rio_common::transport::OpenOutcome::Opened(Ok(resp)) => Ok(Self {
                 tx,
                 rx: resp.into_inner(),
             }),
@@ -705,16 +714,26 @@ async fn fill_from_readblob(
     attach_token(&mut req, &ctx.assignment_token)?;
     let timeout = jit_fetch_timeout(ctx.fetch_timeout, ctx.size);
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut stream = match tokio::time::timeout_at(deadline, client.read_blob(req)).await {
-        Err(_elapsed) => {
+    // FUSE callback context has no abort token — pending() degrades
+    // bounded_open to a pure deadline race (streaming-open-ban). The
+    // consume loop below stays on the shared `deadline`.
+    let mut stream = match rio_common::transport::bounded_open(
+        std::future::pending(),
+        timeout,
+        client.read_blob(req),
+    )
+    .await
+    {
+        rio_common::transport::OpenOutcome::TimedOut { .. }
+        | rio_common::transport::OpenOutcome::Aborted => {
             tracing::warn!(digest = %hex::encode(ctx.digest), "ReadBlob timed out");
             return Err(Errno::EIO);
         }
-        Ok(Err(status)) => {
+        rio_common::transport::OpenOutcome::Opened(Err(status)) => {
             tracing::warn!(digest = %hex::encode(ctx.digest), %status, "ReadBlob failed");
             return Err(Errno::EIO);
         }
-        Ok(Ok(resp)) => resp.into_inner(),
+        rio_common::transport::OpenOutcome::Opened(Ok(resp)) => resp.into_inner(),
     };
     let mut offset: u64 = 0;
     loop {

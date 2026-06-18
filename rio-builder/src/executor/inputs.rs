@@ -466,14 +466,31 @@ pub(super) async fn resolve_castore_roots(
         reason: msg,
     };
     let consume = async {
-        let mut stream = client
-            .get_nar_index_batch(request)
-            .await
-            .map_err(|status| ExecutorError::MetadataFetch {
-                path: needs[0].0.clone(),
-                source: status,
-            })?
-            .into_inner();
+        // streaming-open-ban: bound the open itself; the outer
+        // tokio::time::timeout below still bounds open+consume together
+        // at the same GRPC_STREAM_TIMEOUT, so the inner TimedOut arm is
+        // dominated and serves as the structural witness.
+        let open = rio_common::transport::bounded_open(
+            std::future::pending(),
+            rio_common::grpc::GRPC_STREAM_TIMEOUT,
+            client.get_nar_index_batch(request),
+        )
+        .await;
+        let mut stream = match open {
+            rio_common::transport::OpenOutcome::Opened(r) => r
+                .map_err(|status| ExecutorError::MetadataFetch {
+                    path: needs[0].0.clone(),
+                    source: status,
+                })?
+                .into_inner(),
+            rio_common::transport::OpenOutcome::TimedOut { .. }
+            | rio_common::transport::OpenOutcome::Aborted => {
+                return Err(infra(
+                    &needs[0].0,
+                    "GetNarIndexBatch open timed out".to_string(),
+                ));
+            }
+        };
         let mut by_hash: HashMap<Vec<u8>, Option<rio_proto::types::NarIndex>> = HashMap::new();
         while let Some(resp) =
             stream

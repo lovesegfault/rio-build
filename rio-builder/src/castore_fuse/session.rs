@@ -111,7 +111,7 @@ pub enum SessionError {
     /// The mountd handshake (or a later mountd request) failed.
     #[error("mountd: {0}")]
     Mountd(#[from] MountdError),
-    /// The closure DAG prefetch / [`InoMap`](crate::castore_fuse::tree::InoMap)
+    /// The closure DAG prefetch / [`InoMap`]
     /// construction failed.
     #[error("DAG prefetch: {0}")]
     Prefetch(#[from] TreeError),
