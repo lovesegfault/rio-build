@@ -790,6 +790,7 @@ mod registration_writer_census {
             "grpc/tests/submit_tests.rs",
             include_str!("../grpc/tests/submit_tests.rs"),
         ),
+        ("guard.rs", include_str!("../guard.rs")),
         ("lease_hooks.rs", include_str!("../lease_hooks.rs")),
         ("lib.rs", include_str!("../lib.rs")),
         ("main.rs", include_str!("../main.rs")),
