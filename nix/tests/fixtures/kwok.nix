@@ -60,12 +60,12 @@ let
     cat ${
       pkgs.fetchurl {
         url = "https://raw.githubusercontent.com/kubernetes-sigs/karpenter/v${pins.addons.karpenter.version}/pkg/apis/crds/karpenter.sh_nodeclaims.yaml";
-        sha256 = "0kb4z10l83fn0rj2drydzsciq6yck0a42g2llm5qlrxz0bhnn525";
+        sha256 = "1ygs4ss8hxs0gqh9g7rh9305yawsr25zyaxq2xbvj9nsv5x20bki";
       }
     } ${
       pkgs.fetchurl {
         url = "https://raw.githubusercontent.com/kubernetes-sigs/karpenter/v${pins.addons.karpenter.version}/pkg/apis/crds/karpenter.sh_nodepools.yaml";
-        sha256 = "0nxhxk65wia17v85mcsni1djz38d5303brkkx0wbrzjyapi4q7lf";
+        sha256 = "1681f7i076pw00p6lmhzykghbx15pqfsj0h60x0aq9wl9rwn60hl";
       }
     } > $out
   '';
