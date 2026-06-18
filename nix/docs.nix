@@ -180,10 +180,16 @@ let
   # refs.gh() defaulted to "main").
   realSha = self.rev or "dirty";
   placeholderSha = "0000000000000000000000000000000000000000";
+  # GH Pages deploy base (see .github/workflows/docs.yml). Empty
+  # site-url makes page-shell omit canonical/OG meta — fine for the
+  # placeholder-SHA checks build, but the deployed `packages.docs`
+  # always passes the real URL.
+  siteUrl = "https://lovesegfault.github.io/rio-build";
   mkInputArgs =
     ghSha:
     lib.concatMapStringsSep " " (i: "--input ${lib.escapeShellArg i}") [
       "gh-sha=${ghSha}"
+      "site-url=${siteUrl}"
     ];
 
   # Compile root: docs sources + generated data, fused into one tree

@@ -5,7 +5,7 @@
 // so this file only routes + wraps in the page shell. PDF stitching
 // is `book-pdf.typ`.
 #import "/lib/html/meta.typ": chapters, flatten-chapters, route-for
-#import "/lib/html/page.typ": page-shell
+#import "/lib/html/page.typ": page-shell, site-url
 #import "/lib/rio.typ": bundle-mode
 
 // Bundle mode shares one label/state space across all `document()`
@@ -31,6 +31,28 @@
 
 #asset("style.css", read("/assets/style.css", encoding: none))
 #asset("theme.js", read("/assets/theme.js", encoding: none))
+
+// Crawler hints. Only emitted when site-url is known (the deployed
+// `packages.docs` build); a relative-only sitemap is invalid per the
+// sitemaps.org schema.
+#if site-url != "" {
+  let routes = flatten-chapters(chapters)
+    .filter(c => (
+      c.path != none
+    ))
+    .map(c => route-for(c.path))
+  asset("robots.txt", bytes(
+    "User-agent: *\nAllow: /\nSitemap: " + site-url + "/sitemap.xml\n",
+  ))
+  asset("sitemap.xml", bytes(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      + "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+      + routes
+        .map(r => "  <url><loc>" + site-url + "/" + r + ".html</loc></url>\n")
+        .join("")
+      + "</urlset>\n",
+  ))
+}
 
 // 404: minimal shell, no chapter body.
 #document(

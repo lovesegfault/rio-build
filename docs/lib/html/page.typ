@@ -11,11 +11,15 @@
 
 // Ayu accent — keeps the mobile-chrome tint in step with style.css.
 #let _theme-color = "#f29718"
+// Deploy base for canonical/OG URLs. Empty for local builds (the
+// `nix run .#docs` wrapper) so canonical/OG meta is omitted there.
+#let site-url = sys.inputs.at("site-url", default: "")
 
 #let page-shell(route, title, src-path, body) = {
   _current-route.update(route)
   let desc = descriptions.at(src-path, default: none)
   let trail = crumb-trail(chapters, src-path)
+  let page-url = if site-url != "" { site-url + "/" + route + ".html" }
   html.elem("html", attrs: (lang: "en"))[
     #html.head[
       #html.elem("meta", attrs: (charset: "utf-8"))
@@ -28,6 +32,18 @@
       )
       #if desc != none {
         html.elem("meta", attrs: (name: "description", content: desc))
+      }
+      #if page-url != none {
+        html.elem("link", attrs: (rel: "canonical", href: page-url))
+        html.elem("meta", attrs: (property: "og:title", content: title))
+        html.elem("meta", attrs: (property: "og:type", content: "article"))
+        html.elem("meta", attrs: (property: "og:url", content: page-url))
+        if desc != none {
+          html.elem("meta", attrs: (
+            property: "og:description",
+            content: desc,
+          ))
+        }
       }
       #html.elem("meta", attrs: (name: "theme-color", content: _theme-color))
       #html.title[#title — rio-build design book]
