@@ -82,9 +82,9 @@ let
   split = import ./lib/helm-split.nix { inherit (pkgs) lib; };
 
   # Upstream Gateway API standard-channel CRDs. Cilium does NOT vendor
-  # these (it expects them pre-installed). Standard channel = Gateway,
-  # GatewayClass, HTTPRoute, GRPCRoute, ReferenceGrant — exactly what
-  # dashboard-gateway.yaml uses; no experimental/TLSRoute needed.
+  # these (it expects them pre-installed). dashboard-gateway.yaml uses
+  # Gateway, GatewayClass, HTTPRoute, ReferenceGrant — all standard
+  # channel; no experimental CRDs needed.
   gatewayApiCrds = pkgs.fetchurl {
     url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/${pins.addons.gateway_api.version}/standard-install.yaml";
     sha256 = pins.addons.gateway_api.crds_hash;
@@ -132,7 +132,14 @@ pkgs.runCommand "cilium-rendered"
     mkdir -p $out
 
     ${pkgs.lib.optionalString gatewayEnabled ''
-      cp ${gatewayApiCrds} $out/00-gateway-api-crds.yaml
+      # Drop TLSRoute: gateway-api v1.5 standard ships TLSRoute at v1 only,
+      # but cilium-operator 1.19.x hard-codes a v1alpha2 field indexer when
+      # ANY tlsroutes CRD is present → fatal "no matches for kind TLSRoute
+      # in version v1alpha2" → CrashLoopBackOff (cilium/cilium#45139, fixed
+      # in cilium 1.20 via #45251). We don't use TLSRoute. Remove this
+      # filter once pins.addons.cilium.version >= 1.20.
+      yq 'select(.metadata.name != "tlsroutes.gateway.networking.k8s.io")' \
+        ${gatewayApiCrds} > $out/00-gateway-api-crds.yaml
       cp ${lbIpamPool} $out/03-cilium-lbipam-pool.yaml
     ''}
 
@@ -180,7 +187,7 @@ pkgs.runCommand "cilium-rendered"
         --api-versions gateway.networking.k8s.io/v1/Gateway \
         --api-versions gateway.networking.k8s.io/v1/HTTPRoute \
         --api-versions gateway.networking.k8s.io/v1/GRPCRoute \
-        --api-versions gateway.networking.k8s.io/v1beta1/ReferenceGrant \
+        --api-versions gateway.networking.k8s.io/v1/ReferenceGrant \
       ''} \
       --set image.useDigest=false \
       --set operator.image.useDigest=false \

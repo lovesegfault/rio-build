@@ -117,7 +117,7 @@ spec:
 # Service (in {{ .Values.namespaces.store.name }}). Scoped to exactly
 # one (from-kind, from-namespace) → (to-kind, to-name) pair — this does
 # NOT open the store namespace to arbitrary cross-namespace refs.
-apiVersion: gateway.networking.k8s.io/v1beta1
+apiVersion: gateway.networking.k8s.io/v1
 kind: ReferenceGrant
 metadata:
   name: rio-dashboard-logs-to-store

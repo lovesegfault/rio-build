@@ -32,7 +32,15 @@ data "kubectl_file_documents" "gateway_api_crds" {
 }
 
 resource "kubectl_manifest" "gateway_api_crds" {
-  for_each  = data.kubectl_file_documents.gateway_api_crds.manifests
+  # Drop TLSRoute: gateway-api v1.5 standard ships it at v1 only, but
+  # cilium-operator 1.19.x hard-codes a v1alpha2 field indexer when ANY
+  # tlsroutes CRD is present → operator CrashLoopBackOff (cilium/cilium
+  # #45139, fixed in 1.20). We don't use TLSRoute. Remove this filter
+  # once addons.cilium.version >= 1.20.
+  for_each = {
+    for k, v in data.kubectl_file_documents.gateway_api_crds.manifests :
+    k => v if !strcontains(k, "tlsroutes.gateway.networking.k8s.io")
+  }
   yaml_body = each.value
 
   # server_side_apply: CRDs are large; client-side apply hits the

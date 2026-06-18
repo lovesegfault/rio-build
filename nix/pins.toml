@@ -52,8 +52,8 @@ identity_label_filter = "k8s:!job-name k8s:!batch.kubernetes.io/job-name k8s:!co
 # cilium or the feature silently no-ops. crds_hash is the fetchurl hash
 # for the standard-install.yaml bundle (consumed by nix/cilium-render.nix,
 # not terraform).
-version = "v1.4.0"
-crds_hash = "sha256:1wc1njnw1andqlabcykpd2dj250cqk6hx836v2nn8va4c7k2jh3a"
+version = "v1.5.1"
+crds_hash = "sha256:1f7rhk99gggr3j580099f3b7x3bsliwpqlfj7fpgg1qsp6rh443m"
 
 [addons.aws_load_balancer_controller]
 # v3.0+ aligns chart with app version.
