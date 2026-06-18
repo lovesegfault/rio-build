@@ -17,6 +17,16 @@
   --c-blue: #39bae6; --c-red: #d95757; --c-yellow: #ffb454;
   --c-green: #aad94c; --c-purple: #d2a6ff;
 }
+/* Auto theme: no data-theme attr → follow OS preference. The dark var
+   block is duplicated here so theme.js needs no JS-side media query. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --fg: #bfbdb6; --bg: #10141c; --accent: #e6b450;
+    --muted: #5a6378; --rule: #1b1f29; --sunk: #0d1017;
+    --c-blue: #39bae6; --c-red: #d95757; --c-yellow: #ffb454;
+    --c-green: #aad94c; --c-purple: #d2a6ff;
+  }
+}
 * { box-sizing: border-box; }
 body {
   margin: 0; display: flex; justify-content: center; min-height: 100vh;
@@ -74,6 +84,9 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
 /* html.frame() SVGs: invert in dark mode (see lib/rio.typ theming note) */
 .rio-frame svg { max-width: 100%; height: auto; }
 :root[data-theme="dark"] .rio-frame svg { filter: invert(0.93) hue-rotate(180deg); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .rio-frame svg { filter: invert(0.93) hue-rotate(180deg); }
+}
 @font-face {
   font-family: "NewComputerModernSans"; font-weight: 400; font-style: normal;
   font-display: swap;
@@ -276,6 +289,14 @@ h5:hover .anchor, h6:hover .anchor,
     .rio-nav { transition: none; }
   }
 }
+/* ─── keyboard-shortcut overlay ───────────────────────────────────── */
+.rio-shortcuts { border: 1px solid var(--rule); border-radius: 6px;
+  background: var(--bg); color: var(--fg); padding: 1rem 1.25rem; }
+.rio-shortcuts::backdrop { background: rgba(0,0,0,.3); }
+.rio-shortcuts table { border-collapse: collapse; }
+.rio-shortcuts td { padding: .25rem .75rem .25rem 0; border: none; }
+.rio-shortcuts kbd { background: var(--sunk); border: 1px solid var(--rule);
+  border-radius: 3px; padding: .1em .4em; font-size: .85em; }
 /* ─── skip-to-content (a11y) ──────────────────────────────────────── */
 .rio-skip { position: absolute; left: -9999px; }
 .rio-skip:focus { position: fixed; left: 1rem; top: 1rem; z-index: 100;
@@ -283,7 +304,7 @@ h5:hover .anchor, h6:hover .anchor,
 /* ─── print ───────────────────────────────────────────────────────── */
 @media print {
   .rio-nav, .rio-toc, .rio-copy, .nav-wrapper, .rio-edit, .rio-theme-toggle,
-  .rio-nav-toggle, .rio-skip, #search { display: none !important; }
+  .rio-nav-toggle, .rio-skip, .rio-shortcuts, #search { display: none !important; }
   .rio-page { display: block; max-width: none; }
   .rio-main { padding: 0; }
 }

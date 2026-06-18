@@ -2,10 +2,13 @@
 (() => {
   const KEY = "rio-theme";
   const root = document.documentElement;
+  // Three-state: "light" / "dark" / auto (no data-theme attr; CSS
+  // `@media (prefers-color-scheme: dark) :root:not([data-theme])`
+  // supplies the dark vars). Stored value present → explicit; absent →
+  // auto.
+  const ICONS = { light: "○", dark: "●", auto: "◐" };
   const stored = localStorage.getItem(KEY);
-  const initial =
-    stored || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  root.dataset.theme = initial;
+  if (stored === "light" || stored === "dark") root.dataset.theme = stored;
 
   const isEditable = (el) =>
     el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
@@ -36,10 +39,22 @@
     }
     const btn = document.querySelector(".rio-theme-toggle");
     if (btn) {
+      const cur = () => root.dataset.theme || "auto";
+      const apply = (t) => {
+        if (t === "auto") {
+          delete root.dataset.theme;
+          localStorage.removeItem(KEY);
+        } else {
+          root.dataset.theme = t;
+          localStorage.setItem(KEY, t);
+        }
+        btn.textContent = ICONS[t];
+        btn.title = "Theme: " + t;
+      };
+      apply(cur());
       btn.addEventListener("click", () => {
-        const next = root.dataset.theme === "dark" ? "light" : "dark";
-        root.dataset.theme = next;
-        localStorage.setItem(KEY, next);
+        const next = { light: "dark", dark: "auto", auto: "light" }[cur()];
+        apply(next);
       });
     }
 
@@ -61,17 +76,26 @@
       });
     }
 
-    // ─── keyboard nav: ←/→ chapter, S to focus search ───────────────
+    // ─── keyboard nav: ←/→ chapter, S to focus search, ? for help ───
+    const shortcuts = document.querySelector("dialog.rio-shortcuts");
     addEventListener("keydown", (ev) => {
-      if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+      if (ev.altKey || ev.ctrlKey || ev.metaKey) return;
       // Escape is meaningful from inside the search input (clear+blur),
       // so it bypasses the isEditable early-out the other keys use.
       if (ev.key === "Escape") {
         setNavOpen(false);
+        shortcuts?.close();
         document.querySelector(".pagefind-ui__search-clear")?.click();
         document.querySelector("#search input")?.blur();
         return;
       }
+      // `?` is shift+/ on US layouts — check before the modifier guard.
+      if (ev.key === "?" && !isEditable(ev.target)) {
+        ev.preventDefault();
+        if (shortcuts) shortcuts.open ? shortcuts.close() : shortcuts.showModal();
+        return;
+      }
+      if (ev.shiftKey) return;
       if (isEditable(ev.target)) return;
       if (ev.key === "ArrowLeft") {
         const a = document.querySelector(".mobile-nav-chapters.previous");

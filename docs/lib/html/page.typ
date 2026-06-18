@@ -53,6 +53,28 @@
         class: "rio-skip",
         href: "#main",
       ))[Skip to content]
+      #html.elem("dialog", attrs: (
+        class: "rio-shortcuts",
+        aria-label: "Keyboard shortcuts",
+      ))[
+        #html.elem("p")[#html.elem("strong")[Keyboard shortcuts]]
+        #html.elem("table")[
+          #html.elem("tr")[#html.elem("td")[#html.elem("kbd")[s]] #html.elem(
+              "td",
+            )[Focus search]]
+          #html.elem("tr")[#html.elem(
+              "td",
+            )[#html.elem("kbd")[←] / #html.elem("kbd")[→]] #html.elem(
+              "td",
+            )[Previous / next chapter]]
+          #html.elem("tr")[#html.elem("td")[#html.elem("kbd")[Esc]] #html.elem(
+              "td",
+            )[Close drawer / clear search]]
+          #html.elem("tr")[#html.elem("td")[#html.elem("kbd")[?]] #html.elem(
+              "td",
+            )[Toggle this help]]
+        ]
+      ]
       #html.elem("button", attrs: (
         class: "rio-nav-toggle",
         type: "button",
