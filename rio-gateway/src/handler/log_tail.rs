@@ -2313,6 +2313,18 @@ mod tests {
         _server: tokio::task::JoinHandle<()>,
     }
 
+    impl Harness {
+        /// `on_started` for the 35 test sites that don't care about
+        /// the duplicate-same-exec return (sh-042-r3). The
+        /// `#[must_use]` stays on [`LogTailSet::on_started`] for the
+        /// one production caller (`build.rs`) that gates on it; the
+        /// discard ceremony is reasoned about once here, not 35×.
+        /// Tests asserting on the bool call `set.on_started` directly.
+        fn start(&mut self, drv: &str, exec: &str) {
+            let _ = self.set.on_started(drv, exec);
+        }
+    }
+
     async fn harness() -> Harness {
         harness_with(test_config()).await
     }
@@ -2449,7 +2461,7 @@ mod tests {
 
         h.mock.fail_next_opens(1);
         h.mock.push_script(vec![chunk(0, 1)], SessionEnd::Hold);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let mock = h.mock.clone();
         wait_for("two opens (failed + retried)", || mock.request_count() >= 2).await;
 
@@ -2486,7 +2498,7 @@ mod tests {
 
         h.mock.unauth_next_opens(2);
         h.mock.push_script(vec![chunk(0, 1)], SessionEnd::Hold);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let mock = h.mock.clone();
         wait_for("three opens (rejected, rejected, served)", || {
             mock.request_count() >= 3
@@ -2524,7 +2536,7 @@ mod tests {
         // cycles (50 ms backoff → ~3 cycles before the threshold,
         // many after).
         h.mock.fail_next_opens(200);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let notice = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
             .await
@@ -2577,7 +2589,7 @@ mod tests {
             h.mock
                 .push_script(vec![], SessionEnd::Error(tonic::Code::NotFound));
         }
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let notice = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
             .await
@@ -2633,7 +2645,7 @@ mod tests {
             h.mock
                 .push_script(vec![], SessionEnd::Error(tonic::Code::Internal));
         }
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         // First emission must be the notice (idle-healthy did not arm,
         // so the err_stream refusals start the clock; the relayed
@@ -2695,7 +2707,7 @@ mod tests {
             h.mock
                 .push_script(vec![], SessionEnd::Error(tonic::Code::Internal));
         }
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let first = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
             .await
@@ -2781,7 +2793,7 @@ mod tests {
         h.mock
             .push_script(vec![chunk(0, 3), chunk(3, 2)], SessionEnd::Hold);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let lines = recv_lines(&mut h.out_rx, 5).await;
         assert_eq!(
@@ -2817,7 +2829,7 @@ mod tests {
         // legally return lines starting at 0.
         h.mock.push_script(vec![chunk(0, 60)], SessionEnd::Hold);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let lines = recv_lines(&mut h.out_rx, 60).await;
         let numbers: Vec<u64> = lines.iter().map(|(n, _)| *n).collect();
@@ -2945,7 +2957,7 @@ mod tests {
         // EXEC_A session 2 (the gap's one re-open chance): opens and
         // serves NOTHING (held) — the pending stays recorded.
         h.mock.push_script(vec![], SessionEnd::Hold);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         wait_for("the gap re-open to be requested", || {
             h.mock.request_count() == 2
         })
@@ -2961,7 +2973,7 @@ mod tests {
             ..chunk(0, 2)
         };
         h.mock.push_script(vec![chunk_b], SessionEnd::Hold);
-        let _ = h.set.on_started(DRV, EXEC_B);
+        h.start(DRV, EXEC_B);
         wait_for("the replacement subscription to open", || {
             h.mock.request_count() == 3
         })
@@ -2991,7 +3003,7 @@ mod tests {
         // second re-dispatch (B -> A') is the cheapest path to a relay
         // that holds a fresh pending gap at terminus: it also
         // exercises supersession over an EMPTY cell (a no-op discard).
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         wait_for("the disclosure-face subscription to open", || {
             h.mock.request_count() == 4
         })
@@ -3036,7 +3048,7 @@ mod tests {
         let gate = h.mock.gate_next_session();
         h.mock.push_script(vec![chunk(0, 50)], SessionEnd::Close);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         wait_for("the subscription to open", || h.mock.request_count() == 1).await;
 
         // The derivation goes terminal while the mock still holds all
@@ -3066,7 +3078,7 @@ mod tests {
         // ingest session never closes).
         h.mock.push_script(vec![chunk(0, 2)], SessionEnd::Hold);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let _ = recv_lines(&mut h.out_rx, 2).await;
 
         h.set.on_terminal(DRV);
@@ -3114,7 +3126,7 @@ mod tests {
         // true): a wedged replica mid-replay of durable backlog.
         h.mock.push_script(vec![chunk(0, 2)], SessionEnd::Hold);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let _ = recv_lines(&mut h.out_rx, 2).await;
         h.set.on_terminal(DRV);
 
@@ -3163,7 +3175,7 @@ mod tests {
         h.mock
             .push_script(vec![chunk(0, 2), final_chunk(2, true)], SessionEnd::Hold);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let _ = recv_lines(&mut h.out_rx, 2).await;
         h.set.on_terminal(DRV);
 
@@ -3217,7 +3229,7 @@ mod tests {
         // EVERY open hangs: the relay gets no stream, ever.
         h.mock.hang_next_opens(u32::MAX);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         wait_for("the first (hung) open to arrive", || {
             h.mock.request_count() == 1
         })
@@ -3311,7 +3323,7 @@ mod tests {
         h.mock
             .push_script(vec![final_chunk(2, true)], SessionEnd::Close);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         wait_for("the subscription to open", || h.mock.request_count() == 1).await;
         h.set.on_terminal(DRV);
         gate.notify_one();
@@ -3333,7 +3345,7 @@ mod tests {
         let mut h = harness().await;
         h.mock.fail_next_opens(u32::MAX);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         wait_for("the first failed open", || h.mock.request_count() >= 1).await;
         h.set.on_terminal(DRV);
         let snapshot = h.mock.request_count();
@@ -3366,7 +3378,7 @@ mod tests {
         h.mock
             .push_script(vec![final_chunk(2, true)], SessionEnd::Close);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let _ = recv_lines(&mut h.out_rx, 2).await;
         h.set.on_terminal(DRV);
         wait_for("the post-terminal re-open after the backoff", || {
@@ -3391,7 +3403,7 @@ mod tests {
         h.mock
             .push_script(vec![final_chunk(3, true)], SessionEnd::Close);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         wait_for("the subscription to open", || h.mock.request_count() == 1).await;
         h.set.on_terminal(DRV);
         gate.notify_one();
@@ -3427,7 +3439,7 @@ mod tests {
         // Session 2: the store re-serves the same shape.
         h.mock.push_script(vec![chunk(100, 5)], SessionEnd::Hold);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let lines = recv_lines(&mut h.out_rx, 56).await;
         let reqs = h.mock.requests();
@@ -3479,7 +3491,7 @@ mod tests {
         // flush of the withheld copy.
         h.mock
             .push_script(vec![chunk(0, 5), chunk(100, 5)], SessionEnd::Close);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         // The prefix relays before the sighting withholds.
         let prefix = recv_lines(&mut h.out_rx, 5).await;
@@ -3523,7 +3535,7 @@ mod tests {
         // Stream 2 (the one re-open chance): the store's view changed —
         // only [25,35) is durable now; gap_from is still 10.
         h.mock.push_script(vec![chunk(25, 10)], SessionEnd::Close);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let prefix = recv_lines(&mut h.out_rx, 10).await;
         assert_eq!(prefix[9].0, 9, "prefix intact");
@@ -3569,7 +3581,7 @@ mod tests {
         // recorded while the subscription cycles its backoff loop.
         h.mock
             .push_script(vec![chunk(0, 5), chunk(100, 5)], SessionEnd::Hold);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let prefix = recv_lines(&mut h.out_rx, 5).await;
         assert_eq!(prefix[4].0, 4, "prefix intact");
@@ -3617,7 +3629,7 @@ mod tests {
         // starts INSIDE the old hole and covers through the withheld
         // span: [12,25).
         h.mock.push_script(vec![chunk(12, 13)], SessionEnd::Close);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let prefix = recv_lines(&mut h.out_rx, 10).await;
         assert_eq!(prefix[9].0, 9, "prefix intact");
@@ -3666,7 +3678,7 @@ mod tests {
             .push_script(vec![chunk(0, 10), chunk(20, 5)], SessionEnd::Close);
         // Fresh covers [12,16): inside the hole, short of the withheld.
         h.mock.push_script(vec![chunk(12, 4)], SessionEnd::Close);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let prefix = recv_lines(&mut h.out_rx, 10).await;
         assert_eq!(prefix[9].0, 9, "prefix intact");
@@ -3714,7 +3726,7 @@ mod tests {
             .push_script(vec![chunk(0, 5), chunk(10, 5)], SessionEnd::Close);
         // Stream 2: partial heal — only [5,7) is served.
         h.mock.push_script(vec![chunk(5, 2)], SessionEnd::Close);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let head = recv_lines(&mut h.out_rx, 7).await;
         assert_eq!(head[6].0, 6, "prefix + partial heal relayed");
@@ -3745,7 +3757,7 @@ mod tests {
         h.mock
             .push_script(vec![chunk(0, 5), chunk(10, 5)], SessionEnd::Close);
         h.mock.push_script(vec![chunk(5, 5)], SessionEnd::Close);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         h.set.on_terminal(DRV);
 
         let all = recv_lines(&mut h.out_rx, 15).await;
@@ -3773,7 +3785,7 @@ mod tests {
         h.mock
             .push_script(vec![chunk(0, 5), chunk(10, 5)], SessionEnd::Close);
         h.mock.push_script(vec![chunk(5, 7)], SessionEnd::Close);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         h.set.on_terminal(DRV);
 
         let all = recv_lines(&mut h.out_rx, 15).await;
@@ -3800,7 +3812,7 @@ mod tests {
         let mut h = harness().await;
         h.mock
             .push_script(vec![chunk(0, 3)], SessionEnd::ErrorUnservable);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let lines = recv_lines(&mut h.out_rx, 3).await;
         assert_eq!(lines[2].0, 2, "lines before the refusal relay");
@@ -3826,7 +3838,7 @@ mod tests {
         foreign.exec_id = EXEC_B.to_string();
         h.mock
             .push_script(vec![chunk(0, 2), foreign, chunk(2, 2)], SessionEnd::Hold);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
 
         let lines = recv_lines(&mut h.out_rx, 4).await;
         assert_eq!(
@@ -3867,7 +3879,7 @@ mod tests {
                     } else {
                         h.mock.push_script(vec![chunk(100, 2)], SessionEnd::Hold);
                     }
-                    let _ = h.set.on_started(DRV, EXEC_A);
+                    h.start(DRV, EXEC_A);
                     // Terminal after the prefix has had a moment to
                     // relay: the grace clock starts somewhere between
                     // the sighting and the later opens — WHICH accept
@@ -3965,7 +3977,7 @@ mod tests {
         // A held-open session: the subscription would otherwise live
         // (and re-open) indefinitely.
         h.mock.push_script(vec![chunk(0, 1)], SessionEnd::Hold);
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let _ = recv_lines(&mut h.out_rx, 1).await;
         let count_at_drop = h.mock.request_count();
         drop(h.set);
@@ -4935,7 +4947,7 @@ mod tests {
         h.mock
             .push_script(vec![chunk(0, 2)], SessionEnd::ErrorUnservable);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let lines = recv_lines(&mut h.out_rx, 2).await;
         assert_eq!(lines.len(), 2);
 
@@ -4986,7 +4998,7 @@ mod tests {
         // before uploading the rest -- the store has nothing more).
         h.mock.push_script(vec![chunk(0, 2)], SessionEnd::Hold);
 
-        let _ = h.set.on_started(DRV, EXEC_A);
+        h.start(DRV, EXEC_A);
         let _ = recv_lines(&mut h.out_rx, 2).await;
         h.set.on_terminal(DRV);
 

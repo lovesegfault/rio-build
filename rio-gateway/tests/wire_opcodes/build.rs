@@ -1166,20 +1166,19 @@ async fn started_with_predecessor_emits_retry_marker_on_existing_aid() -> anyhow
         ev(build_event::Event::Derivation(
             types::DerivationEvent::started(target.clone(), "w1".into(), exec_a.into()),
         )),
-        // Re-dispatch carrying the closed predecessor.
-        ev(build_event::Event::Derivation(
-            types::DerivationEvent::started_with_predecessor(
-                target.clone(),
-                "w2".into(),
-                exec_b.into(),
-                types::StartedPredecessor {
-                    exec_id: exec_a.into(),
-                    termination_reason: "evicted_empty_dir_size_limit".into(),
-                    floor_bumped: types::PredecessorFloorAxis::Disk as i32,
-                    new_axis_bytes: 50 << 30,
-                },
-            ),
-        )),
+        // Re-dispatch carrying the closed predecessor — the same
+        // `{ predecessor, ..started(...) }` struct-update shape
+        // dispatch.rs uses, so this scripts the scheduler emit site
+        // it covers, not a now-deleted helper (sh-042-r3).
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            predecessor: Some(types::StartedPredecessor {
+                exec_id: exec_a.into(),
+                termination_reason: "evicted_empty_dir_size_limit".into(),
+                floor_bumped: types::PredecessorFloorAxis::Disk as i32,
+                new_axis_bytes: 50 << 30,
+            }),
+            ..types::DerivationEvent::started(target.clone(), "w2".into(), exec_b.into())
+        })),
         ev(build_event::Event::Derivation(
             types::DerivationEvent::completed(target.clone(), vec![]),
         )),

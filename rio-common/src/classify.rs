@@ -195,35 +195,29 @@ mod label_tests {
     use strum::IntoEnumIterator;
 
     /// The canonical strings are load-bearing (persisted rows join on
-    /// them); pin the full alphabet. The `iter().count()` guard
-    /// (sh-042-r2) makes the hand-typed array exhaustive over the enum
-    /// — same source as `human_alphabet_pinned` so a 13th variant
-    /// fails BOTH pin tests, not just one.
+    /// them); pin the full alphabet. The wildcard-free match
+    /// (sh-042-r3) is compiler-exhaustive over the enum — a 13th
+    /// variant fails `clippy-test-rio-common` at compile, not at test
+    /// runtime, with one fewer moving part than the array+count form.
     #[test]
     fn label_alphabet_pinned() {
-        let all = [
-            (AttemptTerminalKind::Unspecified, "unspecified"),
-            (AttemptTerminalKind::OomKilled, "oom_killed"),
-            (
-                AttemptTerminalKind::EvictedDiskPressure,
-                "evicted_disk_pressure",
-            ),
-            (
-                AttemptTerminalKind::EvictedEmptyDirSizeLimit,
-                "evicted_empty_dir_size_limit",
-            ),
-            (AttemptTerminalKind::EvictedOther, "evicted_other"),
-            (AttemptTerminalKind::Completed, "pod_completed"),
-            (AttemptTerminalKind::Error, "pod_error"),
-            (AttemptTerminalKind::DeadlineExceeded, "deadline_exceeded"),
-            (AttemptTerminalKind::Cancelled, "cancelled"),
-            (AttemptTerminalKind::Preempted, "preempted"),
-            (AttemptTerminalKind::Reaped, "reaped"),
-            (AttemptTerminalKind::NoEligibleSource, "no_eligible_source"),
-        ];
-        assert_eq!(all.len(), AttemptTerminalKind::iter().count());
-        for (kind, label) in all {
-            assert_eq!(attempt_terminal_reason_label(kind), label);
+        use AttemptTerminalKind as K;
+        for kind in AttemptTerminalKind::iter() {
+            let want = match kind {
+                K::Unspecified => "unspecified",
+                K::OomKilled => "oom_killed",
+                K::EvictedDiskPressure => "evicted_disk_pressure",
+                K::EvictedEmptyDirSizeLimit => "evicted_empty_dir_size_limit",
+                K::EvictedOther => "evicted_other",
+                K::Completed => "pod_completed",
+                K::Error => "pod_error",
+                K::DeadlineExceeded => "deadline_exceeded",
+                K::Cancelled => "cancelled",
+                K::Preempted => "preempted",
+                K::Reaped => "reaped",
+                K::NoEligibleSource => "no_eligible_source",
+            };
+            assert_eq!(attempt_terminal_reason_label(kind), want);
         }
     }
 
@@ -238,7 +232,7 @@ mod label_tests {
     /// (the fallback is intentional, not an omission).
     #[test]
     fn human_alphabet_pinned() {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         let pinned: HashMap<&str, &str> = HashMap::from([
             (
                 "evicted_empty_dir_size_limit",
@@ -257,11 +251,19 @@ mod label_tests {
             ("unspecified", "unspecified"),
             ("no_eligible_source", "no_eligible_source"),
         ]);
-        // Bidirectional pin (sh-042-r2): the loop below proves "every
-        // enum variant has a pinned row"; this proves "every pinned
-        // row is reachable via some variant's label" — a stale entry
-        // or a label-collision orphan fails here.
-        assert_eq!(pinned.len(), AttemptTerminalKind::iter().count());
+        // Bidirectional pin (sh-042-r3): the loop below proves "every
+        // enum variant has a pinned row"; set-equality of pinned keys
+        // vs the enum's label image proves "every pinned row is
+        // reachable via some variant's label" — a stale entry or a
+        // label-collision orphan fails here. Count-equality alone
+        // does not: under a label collision the orphaned key is never
+        // `.get()`-ed and |P|=|V| still holds.
+        assert_eq!(
+            pinned.keys().copied().collect::<HashSet<_>>(),
+            AttemptTerminalKind::iter()
+                .map(attempt_terminal_reason_label)
+                .collect::<HashSet<_>>(),
+        );
         for kind in AttemptTerminalKind::iter() {
             let label = attempt_terminal_reason_label(kind);
             let want = pinned

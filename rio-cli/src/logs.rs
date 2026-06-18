@@ -66,7 +66,6 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
     // hint below — an empty `TENANT_TOKEN_HEADER` is a valid http
     // HeaderValue but never a usable JWT.
     let token = a.tenant_token.as_deref().filter(|s| !s.is_empty());
-    let token_set = token.is_some();
     let mut request = tonic::Request::new(TailLogRequest {
         derivation: a.drv_path,
         exec_id: a.exec_id.unwrap_or_default(),
@@ -96,7 +95,7 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
         // nonexistent are deliberately indistinguishable) instead of
         // the log. Surface the missing-token hint so the (a)-tier
         // `rio-cli logs <drv> --exec-id <old>` pointer is actionable.
-        Err(e) if pinned_exec && !token_set && e.code() == tonic::Code::NotFound => {
+        Err(e) if pinned_exec && token.is_none() && e.code() == tonic::Code::NotFound => {
             return Err(anyhow::Error::from(e).context(
                 "the store reports no log for this --exec-id, but no \
                  --tenant-token / RIO_TENANT_TOKEN was supplied — a \

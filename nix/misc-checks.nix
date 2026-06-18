@@ -2485,7 +2485,7 @@ in
         # FloorAxis pass-through inlining (sh-042-r1); misc-checks.nix
         # is the lint itself.
         if grep -rn -E "$deny_cross" $crossSrc \
-             | grep -vE 'rio-crds/src/pool\.rs:([4-9]|1[01]):|flake\.nix:.*Before this assert|misc-checks\.nix|actor/tests/misc\.rs:.*workers_active|actor/tests/dispatch\.rs:.*pass-through .FloorAxis'; then
+             | grep -vE 'rio-crds/src/pool\.rs:([4-9]|1[01]):|flake\.nix:.*Before this assert|misc-checks\.nix|actor/tests/misc\.rs:.*workers_active|actor/tests/dispatch\.rs:.*pass-through `FloorAxis'; then
           echo "FAIL: retired identifier in non-doc source" >&2
           fail=1
         fi
