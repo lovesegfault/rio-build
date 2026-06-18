@@ -41,10 +41,10 @@ let
   # API surface matches.
   kubeSchedulerImage = pkgs.dockerTools.pullImage {
     imageName = "registry.k8s.io/kube-scheduler";
-    imageDigest = "sha256:9054fecb4fa04cc63aec47b0913c8deb3487d414190cd15211f864cfe0d0b4d6";
+    imageDigest = "sha256:51a32afb3c6966c974cd3b351042b1cb1b15af0619cb25e006c409d91367ea2e";
     finalImageName = "registry.k8s.io/kube-scheduler";
-    finalImageTag = "v1.35.4";
-    hash = "sha256-ekS+bXcN9z4+dS3ykpZuMaTuwErKoRnLoE+30KHG7cs=";
+    finalImageTag = "v1.35.6";
+    hash = "sha256-OchPtISpXI9/ekM2Lp3exsYcz+VB7Dj91a1KlWeAzBY=";
     os = "linux";
     arch = "amd64";
   };

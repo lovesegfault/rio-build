@@ -17,8 +17,8 @@
 # the arch-specific manifest via os/arch.
 { pkgs }:
 {
-  # Bitnami PostgreSQL 18.3.0 for the k3s-full fixture (bitnami subchart
-  # v18.6.1 via nixhelm, appVersion=18.3.0). Chart's values.yaml uses
+  # Bitnami PostgreSQL 18.4.0 for the k3s-full fixture (bitnami subchart
+  # v18.7.5 via nixhelm, appVersion=18.4.0). Chart's values.yaml uses
   # tag:latest — k3s-full.nix passes `postgresql.image.tag` via extraSet
   # DERIVED from this FOD's imageTag passthru (no drift window).
   #
@@ -30,15 +30,15 @@
   # → clear signal to bump here.
   bitnami-postgresql = pkgs.dockerTools.pullImage {
     imageName = "registry-1.docker.io/bitnami/postgresql";
-    imageDigest = "sha256:106cae6ba66dc1498dba57037b16d6d0f3470277bfcaf440860b1df2f967bf14";
+    imageDigest = "sha256:256bf40a7343862b9a66d1d27cd34599e80dad99284fc5450b24cb02e26ff34e";
     # finalImageName/Tag: what `ctr images ls` shows. MUST match what
     # the bitnami chart renders (docker.io/bitnami/postgresql:<tag>) —
     # containerd does exact-string image lookup; "bitnami/postgresql"
     # ≠ "docker.io/bitnami/postgresql" → cache miss → tries to pull
     # from network → ImagePullBackOff in the airgapped VM.
     finalImageName = "docker.io/bitnami/postgresql";
-    finalImageTag = "18.3.0";
-    hash = "sha256-MpAV88ItXcTgRTAtF48I1SL+08Yg1Mn233Cry/96gCY=";
+    finalImageTag = "18.4.0";
+    hash = "sha256-6PyL73YjqitvWl3xHehhGCnIdz2LAuYprYmkMtQAmaI=";
     os = "linux";
     arch = "amd64";
   };

@@ -57,7 +57,7 @@ crds_hash = "sha256:1wc1njnw1andqlabcykpd2dj250cqk6hx836v2nn8va4c7k2jh3a"
 
 [addons.aws_load_balancer_controller]
 # v3.0+ aligns chart with app version.
-version = "3.2.2"
+version = "3.4.0"
 
 [addons.karpenter]
 # Karpenter chart (AWS provider, OCI-published). Must stay within the
@@ -68,7 +68,7 @@ version = "1.11.1"
 # external-dns chart (kubernetes-sigs.github.io/external-dns). Chart
 # version, NOT app version (chart 1.N.0 ships app 0.N.0). Only used by
 # infra/eks/dns.tf — no VM-test consumer yet.
-version = "1.20.0"
+version = "1.21.1"
 
 # ── NixOS node AMI (ADR-021) — consumed by nix/nixos-node/, not TF ─────
 
@@ -95,8 +95,8 @@ kernel_minor = "7_0"
 # =true so nodeadm-init skips the EC2 DescribeInstances call (only
 # IMDS is mocked). If a bump removes that gate, vm-nixos-node will
 # hang ~10min on a DescribeInstances retry loop — check there first.
-rev = "v20260415"
-src_hash = "sha256-RsxQVcOfiRSO+/X6WCcj5XJTL5P5GToZUwnT0LbiPiw="
+rev = "v20260610"
+src_hash = "sha256-P6CpgkbUvWyQJOb4EB8rlpapn0kzcywD+gLNeDUxBkk="
 
 [node.ecr_credential_provider]
 # kubernetes/cloud-provider-aws → ecr-credential-provider binary.

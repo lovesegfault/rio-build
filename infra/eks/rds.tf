@@ -114,7 +114,7 @@ resource "aws_rds_cluster" "rio" {
   # 17.x: latest Aurora-supported major as of writing. Aurora lags
   # upstream PG by ~6 months. Check `aws rds describe-db-engine-
   # versions --engine aurora-postgresql` if this errors on apply.
-  engine_version              = "17.9"
+  engine_version              = "17.10"
   allow_major_version_upgrade = true
   # "provisioned" + serverlessv2_scaling_configuration = Serverless v2.
   # engine_mode "serverless" is Serverless V1 (deprecated, don't use).

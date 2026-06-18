@@ -42,7 +42,7 @@ resource "helm_release" "metrics_server" {
   create_namespace = false
   repository       = "https://kubernetes-sigs.github.io/metrics-server"
   chart            = "metrics-server"
-  version          = "3.13.0"
+  version          = "3.13.1"
 
   set = [
     {
