@@ -12,7 +12,7 @@
 * { box-sizing: border-box; }
 body {
   margin: 0; display: grid; grid-template-columns: var(--nav-w) 1fr;
-  font: 16px/1.6 "NewComputerModern", serif;
+  font: 18px/1.45 "NewComputerModern", serif;
   color: var(--fg); background: var(--bg);
 }
 code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
