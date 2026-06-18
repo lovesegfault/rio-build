@@ -35,8 +35,9 @@ pub enum RegenCmd {
     Tfvars,
     /// Diff the worker seccomp profile against upstream moby (human review).
     Seccomp {
-        /// moby git tag to fetch default.json from.
-        #[arg(default_value = "v27.5.1")]
+        /// moby git tag to fetch default.json from. Upstream renamed
+        /// release tags v* → docker-v* at the 29.x line.
+        #[arg(default_value = "docker-v29.6.0")]
         tag: String,
     },
 }
