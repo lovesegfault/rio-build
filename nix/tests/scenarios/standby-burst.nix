@@ -52,11 +52,44 @@ let
     }
   ) (pkgs.lib.range 1 4);
 
+  # Mint an x-rio-service-token (rio_auth::hmac::ServiceClaims) for the
+  # AdminService/ClusterStatus probe — c66 gated all AdminService reads
+  # on ensure_service_caller (UNGATED_PUBLIC→[]). Mirrors lifecycle.nix
+  # signServiceToken: key from the live rio-service-hmac Secret on
+  # stdin (base64), trimmed per rio_auth::hmac::load_key.
+  signServiceToken = pkgs.writeScript "sign-service-token-standby-burst" ''
+    #!${pkgs.python3}/bin/python3
+    import base64, hashlib, hmac, json, sys, time
+    key = base64.b64decode(sys.stdin.read().strip())
+    for suf in (b"\r\n", b"\n"):
+        if key.endswith(suf):
+            key = key[: -len(suf)]
+            break
+    claims = json.dumps(
+        {"caller": "rio-cli", "expiry_unix": int(time.time()) + 3600},
+        separators=(",", ":"),
+    ).encode()
+    tag = hmac.new(key, claims, hashlib.sha256).digest()
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    print(f"{b64(claims)}.{b64(tag)}")
+  '';
+
   prelude = ''
     ${common.mkBootstrap {
       inherit fixture;
       withSsh = false;
     }}
+
+    # AdminService/ClusterStatus is service-token-gated (c66
+    # ensure_service_caller, allowlist rio-controller/rio-cli/
+    # rio-dashboard) and the gate runs BEFORE ensure_leader — without
+    # a valid token both replicas answer PermissionDenied, breaking
+    # the leader DATA-frame / standby Unavailable assertions. Mint
+    # once; valid for the test duration.
+    service_token = k3s_server.succeed(
+        "k3s kubectl -n ${ns} get secret rio-service-hmac "
+        "-o jsonpath='{.data.service-hmac\\.key}' | ${signServiceToken}"
+    ).strip()
 
     def lease_transitions():
         raw = kubectl(
@@ -126,7 +159,9 @@ let
                 "curl -s --max-time 10 -X POST "
                 f"http://localhost:{port}/rio.admin.AdminService/ClusterStatus "
                 "-H 'content-type: application/grpc-web+proto' "
-                f"-H 'x-grpc-web: 1' --data-binary @- -D {hdrs} -o {body}"
+                "-H 'x-grpc-web: 1' "
+                f"-H 'x-rio-service-token: {service_token}' "
+                f"--data-binary @- -D {hdrs} -o {body}"
             )
         finally:
             k3s_server.execute(
