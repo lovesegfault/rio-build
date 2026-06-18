@@ -229,9 +229,12 @@ scope: with scope; ''
       # Pod-level precondition only — same reasoning as the pull-mode
       # fragment banner: pull pods never register, so a leftover pod
       # from the fixture default pool is the only thing that could
-      # steal the dispatch.
+      # steal the dispatch. Filter on rio.build/pool: ADR-022 lands
+      # the rio-mountd DaemonSet in this namespace, so an unfiltered
+      # wait never sees an empty namespace.
       k3s_server.wait_until_succeeds(
-          "! k3s kubectl -n ${nsBuilders} get pods --no-headers 2>/dev/null | grep -q .",
+          "! k3s kubectl -n ${nsBuilders} get pods -l rio.build/pool "
+          "--no-headers 2>/dev/null | grep -q .",
           timeout=120,
       )
       k3s_server.succeed(

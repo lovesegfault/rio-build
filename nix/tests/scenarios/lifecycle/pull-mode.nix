@@ -44,9 +44,13 @@ scope: with scope; ''
           "delete pool x86-64 --ignore-not-found --wait=true",
           ns="${nsBuilders}",
       )
-      # Pod-level precondition only (see banner comment).
+      # Pod-level precondition only (see banner comment). Filter on
+      # the rio.build/pool label: ADR-022 lands the rio-mountd
+      # DaemonSet in this namespace, so an unfiltered wait never sees
+      # an empty namespace.
       k3s_server.wait_until_succeeds(
-          "! k3s kubectl -n ${nsBuilders} get pods --no-headers 2>/dev/null | grep -q .",
+          "! k3s kubectl -n ${nsBuilders} get pods -l rio.build/pool "
+          "--no-headers 2>/dev/null | grep -q .",
           timeout=120,
       )
 

@@ -30,9 +30,12 @@ scope: with scope; ''
       # only thing that could serve this subtest's builds out from
       # under the `ephemeral` pool is a still-running builder pod from
       # the deleted default pool. The --wait=true delete above started
-      # the cascade; wait for the pods to actually be gone.
+      # the cascade; wait for the pods to actually be gone. Filter on
+      # rio.build/pool: ADR-022 lands the rio-mountd DaemonSet in this
+      # namespace, so an unfiltered wait never sees an empty namespace.
       k3s_server.wait_until_succeeds(
-          "! k3s kubectl -n ${nsBuilders} get pods --no-headers 2>/dev/null | grep -q .",
+          "! k3s kubectl -n ${nsBuilders} get pods -l rio.build/pool "
+          "--no-headers 2>/dev/null | grep -q .",
           timeout=120,
       )
 
