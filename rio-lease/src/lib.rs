@@ -1227,7 +1227,26 @@ pub async fn run_lease_loop<H: LeaseHooks>(
     // keeps running with `is_leader=false` → never dispatches →
     // effectively a standby. Not useful but not broken either;
     // the OTHER replica (with working kube access) leads.
-    let client = match kube::Client::try_default().await {
+    //
+    // `default_retry = false`: kube 4.0's `try_default()` layers a
+    // RetryPolicy::server_retry() (15× exponential backoff on
+    // 429/503/504, honoring Retry-After). The lease loop already
+    // bounds every apiserver call with `tokio::time::timeout`
+    // (RENEW_PHASE_DEADLINE = 1.5s per phase) and retries on its own
+    // 5s tick, so kube's internal retry is redundant — and it
+    // degrades a typed 503/429 into the outer timeout's
+    // `error: None`, hiding "apiserver said 503" behind "apiserver
+    // hung?" in the lease ledger logs. Disable it so the status code
+    // surfaces.
+    let client = match async {
+        let mut config = kube::Config::infer()
+            .await
+            .map_err(kube::Error::InferConfig)?;
+        config.default_retry = false;
+        kube::Client::try_from(config)
+    }
+    .await
+    {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "kube client init failed; lease loop exiting (this replica will never lead)");
