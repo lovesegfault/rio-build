@@ -27,6 +27,7 @@
 //! for everything Nix-facing, BLAKE3 for chunks only.
 
 use fastcdc::v2020::FastCDC;
+use rayon::prelude::*;
 
 /// Minimum chunk size. FastCDC won't cut before this many bytes.
 pub const CHUNK_MIN: usize = 16 * 1024;
@@ -66,9 +67,14 @@ pub struct Chunk<'a> {
 ///
 /// # Cost
 ///
-/// One pass over the data for FastCDC boundaries (fast — it's a rolling
-/// hash). One pass per chunk for BLAKE3 (also fast — ~1 GB/s). Total is
-/// roughly 2× the input throughput, dominated by BLAKE3.
+/// Two phases. **Phase 1** (serial): one pass over the data for FastCDC
+/// boundaries — a rolling hash, inherently sequential, cheap (~few GB/s).
+/// **Phase 2** (parallel): per-chunk BLAKE3 over the rayon global pool.
+/// BLAKE3 is ~1 GB/s/core, so phase 2 scales close to N-core; the serial
+/// phase-1 scan becomes the floor. The caller wraps this in
+/// [`crate::cas::cpu_bound`] (`block_in_place`), which sheds the tokio
+/// worker; rayon dispatches into its OWN pool, so tokio sees one blocked
+/// thread regardless of core count.
 pub fn chunk_nar(nar: &[u8]) -> Vec<Chunk<'_>> {
     // FastCDC::new panics on empty input (reasonable — no boundaries in
     // nothing). Early-return instead.
@@ -76,6 +82,45 @@ pub fn chunk_nar(nar: &[u8]) -> Vec<Chunk<'_>> {
         return Vec::new();
     }
 
+    // Phase 1 — serial boundary scan. `fastcdc::v2020::Chunk` is the
+    // in-memory iterator's owned `{hash:u64, offset, length}` item (NOT
+    // `ChunkData` — that's the streaming-reader variant). ≈24 B/entry ×
+    // MAX_NAR_SIZE/CHUNK_MIN ≈ 262 144 → ~6 MiB worst case; negligible
+    // beside the resident NAR buffer. We materialize to a Vec FIRST so
+    // phase 2 is an `IndexedParallelIterator` — `.collect::<Vec<_>>()`
+    // on that preserves index order, which is the manifest-reassembly
+    // invariant (`chunks_concatenate_to_input`). `.par_bridge()` directly
+    // on the FastCDC iterator would NOT preserve order and would corrupt
+    // every reassembled NAR.
+    let mut entries: Vec<fastcdc::v2020::Chunk> = Vec::with_capacity(nar.len() / CHUNK_AVG);
+    entries.extend(FastCDC::new(nar, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX));
+
+    // Phase 2 — data-parallel BLAKE3. The rayon GLOBAL pool is shared
+    // across every concurrent `put_chunked` leader (admission gate allows
+    // 64-128), so total CPU stays bounded at num_cpus — fair sharing, not
+    // a per-call thread pool. The `blake3/rayon` feature is deliberately
+    // OFF: that parallelizes WITHIN one hash for inputs >128 KiB, and
+    // nesting it under cross-chunk `par_iter` would oversubscribe.
+    entries
+        .into_par_iter()
+        .map(|entry| {
+            let data = &nar[entry.offset..entry.offset + entry.length];
+            Chunk {
+                hash: *blake3::hash(data).as_bytes(),
+                data,
+            }
+        })
+        .collect()
+}
+
+/// Serial reference: the pre-rayon `chunk_nar` body verbatim. Test-only
+/// oracle for `parallel_matches_serial` — proves the two-phase rewrite is
+/// observationally identical to the original interleaved scan-and-hash.
+#[cfg(test)]
+fn chunk_nar_serial(nar: &[u8]) -> Vec<Chunk<'_>> {
+    if nar.is_empty() {
+        return Vec::new();
+    }
     FastCDC::new(nar, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX)
         .map(|entry| {
             let data = &nar[entry.offset..entry.offset + entry.length];
@@ -92,6 +137,28 @@ pub fn chunk_nar(nar: &[u8]) -> Vec<Chunk<'_>> {
 mod tests {
     use super::*;
     use rio_test_support::fixtures::pseudo_random_bytes;
+
+    /// The parallel BLAKE3 phase must produce bit-identical output to
+    /// the serial reference: same chunk count, same (hash, offset, len)
+    /// at every index. Order preservation is the load-bearing property —
+    /// `into_par_iter().collect::<Vec<_>>()` on an IndexedParallelIterator
+    /// guarantees it; `.par_bridge()` would NOT.
+    #[test]
+    fn parallel_matches_serial() {
+        let data = pseudo_random_bytes(0, 8 << 20);
+        let par = chunk_nar(&data);
+        let ser = chunk_nar_serial(&data);
+        assert_eq!(par.len(), ser.len(), "chunk count");
+        for (i, (p, s)) in par.iter().zip(ser.iter()).enumerate() {
+            assert_eq!(p.hash, s.hash, "hash mismatch at chunk {i}");
+            assert_eq!(
+                p.data.as_ptr(),
+                s.data.as_ptr(),
+                "offset mismatch at chunk {i}"
+            );
+            assert_eq!(p.data.len(), s.data.len(), "len mismatch at chunk {i}");
+        }
+    }
 
     #[test]
     fn empty_input_empty_output() {

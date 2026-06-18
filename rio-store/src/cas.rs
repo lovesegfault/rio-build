@@ -296,6 +296,11 @@ pub async fn stage_chunked(
     // scheduled on that worker. spawn_blocking would require
     // nar_data: 'static (it's a borrow); block_in_place keeps the
     // borrow and tells the runtime to hand off other work.
+    // chunk_nar's BLAKE3 phase fans out over the rayon GLOBAL pool —
+    // rayon owns its own threads, so tokio still sees one blocked
+    // worker (which it backfills) regardless of core count, and the
+    // current_thread fallback at cpu_bound() is fine: rayon's pool
+    // exists independent of any tokio runtime.
     let chunks = cpu_bound(|| chunker::chunk_nar(nar_data));
     debug!(chunks = chunks.len(), "NAR chunked");
 
