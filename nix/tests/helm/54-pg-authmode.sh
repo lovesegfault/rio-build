@@ -13,6 +13,7 @@ eks_args=(
   --set externalSecrets.enabled=true
   --set externalSecrets.auroraEndpoint=db.example.invalid
   --set "externalSecrets.auroraSecretArn=arn:aws:secretsmanager:eu:1:secret:x"
+  --set scheduler.sla.cluster=pg-authmode-stub
 )
 
 # Bad enum value must fail the render, naming the knob.

@@ -25,6 +25,7 @@ render_eks=$(helm template rio . --set global.image.tag=test \
   --set externalSecrets.enabled=true \
   --set externalSecrets.auroraEndpoint=db.example.invalid \
   --set externalSecrets.auroraSecretArn=arn:aws:secretsmanager:eu:1:secret:x \
+  --set scheduler.sla.cluster=migrate-job-stub \
   --set postgres.authMode=iam)
 
 migrate_job() {
