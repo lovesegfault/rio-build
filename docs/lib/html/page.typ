@@ -20,6 +20,9 @@
         ),
       )
       #html.title[#title — rio-build design book]
+      // Empty data-URI favicon — suppresses the /favicon.ico 404 every
+      // page load otherwise triggers under `nix run .#docs`.
+      #html.elem("link", attrs: (rel: "icon", href: "data:,"))
       #html.elem("link", attrs: (rel: "stylesheet", href: "/style.css"))
       #html.elem("link", attrs: (
         rel: "stylesheet",

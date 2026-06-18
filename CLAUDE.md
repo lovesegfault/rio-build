@@ -200,7 +200,7 @@ This project has a comprehensive design book in `docs/` (typst sources). When im
 - **Crate structure** (`docs/spec/system/crate-structure.typ`): Expected modules and file layout
 - **Architecture** (`docs/architecture.typ`): System-level design
 
-Render with `/nixbuild .#docs` (native typst HTML bundle + pagefind, `result/index.html`) or `/nixbuild .#docs-pdf` (stitched PDF). Dev loop: `typst watch --features html --port 8000 docs/book.typ` (live reload; search index only in the nix-built output).
+Render with `/nixbuild .#docs` (native typst HTML bundle + pagefind, `result/index.html`) or `/nixbuild .#docs-pdf` (stitched PDF). Dev loop: `typst watch --features bundle,html --format bundle --root docs --input x-target=html --input gh-sha=dirty docs/book.typ /tmp/rio-docs-watch/ --port 8000` (live reload; pagefind search index only in the nix-built output).
 
 ### Keeping docs and code in sync
 

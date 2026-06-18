@@ -38,9 +38,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# mdbook output
-docs/book/
-
 # typst output
 docs/**/*.pdf
 
@@ -68,5 +65,4 @@ mutants.out*/
 *.qcow2
 .stress-test/
 .fsbench/
-docs/dist/
 _apalache-out/

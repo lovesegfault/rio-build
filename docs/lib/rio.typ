@@ -108,9 +108,8 @@
 // double-apply (currentColor → light --fg → invert → dark-on-dark);
 // the CSS scoping on .rio-frame is load-bearing.
 
-// Per-page route, set by lib/html/page-shell (Task 7). Until that
-// lands, stays `none` so `_chapter-nav()` returns the empty stub and
-// PDF compiles unaffected.
+// Per-page route, set by lib/html/page.typ's `page-shell()`. Stays
+// `none` for PDF targets so `_chapter-nav()` returns the empty stub.
 #let _current-route = state("rio-current-route", none)
 
 // Locate the current route in the flattened chapter manifest. Returns
@@ -193,7 +192,7 @@
 
 // gentle-clues callouts: in html mode the package's icon+title grid()
 // warns, so emit a plain <aside> instead (selectable text; styled by
-// lib/html/page-shell). Paged targets get the real gentle-clues render.
+// docs/assets/style.css). Paged targets get the real gentle-clues render.
 #let _clue(gc-fn, kind, ..args) = context if is-html() {
   let title = args.named().at("title", default: none)
   html.elem("aside", attrs: (class: "rio-clue rio-clue-" + kind), {
@@ -255,13 +254,6 @@
 // re-fire: typst's `state.get()` is positional, so the second `rio()`'s
 // `context` read sees the first call's `_gloss-done.update(true)`.
 #let _gloss-done = state("rio-gloss-done", false)
-// Chapters that `provides-glossary()` (sla-sizing, glossary.typ) own
-// their `<key>` anchors via `print-glossary`; `_gloss-own` lets the
-// html `@key` cross-link intercept in `rio()` fall through to the
-// intra-chapter glossarium link there.
-#let _gloss-own = state("rio-gloss-own", false)
-// Registered key set, for the `show link:` membership check.
-#let _gloss-keys = glossary-entries.map(e => e.key)
 // Bare empty-body figures: rio()'s `show figure.where(kind:
 // "glossarium_entry")` rule renders them as `it.body` (=[]) in html
 // mode and `align(left, it)` in paged (also visually empty), so no box
@@ -277,15 +269,12 @@
 // so `rio()` skips `_gloss-anchors` (which would otherwise duplicate
 // the `<key>` labels their `print-glossary` emits), and registers if
 // nothing has yet (standalone compile of the chapter; under book-pdf an
-// earlier chapter's `rio()` already did). `_gloss-own` is the separate
-// gate for the html cross-link intercept (it stays false in chapters
-// that rely on rio()'s anchors and true here).
+// earlier chapter's `rio()` already did).
 #let provides-glossary() = {
   context if not _gloss-done.get() {
     register-glossary(glossary-entries)
   }
   _gloss-done.update(true)
-  _gloss-own.update(true)
 }
 
 // Label/anchor id with the tracey `+N` revision suffix stripped.
@@ -500,7 +489,7 @@
   ) if is-pdf
 
   // html: emit content transforms. Page chrome (head/CSS/sidebar/nav)
-  // is supplied by lib/html/page-shell; this block only handles
+  // is supplied by lib/html/page.typ; this block only handles
   // equation/figure/table framing and footnote/nav fragments.
   //
   // Whole block is gated on is-html() ONLY — every branch below emits
@@ -513,7 +502,7 @@
   // glossarium figures keep their explicit kinds and render as HTML.
   // Custom CSS for our html-mode element bypasses (#r → div.rio-req,
   // gentle-clues → aside.rio-clue, figure → .rio-figure, footnote →
-  // .rio-footnote) lives in lib/html/page-shell.
+  // .rio-footnote) lives in docs/assets/style.css.
   show: if not is-pdf {
     it => {
       // Equations: typst 0.15 native HTML export emits `<math>`
@@ -527,7 +516,7 @@
       // whose grid() would otherwise warn). Selectable text matters
       // less for these than for code/callouts.
       let frame-figure = fig => context if target() == "html" {
-        // 560pt ≈ 746px (mdbook --content-max-width is 750px). Only
+        // 560pt ≈ 746px (.rio-main max-width is 56rem). Only
         // algorithms get a fixed-width box — they never exceed the
         // column and benefit from fill width. Diagrams (kind: image)
         // stay intrinsic so wide autograph/fletcher (1500pt+) aren't
@@ -535,8 +524,8 @@
         let body = if fig.kind == "algorithm" {
           box(width: 560pt, fig.body)
         } else { fig.body }
-        // Single-variant render — dark themes recolor via CSS filter
-        // (.ayu/.navy/.coal .rio-frame svg below). .rio-frame scopes
+        // Single-variant render — dark theme recolours via CSS filter
+        // (:root[data-theme="dark"] .rio-frame svg). .rio-frame scopes
         // the invert filter to the diagram SVG only — figcaption
         // inline-eq SVGs and figure(kind: table) body cells are
         // .rio-figure children but NOT .rio-frame; they're
@@ -569,8 +558,8 @@
         })
       } else { fig }
       // typst html refuses #footnote when a custom <html> element is
-      // present (mdbook emits one). Render the note body inline as a
-      // muted parenthetical instead — close enough for web reading.
+      // present (page-shell emits one). Render the note body inline as
+      // a muted parenthetical instead — close enough for web reading.
       show footnote: it => html.elem(
         "span",
         attrs: (class: "rio-footnote"),
@@ -586,13 +575,10 @@
       // source-migrated (range-limited promote) and docs-lint catches
       // re-introduction.
       it
-      // QA #9/QA2-R3: prev/next chapter nav. mdbook's chrome.css
-      // expects TWO blocks with `.previous`/`.next` children:
-      //   .nav-wrapper      — mobile bottom buttons (display:none on
-      //                        desktop, @media ≤1080px shows it)
-      //   .nav-wide-wrapper — desktop floating side arrows
-      // Emit <a> directly (cross-link doesn't pass attrs) so the
-      // chrome.css class + rel + aria-label land on the link itself.
+      // QA #9/QA2-R3: prev/next chapter nav. style.css renders
+      // .nav-wrapper as a footer prev/next bar at all widths. Emit <a>
+      // directly (cross-link doesn't pass attrs) so class + rel +
+      // aria-label land on the link itself.
       context {
         let nav = _chapter-nav()
         if nav.prev != none or nav.next != none {
@@ -614,14 +600,6 @@
             {
               nav-a(nav.prev, "mobile-nav-chapters previous", "prev", [←])
               nav-a(nav.next, "mobile-nav-chapters next", "next", [→])
-            },
-          )
-          html.elem(
-            "nav",
-            attrs: (class: "nav-wide-wrapper", aria-label: "Page navigation"),
-            {
-              nav-a(nav.prev, "nav-chapters previous", "prev", [←])
-              nav-a(nav.next, "nav-chapters next", "next", [→])
             },
           )
         }

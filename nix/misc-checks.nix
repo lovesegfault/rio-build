@@ -2185,12 +2185,7 @@ in
         # non-deterministic across dev environments).
         typSrc = pkgs.lib.fileset.toSource {
           root = ../docs;
-          fileset = pkgs.lib.fileset.difference (pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs) (
-            pkgs.lib.fileset.unions [
-              (pkgs.lib.fileset.maybeMissing ../docs/.cache)
-              (pkgs.lib.fileset.maybeMissing ../docs/dist)
-            ]
-          );
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs;
         };
         # Non-.typ files that reference docs by path — rust comments +
         # warn! bodies, nix comments, github workflows, shell scripts,
@@ -2389,9 +2384,10 @@ in
         # and the deleted rio-scheduler/src/logs/ tree.
         #
         # Native typst bundle (retired 2026-06): shiroa / shiroaPkg /
-        # shiroa-mdbook / reflexo / typst.ts (the JS renderer) /
-        # docs-svg-dedup / RIO_TYPST_XDG / docs-serve-parity /
-        # is-web-target — the shiroa-era HTML pipeline.
+        # shiroa-mdbook / mdbook / reflexo / typst.ts (the JS renderer)
+        # / docs-svg-dedup / RIO_TYPST_XDG / docs-serve-parity /
+        # is-web-target / x-url-base / shiroa-sys-target — the retired
+        # HTML pipeline and its `--input` keys.
         #  - `is-html-target` is NOT denied: live predicate in
         #    lib/rio.typ. Verified 2026-06-17:
         #      rg -n 'is-html-target' docs/

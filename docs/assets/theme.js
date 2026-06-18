@@ -7,6 +7,9 @@
     stored || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
   root.dataset.theme = initial;
   addEventListener("DOMContentLoaded", () => {
+    if (window.PagefindUI && document.querySelector("#search")) {
+      new PagefindUI({ element: "#search", showSubResults: true });
+    }
     const btn = document.querySelector(".rio-theme-toggle");
     if (!btn) return;
     btn.addEventListener("click", () => {
@@ -14,6 +17,5 @@
       root.dataset.theme = next;
       localStorage.setItem(KEY, next);
     });
-    new PagefindUI({ element: "#search", showSubResults: true });
   });
 })();

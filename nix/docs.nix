@@ -90,9 +90,6 @@ let
     fileset = lib.fileset.difference ../docs (
       lib.fileset.unions [
         ../docs/gen
-        # gitignored local-build artifacts that may exist on disk
-        (lib.fileset.maybeMissing ../docs/dist)
-        (lib.fileset.maybeMissing ../docs/.cache)
         # Contributor bug-pattern catalog cited from rust comments by
         # literal path; not book content. Excluded so editing it doesn't
         # rebuild docs-pdf/docs-html.
@@ -329,6 +326,19 @@ rec {
         grep -q '<svg' ${html}/architecture.html
         # (e) pagefind index emitted
         test -s ${html}/pagefind/pagefind.js
+        # (f) bug_003: refs.gh() permalinks pin a commit, not /blob/main/
+        ! grep -rq 'lovesegfault/rio-build/blob/main/' ${html}
+        # (g) bug_033/025: #r() emits an `id="r-…"` anchor per marker so
+        # rref() resolves. gateway.typ has ~100 markers; floor 80.
+        test "$(grep -oE 'id="r-[a-z]' \
+          ${html}/spec/components/gateway.html | wc -l)" -ge 80
+        # (h) QA #1: zero-width html.frame() SVGs
+        ! grep -rqE '<svg[^>]*width="0pt"' ${html}
+        # (i) QA2-D: page backref leak into glossary HTML
+        ! grep -q 'pp\.' ${html}/glossary.html
+        # (j) design assertion: nothing from the retired pipeline leaked
+        # (charclass dodges the deny_shared identifier lint on this file)
+        ! grep -rqiE 'shi[r]oa' ${html}
         touch $out
       '';
   };

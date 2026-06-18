@@ -86,6 +86,46 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
    non-math values breaks the formatting context. */
 math { font-family: "NewComputerModernMath", math; font-size: 1.1em; }
 math[display="block"] { margin-block: 1.1em; }
+/* ─── content elements emitted by lib/rio.typ ───────────────────────
+   Ported from the pre-3906bfb2d `rio-css` let-binding; theme-class
+   selectors → :root[data-theme="dark"], legacy-DOM rules
+   (.sidebar/.page-wrapper/.rio-copy/main pre) dropped, equation-SVG
+   rules dropped (typst 0.15 emits native MathML). */
+.rio-req { border-left: 3px solid var(--rule); padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
+.rio-req-id { background: #f6f8fa; border-radius: 3px; padding: 0.1em 0.5em; font-size: 0.85em; }
+:root[data-theme="dark"] .rio-req-id { background: #161b22; }
+.rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em; margin: 1em 0; }
+.rio-clue-title { margin: 0 0 0.4em 0; }
+.rio-clue-info { border-color: #1f6feb; background: #ddf4ff; }
+.rio-clue-warning { border-color: #d1242f; background: #ffebe9; }
+.rio-clue-memo { border-color: #9a6700; background: #fff8c5; }
+.rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
+.rio-clue-idea { border-color: #8250df; background: #fbefff; }
+:root[data-theme="dark"] .rio-clue { color: var(--fg); }
+:root[data-theme="dark"] .rio-clue-info { background: #0d2847; }
+:root[data-theme="dark"] .rio-clue-warning { background: #3d0f12; }
+:root[data-theme="dark"] .rio-clue-memo { background: #3a2e05; }
+:root[data-theme="dark"] .rio-clue-tip { background: #0a2e1a; }
+:root[data-theme="dark"] .rio-clue-idea { background: #2d1b47; }
+.rio-figure { display: block; text-align: center; overflow-x: auto; margin: 1.2em 0; }
+.rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
+.rio-table { overflow-x: auto; max-width: 100%; margin: 1em 0; }
+/* QA4-#5: scroll affordance for wide figures/tables — macOS auto-hides
+   scrollbars; without a hint, 2350px-wide diagrams look clipped. */
+.rio-figure, .rio-table { scrollbar-width: thin; }
+.rio-figure::-webkit-scrollbar, .rio-table::-webkit-scrollbar { height: 8px; }
+.rio-figure::-webkit-scrollbar-thumb,
+.rio-table::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 4px; }
+.rio-footnote { color: var(--muted); font-size: 0.875em; }
+/* Anchor scroll-offset so #r-… fragment targets aren't flush to the top. */
+[id^="r-"], [id^="label-"], h2[id], h3[id], h4[id] { scroll-margin-top: 1.5em; }
+/* Prev/next chapter nav (lib/rio.typ _chapter-nav) — footer bar. */
+.nav-wrapper { display: flex; justify-content: space-between; gap: 1em;
+  margin: 3em 0 1em; }
+.mobile-nav-chapters { padding: .5em 1em; border: 1px solid var(--rule);
+  border-radius: 4px; text-decoration: none; color: var(--fg); }
+.mobile-nav-chapters:hover { border-color: var(--accent); color: var(--accent); }
+.mobile-nav-chapters.next { margin-left: auto; }
 /* pagefind UI inherits theme via vars */
 .pagefind-ui { --pagefind-ui-primary: var(--accent); --pagefind-ui-text: var(--fg);
   --pagefind-ui-background: var(--bg); --pagefind-ui-border: var(--rule); }
