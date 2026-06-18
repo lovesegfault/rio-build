@@ -37,9 +37,8 @@ body {
 /* html.frame() SVGs: invert in dark mode (see lib/rio.typ theming note) */
 .rio-frame svg { max-width: 100%; height: auto; }
 :root[data-theme="dark"] .rio-frame svg { filter: invert(0.93) hue-rotate(180deg); }
-.inline-equation svg { color: var(--fg); }
-.inline-equation svg [fill="#000000"] { fill: currentColor; }
-.inline-equation svg [stroke="#000000"] { stroke: currentColor; }
+math { font-family: inherit; }
+math[display="block"] { display: block; margin: 1.1em auto; text-align: center; }
 /* pagefind UI inherits theme via vars */
 .pagefind-ui { --pagefind-ui-primary: var(--accent); --pagefind-ui-text: var(--fg);
   --pagefind-ui-background: var(--bg); --pagefind-ui-border: var(--rule); }

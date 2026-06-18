@@ -99,16 +99,14 @@
 #let rule-color = rgb("#d0d7de")
 
 // ─── html-frame theming ─────────────────────────────────────────────
-// Figures and equations both render as inline SVG via html.frame().
-// Neither dual-renders anymore — figures recolor via CSS
-// `filter: invert()` (.rio-frame svg) and equations via
-// `currentColor`: they emit at sentinel fill/stroke="#000000" and the
-// CSS attribute selectors at `.inline-equation svg [fill="#000000"]`
-// override them to `currentColor` so `.inline-equation svg
-// { color: var(--fg) }` themes it. NO post-process rewrite — a
-// page-wide replace would also hit .rio-frame diagram SVGs, which
-// double-applies (currentColor → light --fg → invert → dark-on-dark);
-// the CSS scoping is load-bearing. Works in serve and build alike.
+// Figures (diagrams, algorithms) render as inline SVG via
+// html.frame() and recolor via CSS `filter: invert()` (.rio-frame
+// svg). Equations use typst 0.15's native HTML export → `<math>`
+// MathML, which inherits `color` from the cascade, so no SVG
+// sentinel/currentColor hack is needed. NO post-process rewrite — a
+// page-wide replace would hit .rio-frame diagram SVGs and
+// double-apply (currentColor → light --fg → invert → dark-on-dark);
+// the CSS scoping on .rio-frame is load-bearing.
 
 // Per-page route, set by lib/html/page-shell (Task 7). Until that
 // lands, stays `none` so `_chapter-nav()` returns the empty stub and
@@ -415,9 +413,9 @@
   } else { it }
 
   show math.equation.where(block: true): set block(above: 1.1em, below: 1.1em)
-  // box() is paged-layout — in html mode the equation show-rule below
-  // wraps the equation in html.frame() and an outer box() would
-  // re-trigger the "layout ignored" warning.
+  // box() is paged-layout — in html mode equations export as native
+  // MathML and an outer box() would trigger the "layout ignored"
+  // warning.
   show math.equation.where(block: false): it => context if is-paged() {
     box(it)
   } else {
@@ -514,36 +512,11 @@
   // .rio-footnote) lives in lib/html/page-shell.
   show: if not is-pdf {
     it => {
-      // Single-render equations: theme via CSS `currentColor`, not
-      // dual-SVG. Emit ONE html.frame() at fill=black; the
-      // `[fill="#000000"]` attribute selectors override to
-      // currentColor so `.inline-equation svg { color: var(--fg) }`
-      // themes them — works in serve and build.
-      show math.equation: set text(weight: 400)
-      show math.equation.where(block: false): it => context (
-        if target() == "html" {
-          html.elem(
-            "span",
-            attrs: (class: "inline-equation", role: "math"),
-            html.frame({
-              set text(fill: black)
-              it
-            }),
-          )
-        } else { it }
-      )
-      show math.equation.where(block: true): it => context (
-        if target() == "html" {
-          html.elem(
-            "p",
-            attrs: (class: "block-equation", role: "math"),
-            html.frame({
-              set text(fill: black)
-              it
-            }),
-          )
-        } else { it }
-      )
+      // Equations: typst 0.15 native HTML export emits `<math>`
+      // MathML — no show-rule needed; theming inherits `color` from
+      // the cascade. (The pre-0.15 html.frame() SVG path + sentinel
+      // currentColor hack is gone.)
+      //
       // html.frame() figures: diagrams (kind: image — typst's default
       // for unrecognised bodies, so catches fletcher/chronos/lilaq/
       // autograph/finite) and lovelace pseudocode (kind: "algorithm",
