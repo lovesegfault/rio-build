@@ -2560,10 +2560,12 @@ pub const M_109: () = ();
 ///   work-queue (same pattern as 031). Derived state, FK→`manifests`
 ///   `ON DELETE CASCADE`. PG forbids cross-table partial-index
 ///   predicates, hence the same-table bool flag (HOT-update eligible).
-/// - **P0572** (pre-created): `nar_index.root_node`, `directories` +
-///   `directory_tenants` (refcounted content-addressed `Directory`
-///   bodies), `file_blobs` + `file_blob_tenants` (`(file_digest,
-///   manifest)` junction — GC of one referrer leaves the other's row).
+/// - **P0572** (pre-created): `nar_index.root_node` (encoded
+///   `oneof{dir_digest, FileEntry, SymlinkEntry}` — what P0588's
+///   dispatch query reads), `directories` + `directory_tenants`
+///   (refcounted content-addressed `Directory` bodies),
+///   `file_blobs` + `file_blob_tenants` (`(file_digest, manifest)`
+///   junction — GC of one referrer leaves the other's row).
 /// - **P0581** (pre-created): `narinfo.compat_file_hash` for
 ///   legacy-binary-cache compat-write GC coupling.
 /// - **P0586** (pre-created): `chunks.durable` + partial index —
@@ -2616,6 +2618,9 @@ pub const M_111: () = ();
 /// `directory_paths` is the analogous linkage for `directories` (one
 /// row per `(Directory body, NAR containing it)`, FK CASCADE on both
 /// sides — GC of either parent removes the row).
+///
+/// 110-112 ship in the same release; no backfill of the dropped
+/// junctions is needed.
 pub const M_112: () = ();
 
 /// 113 — drop `manifests.nar_indexed` + `manifests_nar_index_pending_idx`.
@@ -2669,7 +2674,9 @@ pub const M_113: () = ();
 /// millions of rows while the previous release is still serving. The
 /// runner's try-then-wait advisory lock was built to allow CIC
 /// (I-194). `IF NOT EXISTS` + the documented DROP-then-rerun recovery
-/// for a failed half-built INVALID index follow 022 verbatim.
+/// for a failed half-built INVALID index follow 022 verbatim. CIC
+/// cannot run inside a transaction block, so this MUST be the only
+/// statement in the file (implicit-transaction rule — see 022).
 pub const M_114: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
