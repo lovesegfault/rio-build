@@ -29,14 +29,31 @@
 
 #let is-html() = target() == "html"
 #let is-paged() = target() == "paged"
+// Compile-global (NOT contextual) html predicate for call sites that
+// can't be wrapped in `context` — the shiroa-era `is-html-target()` /
+// `is-web-target()` names some chapters still use. Gated on the
+// `--input x-target=` CLI input rather than typst's `target()`, so it
+// evaluates the same inside `html.frame()`'s paged sub-context as
+// outside it.
+#let is-html-target() = (
+  sys.inputs.at("x-target", default: "pdf") not in ("pdf", "book-pdf")
+)
+#let is-web-target = is-html-target
 
 // Replacement for shiroa's cross-link: resolve a docs-relative .typ
-// path to either a PDF-internal label or an HTML href.
+// path to either a PDF-internal label or an HTML href. Call sites in
+// chapter prose pass paths with a leading "/" (`"/spec/.../foo.typ"`);
+// lib/html/meta.typ's `route-for`/`label-for` expect tree-relative
+// paths without it, so strip. The PDF branch degrades to plain text
+// when the target chapter isn't in this compilation unit (book-pdf
+// scope excludes guide/ops/glossary/contributing).
 #let cross-link(path, body) = context {
+  let p = if path.starts-with("/") { path.slice(1) } else { path }
   if is-html() {
-    html.elem("a", attrs: (href: "/" + route-for(path) + ".html"))[#body]
+    html.elem("a", attrs: (href: "/" + route-for(p) + ".html"))[#body]
   } else {
-    link(label-for(path), body)
+    let lbl = label-for(p)
+    if query(lbl).len() > 0 { link(lbl, body) } else { body }
   }
 }
 // shiroa's plain-text was a content→str flattener; std repr() is the
@@ -146,7 +163,7 @@
   // html.frame()'s paged sub-context there's no container width, so
   // 100% → 0pt → zero-width SVG (QA #1). frame-figure supplies a
   // fixed-width box for kind:"algorithm" instead.
-  if is-html() {
+  context if is-html() {
     pseudocode-list(booktabs: false, indentation: 1.4em, body)
   } else {
     block(
@@ -163,7 +180,7 @@
 // in PDF (h(1fr) needs container width); below-line in HTML
 // (html.frame() has no width to push against, and below-line reflows
 // at any viewport — width-independent, so the 560pt box stays). QA2-C.
-#let rann(body) = if is-html() {
+#let rann(body) = context if is-html() {
   linebreak()
   h(2em)
   text(size: 0.85em, style: "italic", fill: muted, body)
@@ -178,7 +195,7 @@
 // gentle-clues callouts: in html mode the package's icon+title grid()
 // warns, so emit a plain <aside> instead (selectable text; styled by
 // rio-css extra-assets below). Paged targets get the real gentle-clues render.
-#let _clue(gc-fn, kind, ..args) = if is-html() {
+#let _clue(gc-fn, kind, ..args) = context if is-html() {
   let title = args.named().at("title", default: none)
   html.elem("aside", attrs: (class: "rio-clue rio-clue-" + kind), {
     if title != none {
@@ -195,14 +212,15 @@
 
 // Glossarium back-reference printer: " — pp. 3, 7" in muted small text,
 // deduplicated. Passed as `user-print-back-references` to print-glossary.
-#let muted-backrefs(entry, deduplicate: true) = {
+#let muted-backrefs(entry, deduplicate: true) = context {
   // Page backrefs are meaningless in HTML (every chapter is "page 1").
   // QA2-D.
-  if is-html() { return }
-  let refs = get-entry-back-references(entry, deduplicate: true)
-  if refs.len() > 0 {
-    let lbl = if refs.len() == 1 { "p." } else { "pp." }
-    text(fill: muted, size: 0.85em)[~—~#lbl~#refs.join(", ")]
+  if not is-html() {
+    let refs = get-entry-back-references(entry, deduplicate: true)
+    if refs.len() > 0 {
+      let lbl = if refs.len() == 1 { "p." } else { "pp." }
+      text(fill: muted, size: 0.85em)[~—~#lbl~#refs.join(", ")]
+    }
   }
 }
 
@@ -376,17 +394,17 @@
   set heading(numbering: "1.1 ")
   // Heading geometry is paged-only — in html mode the page-shell CSS
   // supplies heading styling and an outer v() would warn.
-  show heading.where(level: 1): it => if is-paged() {
+  show heading.where(level: 1): it => context if is-paged() {
     v(1.2em, weak: true)
     text(size: 16pt, weight: 700, fill: accent, it)
     v(0.5em)
   } else { it }
-  show heading.where(level: 2): it => if is-paged() {
+  show heading.where(level: 2): it => context if is-paged() {
     v(1.0em, weak: true)
     text(size: 12.5pt, weight: 700, it)
     v(0.3em)
   } else { it }
-  show heading.where(level: 3): it => if is-paged() {
+  show heading.where(level: 3): it => context if is-paged() {
     v(0.8em, weak: true)
     text(size: 11pt, weight: 700, it)
     v(0.2em)
@@ -396,7 +414,7 @@
   // box() is paged-layout — in html mode the equation show-rule below
   // wraps the equation in html.frame() and an outer box() would
   // re-trigger the "layout ignored" warning.
-  show math.equation.where(block: false): it => if is-paged() {
+  show math.equation.where(block: false): it => context if is-paged() {
     box(it)
   } else {
     it
@@ -416,7 +434,7 @@
   }
 
   set table(stroke: none, inset: (x: 0.8em, y: 0.55em))
-  show table: it => if is-paged() {
+  show table: it => context if is-paged() {
     block(stroke: (y: 0.4pt + rule-color), align(center, it))
   } else { it }
   show table.cell.where(y: 0): strong
@@ -439,9 +457,12 @@
   // codly: replaces the plain raw.where(block: true) styling above with
   // line-numbered, language-tagged blocks. Paged-only — its grid()
   // layout warns under the html target; let raw fall through to typst's
-  // native <pre><code class="language-X"> there (selectable, CSS-styleable).
-  show: if is-paged() { codly-init.with() } else { it => it }
-  if is-paged() {
+  // native <pre><code class="language-X"> there (selectable, CSS-
+  // styleable). Gated on the compile-level `is-pdf` (sys.inputs) rather
+  // than contextual `is-paged()` so the gate can be evaluated outside
+  // `context` (set/show rules can't sit inside `context`).
+  show: if is-pdf { codly-init.with() } else { it => it }
+  if is-pdf {
     codly(
       languages: codly-languages,
       zebra-fill: rgb("#f6f8fa"),
@@ -620,7 +641,7 @@
       + _favicon-uri
       + "\";document.head.appendChild(l)})(document.createElement('link'));",
   )
-  show: if is-html() {
+  show: if not is-pdf {
     it => {
       // Single-render equations: theme via CSS `currentColor`, not
       // dual-SVG. Emit ONE html.frame() at fill=black; the

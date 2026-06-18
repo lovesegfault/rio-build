@@ -30,28 +30,14 @@ let
     src = "${tracey-src}/typst-package/tracey";
   };
 
-  # @preview/shiroa-mdbook from the same fork as shiroaPkg (rio-pin
-  # branch), so the items.sum(default: []) sidebar fix (PR #239) is in
-  # the typst package too — nixpkgs' typstPackages.shiroa-mdbook is the
-  # unpatched 0.3.1 universe release. Reuse the nixpkgs package's
-  # propagatedBuildInputs so closeDeps still resolves transitives
-  # (shiroa-mdbook imports shiroa core).
-  shiroaMdbookTypstPkg = pkgs.buildTypstPackage {
-    pname = "shiroa-mdbook";
-    version = "0.3.1";
-    src = "${shiroaPkg.src}/themes/mdbook";
-    inherit (pkgs.typstPackages.shiroa-mdbook) propagatedBuildInputs;
-  };
-
   # Transitive closure over propagatedBuildInputs. wrapper.nix only
   # walks one hop; this walks to fixpoint.
   closeDeps =
     ps: lib.unique (lib.concatMap (p: [ p ] ++ closeDeps (p.propagatedBuildInputs or [ ])) ps);
 
   # The package set the book imports, plus their transitive closure.
-  # tracey + shiroa-mdbook live outside the `typstPackages` scope
-  # (built from fork sources), so they're spliced in after the
-  # `with p;` list.
+  # tracey lives outside the `typstPackages` scope (built from a flake
+  # input source), so it's spliced in after the `with p;` list.
   typstDeps =
     p:
     closeDeps (
@@ -70,11 +56,9 @@ let
         pinit
         suiji
         chronos
-        shiroa
       ])
       ++ [
         traceyTypstPkg
-        shiroaMdbookTypstPkg
       ]
     );
 
