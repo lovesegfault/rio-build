@@ -22,10 +22,81 @@ use tracing::{debug, error, info, warn};
 use rio_proto::types::FindMissingPathsRequest;
 
 use crate::state::{
-    BuildStateExt, DerivationStatus, DrvHash, ExecutorId, effective_wanted, verifiable_wanted_paths,
+    AttemptEventKind, AttemptKind, AttemptRecord, BuildStateExt, DerivationStatus, DrvHash,
+    ExecutorId, SolvedIntent, effective_wanted, verifiable_wanted_paths,
 };
 
 use super::DagActor;
+
+/// Derive the `StartedPredecessor` payload for the next mint of `drv`
+/// from its in-memory attempt history (sh-042). `None` on a first
+/// mint, on a Subst→Build flip, on a worker-reported close whose
+/// reason is not yet established, or across a poison-clear cycle
+/// boundary.
+///
+/// The rfind predicate is the STRUCTURAL key (newest build-kind
+/// attempt of THIS resubmit cycle that has an exec_id);
+/// `termination_reason.is_some()` is a SEPARATE post-`.filter()` so a
+/// None-reason newest record yields `None` rather than letting rfind
+/// skip past it to a stale older record — `max_infra_retries: 10`
+/// makes a witnessed-OOM(A, `Some("oom_killed")`) → worker-timeout(B,
+/// `None`) → re-mint(C) chain reachable within one cycle, and
+/// surfacing A as C's predecessor would mint a misleading marker.
+///
+/// `attempt_kind == Build` is load-bearing: materialization charge
+/// rows DO carry an `exec_id` (`materialize.rs:2991`) and DO land in
+/// `attempt_history` (`materialize.rs:3632`), so `exec_id.is_some()`
+/// alone does not exclude them; without the kind guard a Subst→Build
+/// flip would surface a materialization-kind predecessor whose
+/// `termination_reason` alphabet is foreign to
+/// `attempt_terminal_reason_human`.
+///
+/// `resubmit_cycle == cycle` keeps a poison-clear from carrying a
+/// prior cycle's record forward: close sites stamp the row from
+/// `state.retry.resubmit_cycles` (pull.rs:2175 / completion.rs:385),
+/// which is NOT incremented by any infra/witnessed/timeout retry path
+/// — only on poison-clear (completion.rs:4074).
+///
+/// `floor_bumped`/`new_axis_bytes` derive from the closed attempt's
+/// reason label via [`rio_common::classify::axis_for_reason_label`]
+/// and read `last_intent.{mem,disk}_bytes` — the JUST-stamped solve
+/// at `pull.rs:1227`, what the next pod will GET (so the marker →
+/// `rio: builder` header transition reads coherently).
+pub(super) fn predecessor_for_started(
+    history: &[AttemptRecord],
+    cycle: u32,
+    last_intent: Option<&SolvedIntent>,
+) -> Option<rio_proto::types::StartedPredecessor> {
+    use rio_common::classify::{FloorAxis, axis_for_reason_label};
+    use rio_proto::types::{PredecessorFloorAxis, StartedPredecessor};
+    let cycle = i32::try_from(cycle).unwrap_or(i32::MAX);
+    history
+        .iter()
+        .rfind(|r| {
+            r.event_kind == AttemptEventKind::Attempt
+                && r.attempt_kind == AttemptKind::Build
+                && r.exec_id.is_some()
+                && r.resubmit_cycle == cycle
+        })
+        .filter(|r| r.termination_reason.is_some())
+        .map(|r| {
+            let reason = r
+                .termination_reason
+                .clone()
+                .expect("filter gated on is_some");
+            let (axis, bytes) = match (axis_for_reason_label(&reason), last_intent) {
+                (Some(FloorAxis::Mem), Some(li)) => (PredecessorFloorAxis::Mem, li.mem_bytes),
+                (Some(FloorAxis::Disk), Some(li)) => (PredecessorFloorAxis::Disk, li.disk_bytes),
+                _ => (PredecessorFloorAxis::None, 0),
+            };
+            StartedPredecessor {
+                exec_id: r.exec_id.map(|u| u.to_string()).unwrap_or_default(),
+                termination_reason: reason,
+                floor_bumped: axis as i32,
+                new_axis_bytes: bytes,
+            }
+        })
+}
 
 impl DagActor {
     // -----------------------------------------------------------------------
@@ -962,22 +1033,43 @@ impl DagActor {
         // stale. Empty only on the unreachable node-vanished race
         // (the event is then display-only noise for an already-dead
         // derivation).
-        let exec_id = self
-            .dag
-            .node(drv_hash)
-            .and_then(|s| s.exec_id)
-            .map(|id| id.to_string())
-            .unwrap_or_default();
+        //
+        // sh-042: single `self.dag.node` bind for exec_id +
+        // predecessor (the `state.*` reads). `mint_and_deliver`
+        // stamped `state.sched.last_intent` (pull.rs:1227) and the
+        // predecessor's close site pushed onto `attempt_history()` in
+        // a PRIOR actor turn — both are readable here without DB.
+        // The owned `(exec_id, predecessor)` tuple is built BEFORE
+        // the `get_interested_builds` loop (drop-the-borrow shape)
+        // and cloned per build.
+        let (exec_id, predecessor) = match self.dag.node(drv_hash) {
+            Some(state) => (
+                state.exec_id.map(|id| id.to_string()).unwrap_or_default(),
+                predecessor_for_started(
+                    state.attempt_history(),
+                    state.retry.resubmit_cycles,
+                    state.sched.last_intent.as_ref(),
+                ),
+            ),
+            None => (String::new(), None),
+        };
         for build_id in self.get_interested_builds(drv_hash) {
+            let event = match predecessor.clone() {
+                Some(p) => rio_proto::types::DerivationEvent::started_with_predecessor(
+                    drv_path.clone(),
+                    executor_id.to_string(),
+                    exec_id.clone(),
+                    p,
+                ),
+                None => rio_proto::types::DerivationEvent::started(
+                    drv_path.clone(),
+                    executor_id.to_string(),
+                    exec_id.clone(),
+                ),
+            };
             self.events.emit(
                 build_id,
-                rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent::started(
-                        drv_path.clone(),
-                        executor_id.to_string(),
-                        exec_id.clone(),
-                    ),
-                ),
+                rio_proto::types::build_event::Event::Derivation(event),
             );
             // Progress snapshot: running count +1, worker set changed.
             // Critpath unchanged on dispatch (no completion) — but the

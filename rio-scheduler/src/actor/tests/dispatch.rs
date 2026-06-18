@@ -3268,3 +3268,269 @@ fn spawn_intent_order_total_and_finite_compatible() {
         .collect();
     v.sort_unstable_by(spawn_intent_order);
 }
+
+// ─── sh-042: predecessor_for_started — five rfind-guard pins ────────────
+//
+// One pin per conjunct so a future edit that drops or relocates a guard
+// fails exactly one cell. The headline integration case
+// (`emit_assignment_started_carries_predecessor_after_witnessed_close`)
+// drives the full pull-mint → witnessed-close → re-mint chain through
+// the actor; the four unit cells below construct the in-memory ledger
+// directly so the predicate is pinned without per-case actor plumbing.
+
+use crate::actor::dispatch::predecessor_for_started;
+use crate::state::{
+    AttemptEventKind, AttemptKind, AttemptRecord, OutcomeClass, ReportingParty, SolvedIntent,
+};
+use rio_proto::types::PredecessorFloorAxis;
+
+fn rec(kind: AttemptKind, exec: Option<Uuid>, reason: Option<&str>, cycle: i32) -> AttemptRecord {
+    AttemptRecord {
+        attempt_id: Uuid::now_v7(),
+        event_kind: AttemptEventKind::Attempt,
+        outcome_class: OutcomeClass::Disconnected,
+        exec_id: exec,
+        executor_id: None,
+        attempt_kind: kind,
+        source_node: None,
+        termination_reason: reason.map(Into::into),
+        reporting_party: ReportingParty::Controller,
+        exempt: false,
+        floor_promoted: false,
+        floor_at_cap: false,
+        error_msg: None,
+        final_line_count: None,
+        resubmit_cycle: cycle,
+        occurred_at_epoch_secs: 0.0,
+        recorded_at_epoch_secs: 0.0,
+    }
+}
+
+fn solve(mem: u64, disk: u64) -> SolvedIntent {
+    SolvedIntent {
+        cores: 4,
+        mem_bytes: mem,
+        disk_bytes: disk,
+        deadline_secs: 1800,
+        ..Default::default()
+    }
+}
+
+/// Guard pin 1/5 — `event_kind == Attempt && exec_id.is_some()`: a
+/// first mint has no prior attempt record at all → predecessor is
+/// None (empty history; also covers the Reset-only / no-exec ledger
+/// shapes — neither satisfies the structural key).
+#[test]
+fn predecessor_first_mint_is_none() {
+    assert!(predecessor_for_started(&[], 0, Some(&solve(8 << 30, 50 << 30))).is_none());
+    let mut reset = rec(AttemptKind::Build, None, Some("oom_killed"), 0);
+    reset.event_kind = AttemptEventKind::Reset;
+    assert!(
+        predecessor_for_started(&[reset], 0, Some(&solve(8 << 30, 50 << 30))).is_none(),
+        "Reset rows are not attempts"
+    );
+}
+
+/// Guard pin 2/5 — `attempt_kind == Build`: a materialization charge
+/// row DOES carry an exec_id (materialize.rs:2991) and DOES land in
+/// attempt_history (materialize.rs:3632), so `exec_id.is_some()`
+/// alone does NOT exclude it. After a Subst→Build flip the
+/// predecessor must be None (the visible transition is
+/// `flip_to_family`'s `SubstCloseCause::FellThroughToBuild`).
+#[test]
+fn predecessor_subst_to_build_flip_is_none() {
+    let mat = rec(
+        AttemptKind::Materialization,
+        Some(Uuid::now_v7()),
+        Some("materialization_infra"),
+        0,
+    );
+    assert!(
+        predecessor_for_started(&[mat], 0, Some(&solve(8 << 30, 50 << 30))).is_none(),
+        "materialization-kind records are NOT build predecessors"
+    );
+}
+
+/// Guard pin 3/5 — `resubmit_cycle == cycle`: a poison-clear bumps
+/// `state.retry.resubmit_cycles` (completion.rs:4074); a prior cycle's
+/// closed record must NOT be carried forward as the new cycle's
+/// predecessor.
+#[test]
+fn predecessor_prior_cycle_record_is_none() {
+    let prior = rec(
+        AttemptKind::Build,
+        Some(Uuid::now_v7()),
+        Some("oom_killed"),
+        0,
+    );
+    assert!(
+        predecessor_for_started(&[prior], 1, Some(&solve(8 << 30, 50 << 30))).is_none(),
+        "predecessor does not cross a poison-clear cycle boundary"
+    );
+}
+
+/// Guard pin 4/5 — post-`.filter(is_some)`: worker-reported
+/// infra/timeout (`handle_timeout_failure`/`handle_infrastructure_
+/// failure` → completion.rs:4690/5471) push with
+/// `termination_reason: None` (db/attempts.rs:144 default; the
+/// controller second-installment fill at pull.rs:2611 arrives in a
+/// SEPARATE actor turn). The newest structural match has no reason →
+/// predecessor is None (a content-free `rio: retry    ` line is worse
+/// than today's silent supersede).
+#[test]
+fn predecessor_worker_timeout_reason_none_is_none() {
+    let timed_out = rec(AttemptKind::Build, Some(Uuid::now_v7()), None, 0);
+    assert!(
+        predecessor_for_started(&[timed_out], 0, Some(&solve(8 << 30, 50 << 30))).is_none(),
+        "a None-reason newest match yields no marker"
+    );
+}
+
+/// Guard pin 5/5 — the post-filter is NOT part of the rfind predicate:
+/// witnessed-OOM(A, `Some("oom_killed")`) → re-mint(B) →
+/// worker-timeout (B closes with `termination_reason: None`) →
+/// re-mint(C). With `is_some()` inside the rfind predicate, B would
+/// be SKIPPED and rfind would match A — minting a marker that names
+/// the WRONG predecessor and WRONG reason. The post-filter shape
+/// yields None for C (silent supersede). Regression pin for the
+/// skip-past-None hazard (`max_infra_retries: 10` makes the chain
+/// reachable in one resubmit cycle).
+#[test]
+fn predecessor_does_not_skip_past_none_to_stale_record() {
+    let exec_a = Uuid::now_v7();
+    let exec_b = Uuid::now_v7();
+    let history = [
+        rec(AttemptKind::Build, Some(exec_a), Some("oom_killed"), 0),
+        rec(AttemptKind::Build, Some(exec_b), None, 0),
+    ];
+    assert!(
+        predecessor_for_started(&history, 0, Some(&solve(8 << 30, 50 << 30))).is_none(),
+        "a None-reason NEWEST record must not let rfind resurrect A"
+    );
+    // Contrast: when B's reason IS established (the controller fill
+    // arrived before C's mint), C carries B — never A.
+    let history = [
+        rec(AttemptKind::Build, Some(exec_a), Some("oom_killed"), 0),
+        rec(
+            AttemptKind::Build,
+            Some(exec_b),
+            Some("deadline_exceeded"),
+            0,
+        ),
+    ];
+    let p = predecessor_for_started(&history, 0, Some(&solve(8 << 30, 50 << 30)))
+        .expect("B's reason is established → predecessor is B");
+    assert_eq!(p.exec_id, exec_b.to_string(), "B, not A");
+    assert_eq!(p.termination_reason, "deadline_exceeded");
+    assert_eq!(p.floor_bumped(), PredecessorFloorAxis::None);
+    assert_eq!(p.new_axis_bytes, 0, "no sizing suffix for ClassifyOnly");
+}
+
+/// sh-042 headline (integration): a witnessed `EvictedEmptyDirSizeLimit`
+/// close (the grace=0 kubelet localStorageEviction — builder SIGKILLed
+/// before `footer_lines()`) → re-mint → the emitted `DerivationStarted`
+/// event carries `predecessor = Some({exec_id: old, termination_reason:
+/// "evicted_empty_dir_size_limit", floor_bumped: DISK, new_axis_bytes:
+/// last_intent.disk_bytes})`. Pre-fix, the second Started carried no
+/// predecessor and the gateway ran the silent supersede.
+#[tokio::test]
+async fn emit_assignment_started_carries_predecessor_after_witnessed_close() -> TestResult {
+    use rio_proto::types::build_event::Event;
+
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh042-evict";
+    let mut events =
+        merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+
+    // Helper: drain to the next Started event for `drv`.
+    async fn next_started(
+        events: &mut tokio::sync::broadcast::Receiver<rio_proto::types::BuildEvent>,
+    ) -> rio_proto::types::DerivationEvent {
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                .await
+                .expect("event within 10s")
+                .expect("broadcast open");
+            match ev.event {
+                Some(Event::Derivation(d))
+                    if d.kind() == rio_proto::types::DerivationEventKind::Started =>
+                {
+                    return d;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // First mint: predecessor.is_none() (guard pin 1/5 end-to-end).
+    let a = pull_attempt(&handle, drv).await;
+    let exec_a: Uuid = a.exec_id.parse()?;
+    let first = next_started(&mut events).await;
+    assert!(
+        first.predecessor.is_none(),
+        "first mint has no closed predecessor"
+    );
+
+    // Witnessed close: the sh-039 two-report shape — the controller's
+    // pod-terminal classification (EvictedEmptyDirSizeLimit) records
+    // the witnessed mark; the controller's Job-gone synthesized
+    // verdict (Reaped) then establishes via `establish_from_witnessed`
+    // (pull.rs:2343 — push_attempt_record stamps the WITNESSED reason
+    // synchronously, then reassign_derivations).
+    report_attempt_terminal(
+        &handle,
+        Some(drv),
+        Some(exec_a),
+        rio_proto::types::AttemptTerminalReason::EvictedEmptyDirSizeLimit,
+        Some("node-evict"),
+    )
+    .await
+    .expect("witnessed-terminal mark accepted");
+    report_attempt_terminal(
+        &handle,
+        Some(drv),
+        Some(exec_a),
+        rio_proto::types::AttemptTerminalReason::Reaped,
+        Some("node-evict"),
+    )
+    .await
+    .expect("synthesized verdict over the witnessed mark establishes");
+    barrier(&handle).await;
+    let info = expect_drv(&handle, drv).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "under-cap witnessed close requeues to Ready"
+    );
+
+    // Re-mint: the second Started carries the predecessor.
+    let b = pull_attempt(&handle, drv).await;
+    let exec_b: Uuid = b.exec_id.parse()?;
+    assert_ne!(exec_a, exec_b, "re-mint allocates a fresh exec_id");
+    let solved_disk = expect_drv(&handle, drv)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .expect("mint stamped last_intent (pull.rs:1227)")
+        .disk_bytes;
+    let second = next_started(&mut events).await;
+    let p = second
+        .predecessor
+        .expect("the witnessed close populated predecessor");
+    assert_eq!(p.exec_id, exec_a.to_string(), "names the closed attempt");
+    assert_eq!(
+        p.termination_reason, "evicted_empty_dir_size_limit",
+        "the canonical attempt_terminal_reason_label string"
+    );
+    assert_eq!(
+        p.floor_bumped(),
+        PredecessorFloorAxis::Disk,
+        "axis_for_reason_label inverse of witnessed_disposition"
+    );
+    assert_eq!(
+        p.new_axis_bytes, solved_disk,
+        "last_intent.disk_bytes (the next pod's solve, not resource_floor)"
+    );
+    Ok(())
+}
