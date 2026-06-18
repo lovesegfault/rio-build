@@ -1011,36 +1011,38 @@ pub struct CaState {
 // r[impl sched.sla.reactive-floor+6]
 /// Per-dimension resource floor for the NEXT dispatch (D4).
 ///
-/// Reactive promotion has three producers, census-pinned
-/// (`observe_resource_floor_caller_census`, db/live_pins.rs): the
-/// explicit WORKER-REPORTED resource-exhaustion signals (`CgroupOom`
-/// → `OomKilled`, `TimedOut` → `DeadlineExceeded`) and the
-/// controller-WITNESSED OomKilled letter promoted at the
-/// establishment sweep (live_058-b: once per attempt via the
-/// establishment transaction's `won` flag; every other witnessed
-/// letter is classify-only — `actor/floor.rs`'s
-/// `witnessed_disposition` table). All route through
-/// `actor::floor::observe_peaks`, which doubles the relevant
-/// dimension, capped at `Ceilings`. The disk dimension has NO live
-/// producer: witnessed `EvictedDiskPressure` is classify-only BY
-/// RULING (the controller folds node-condition and pod-attributed
-/// eviction shapes into that one letter), and no worker-side disk
-/// signal exists yet — the parked arm in `actor/floor.rs` names the
-/// designed re-entry (a worker-side quota-attributed lane).
-/// `solve_intent_for` clamps
+/// sh-041u: every non-success worker close routes through ONE
+/// chokepoint — `actor::floor::observe_peaks` — which sets
+/// `floor.X = max(floor.X, peak_X × headroom).min(cap)`.
+/// `headroom = 2.0` on the axis a corroborated hard event names
+/// (`CgroupOom`/witnessed-OOM → mem; `DiskFull`/witnessed
+/// `EvictedEmptyDirSizeLimit` → disk; `TimedOut` → deadline; a
+/// reason-gated compute-bound `cpu_util ≥ threshold` → cores jumps to
+/// `prov_max`); `headroom = 1.2` on every other mem/disk axis with a
+/// peak (soft, in-memory only). The producers are census-pinned
+/// (`observe_resource_floor_caller_census`, db/live_pins.rs):
+/// chokepoint #2 (the worker-report dispatch), #3 (AD5 worker-abort),
+/// #4 (the establishment sweep's witnessed disposition rows —
+/// live_058-b: once per attempt via the establishment transaction's
+/// `won` flag; `actor/floor.rs`'s `witnessed_disposition` table). All
+/// four dimensions are LIVE; node-condition `EvictedDiskPressure`
+/// stays classify-only BY RULING (I-199). `solve_intent_for` clamps
 /// its solved (mem, disk) at this floor before returning so the next
 /// SpawnIntent is at least as large.
 ///
 /// `Default` = zeros = no clamp (cold start). Persisted as
 /// `derivations.floor_{mem,disk,deadline,cores}_*` (`M_044` + `M_106`)
 /// so a scheduler failover between OOM and retry doesn't reset to zero
-/// → re-OOM at probe defaults.
+/// → re-OOM at probe defaults. The persist gates on `hard_promoted`
+/// only — soft 1.2× observations are this leader's tenure.
 ///
-/// `cores` doubles only on a `ComputeBound` witness —
-/// `cpu_seconds_total / (elapsed_wall × assigned_cores) ≥
-/// compute_bound_threshold` (sh-012, the D4 fourth axis) — never on
-/// bare exit≠0. The SLA model still owns INITIAL core selection; the
-/// cores floor is the post-E3a corroborated escalation only.
+/// `cores` jumps to the partition-aware provisionable max on a
+/// reason-gated compute-bound witness — `cpu_seconds_total /
+/// (elapsed_wall × assigned_cores) ≥ compute_bound_threshold` under
+/// `ExecutorVariant`/`WorkerAbort` (sh-012/sh-031/sh-041) — never on
+/// bare exit≠0 or derivation-intrinsic permanent statuses. The SLA
+/// model still owns INITIAL core selection; the cores floor is the
+/// corroborated escalation only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceFloor {
     pub mem_bytes: u64,
@@ -1112,8 +1114,11 @@ pub struct SchedHint {
     pub resource_floor: ResourceFloor,
     /// Dispatch-time `solve_intent_for` output. The spawn-intent solve
     /// reads `mem_bytes` (resource-fit), the mint profile reads
-    /// `cores` (the assigned-cores carry), `observe_peaks`
-    /// reads `mem/disk/deadline` as the doubling base,
+    /// `cores` (the assigned-cores carry), `observe_peaks` reads all
+    /// four scalars as the corroboration ANCHOR (the trust-band
+    /// denominators — the doubling base is the worker-reported PEAK,
+    /// not these values; for an honest hard event peak ≈ assigned, so
+    /// `peak × 2.0 ≈ assigned × 2` reproduces the retired doubling),
     /// `record_build_sample` reads `predicted` for actual-vs-predicted
     /// scoring.
     ///

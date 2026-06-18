@@ -1728,7 +1728,7 @@ async fn test_disk_full_report_doubles_disk_floor() -> TestResult {
         "left: the DiskFull report falls into the non-bump infra arm \
          (retry-poison; the disk recovery ladder never engages, floor \
          stays 0) / right: the floor doubles from the last-dispatched \
-         intent's disk (the bump_dim law the :302-region unit pins \
+         intent's disk (the set_dim law the :302-region unit pins \
          own); got {}",
         s.sched.resource_floor.disk_bytes
     );
@@ -5400,7 +5400,7 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
 }
 
 // r[verify sched.sla.reactive-floor+6]
-/// bug_027 companion red — the carried-at-ceiling cell of `bump_dim`'s
+/// bug_027 companion red — the carried-at-ceiling cell of `set_dim`'s
 /// at_cap law: when the pod was DISPATCHED at the deadline cap (the
 /// carried `BoundIntent` rendered 86400s) and the mint-time solve
 /// resolved below it, a DeadlineExceeded must take the COUNTED at-cap
@@ -5409,7 +5409,7 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
 /// smaller mint value (an UNCOUNTED guaranteed-futile full-length
 /// retry at a limit that provably failed; the exact uncounted
 /// at-ceiling burn the base-not-floor fix existed to kill).
-/// floor.rs/bump_dim is UNTOUCHED — the law's INPUT becomes honest
+/// floor.rs/`set_dim` is UNTOUCHED — the law's INPUT becomes honest
 /// (the stamp carries the reconciled shape), and the hole closes
 /// through the stamp alone. Pre-fix, verbatim: floor doubled to 7200
 /// with `floor_promoted=true ∧ floor_at_cap=false` (exempt); post-fix:

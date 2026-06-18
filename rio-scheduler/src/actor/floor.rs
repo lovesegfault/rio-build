@@ -158,9 +158,9 @@ impl ObservedPeaks {
     /// Build from a `CompletionReport`'s fields. `0` / `None` =
     /// no-signal → axis untouched. `wall` is NOT a parameter: the
     /// scheduler-side anchor is derived inside
-    /// [`observe_resource_floor`](crate::actor::SchedulerActor::observe_resource_floor)
-    /// from `running_since`, so a worker-supplied duration cannot
-    /// reach the trust gate by construction.
+    /// `observe_resource_floor` from `running_since`, so a
+    /// worker-supplied duration cannot reach the trust gate by
+    /// construction.
     // r[impl sched.executor.input-bounds+2]
     pub fn from_report(
         peak_memory_bytes: u64,
@@ -775,8 +775,8 @@ struct CoresOutcome {
 /// `at_cap` poisons `ComputeBoundAtCap` — there is nothing larger to
 /// try and "shrink the regime" is the only remediation.
 ///
-/// `base = max(floor, last)` mirrors the retired `bump_dim`: tests
-/// the DISPATCHED shape (live_040), so a stale floor or a
+/// `base = max(floor, last)` tests the DISPATCHED shape (live_040 —
+/// the retired per-axis body's at_cap derivation), so a stale floor or a
 /// clamped-at-cap `last_intent` reads as already-at-cap. This is the
 /// cores axis's `at_cap` derivation — NOT [`set_dim`]'s `target ≥
 /// cap` (which would mark at_cap on the FIRST jump and break the

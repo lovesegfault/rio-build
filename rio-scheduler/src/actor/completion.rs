@@ -4118,13 +4118,14 @@ impl DagActor {
     /// counter writes and no legacy mirror-column writes remain since
     /// T-1b.13 — the cached view is refreshed from the fold after the
     /// commit); the synthesized poison-reason strings stay as-is (A8 is
-    /// out of scope); transients are never floor-promoted and never
-    /// exempt (P4) — there is deliberately no floor or exemption logic
-    /// on this arm. No resource_floor bump either: `TransientFailure`
-    /// (build script exited nonzero) is a build-determinism signal, not
-    /// a sizing signal — the previous I-170/I-173/I-177 over-broad
-    /// promote here meant a flaky build climbed the ladder and the next
-    /// submitter paid for an oversized pod.
+    /// out of scope). Transients are never HARD-promoted and never
+    /// exempt (P4) — `TransientFailure → Other` at chokepoint #2 means
+    /// `observe_peaks` runs a SOFT-only observe (peak × 1.2, in-memory,
+    /// never `hard_promoted`, never M_044-persists, never rides
+    /// promotion-exempt — the I-170/I-173/I-177 surface is closed by
+    /// `hard_*()` reason gating, not by skipping the observe). No
+    /// `floor_outcome` is threaded to this handler: there is no
+    /// exemption logic on this arm.
     pub(super) async fn handle_transient_failure(
         &mut self,
         drv_hash: &DrvHash,

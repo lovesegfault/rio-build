@@ -152,11 +152,11 @@ pub enum AttemptResolution {
 /// anchor and the `last_intent` stamp. Two ad-hoc derivations of this
 /// fact in one function guaranteed sibling drift: the anchor lifted
 /// `max(resolved, carried)` while the stamp wrote the raw solve, so
-/// the D4 doubling base undersized on refit-down — the new floor could
-/// land at (or below) the deadline that provably failed, with
-/// `promoted=true` riding the promotion-exempt lane (an uncounted
-/// guaranteed-futile full-length retry) — and `bump_dim`'s at_cap test
-/// had the symmetric carried-at-ceiling hole.
+/// the D4 corroboration anchor undersized on refit-down — the new
+/// floor could land at (or below) the deadline that provably failed,
+/// with `promoted=true` riding the promotion-exempt lane (an uncounted
+/// guaranteed-futile full-length retry) — and `set_dim`'s at_cap test
+/// (`target ≥ cap`) had the symmetric carried-at-ceiling hole.
 ///
 /// `reconcile` is the total match over the `(solve, carried)` presence
 /// product; a future carried sizing dimension lands at THIS seam and
