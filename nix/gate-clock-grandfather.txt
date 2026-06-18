@@ -1,6 +1,8 @@
+rio-builder/src/bin/xfstests_runner/checks/support.rs	gate	while start.elapsed() < timeout {
 rio-builder/src/log_stream.rs	gate	if !self.lines.is_empty() && self.batch_start.elapsed() >= BATCH_TIMEOUT {
 rio-builder/src/log_stream.rs	gate	if self.window_start.elapsed() >= Duration::from_secs(1) {
 rio-builder/src/runtime/pull.rs	lossy	2 * SIGTERM_FINAL_ATTEMPT.as_secs() <= rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS
+rio-common/src/pg_iam.rs	gate	.filter(|c| c.minted_at.elapsed() < FRESH_WINDOW)
 rio-controller/src/reconcilers/componentscaler/mod.rs	gate	last.is_none_or(|t| t.elapsed() >= REQUEUE)
 rio-controller/src/reconcilers/node_informer.rs	gate	if start.elapsed() >= per_pass_budget {
 rio-controller/src/reconcilers/pool/job.rs	gate	.retain(|_, inserted| inserted.elapsed() < TERMINAL_REPORT_SAMPLED_TTL);
