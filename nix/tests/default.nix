@@ -56,6 +56,7 @@ let
   controller-kwok = import ./scenarios/controller-kwok.nix;
   leader-election = import ./scenarios/leader-election.nix;
   cli = import ./scenarios/cli.nix;
+  batch-a = import ./scenarios/batch-a.nix;
   dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
   netpol = import ./scenarios/netpol.nix;
   ingress-v4v6 = import ./scenarios/ingress-v4v6.nix;
@@ -780,8 +781,8 @@ in
   # ── kwok-only lifecycle splits (issue #57 1d) ────────────────────────
   # Object-state halves of pool-lifecycle / ephemeral-pool against the
   # bare-apiserver fixture: ~60-90 s each vs ~7-8 min on k3s-full. The
-  # k3s variants above stay until these are proven green; r[verify]
-  # markers are duplicated (not moved) for the same reason.
+  # k3s variants above stay until these are proven green; verify markers
+  # are duplicated (not moved) for the same reason.
   vm-lifecycle-pool-kwok-only = controllerKwokMod.mkTest {
     name = "pool";
     subtests = [
@@ -1043,9 +1044,55 @@ in
   # rio-cli had 0% coverage — never invoked by any test. This runs
   # status + create-tenant + list-tenants against the live scheduler's
   # AdminService. ~5min (mostly k3s bring-up).
-  vm-cli-k3s = cli {
+  vm-cli-k3s =
+    (cli {
+      inherit pkgs common;
+      fixture = k3sFull { singleNode = true; };
+    }).test;
+
+  # ── k3s batch A (issue #57 1e: one boot, sequential groups) ──────────
+  # Collapses vm-cli-k3s + vm-lifecycle-core-k3s + vm-lifecycle-gc-k3s
+  # onto one `k3sFull { jwtEnabled; singleNode; }` boot. ~4min bring-up
+  # paid once; {cli, lifecycle-core, lifecycle-gc} run sequentially via
+  # lib/driver.py run_batch (NOT concurrently — Machine.execute() is
+  # thread-unsafe; see lib/driver.py). cli FIRST (its `builds` subtest
+  # asserts empty-state); gc LAST (TriggerGC is store-global). The three
+  # collapsed tests above stay until this is proven green; verify markers
+  # are duplicated (not moved) for the same reason — same parallel-prove
+  # pattern as the 1d kwok-only splits.
+  #
+  # vm-security-nonpriv-k3s is NOT folded in (different fixture: nonpriv
+  # overlay changes the default pool's securityContext); see
+  # scenarios/batch-a.nix header.
+  #
+  # ── cli group ──
+  # r[verify sched.admin.create-tenant]
+  # r[verify sched.admin.delete-tenant]
+  # r[verify sched.admin.list-tenants]
+  # r[verify sched.admin.list-executors]
+  # r[verify sched.admin.list-builds]
+  # r[verify sched.admin.clear-poison]
+  # r[verify cli.cmd.sla]
+  # ── lifecycle-core group ──
+  # r[verify sec.jwt.pubkey-mount+2]
+  # r[verify ctrl.probe.named-service]
+  # r[verify ctrl.health.ready-gates-connect]
+  # r[verify builder.cancel.cgroup-kill]
+  # r[verify builder.cgroup.kill-on-teardown]
+  # r[verify builder.timeout.no-reassign]
+  # r[verify ctrl.pool.reconcile]
+  # r[verify ctrl.crd.pool]
+  # ── lifecycle-gc group ──
+  # r[verify store.gc.tenant-retention]
+  # r[verify builder.upload.references-scanned]
+  # r[verify builder.upload.deriver-populated]
+  # r[verify store.gc.two-phase]
+  vm-k3s-batch-a = batch-a {
     inherit pkgs common;
-    fixture = k3sFull { singleNode = true; };
+    fixture = k3sFull {
+      jwtEnabled = true;
+      singleNode = true;
+    };
   };
 
   # r[verify dash.envoy.grpc-web-translate+3]

@@ -25,19 +25,20 @@ let
   # signing with the bytes the cluster actually mounted can never
   # diverge from what the scheduler verifies).
   cliEnv = "RIO_SCHEDULER_ADDR=localhost:19001 " + "RIO_SERVICE_HMAC_KEY_PATH=/tmp/service-hmac.key ";
-in
-pkgs.testers.runNixOSTest {
-  name = "rio-cli";
-  skipTypeCheck = true;
 
-  # Bring-up ~3-4min + a few CLI calls. No builds, no recovery.
-  globalTimeout = 600 + common.covTimeoutHeadroom;
-
-  inherit (fixture) nodes;
-
-  testScript = ''
-    ${common.mkBootstrap { inherit fixture; }}
-
+  # ── Body-only export for batch-a.nix (issue #57 1e) ────────────────
+  # Everything between bootstrap and collectCoverage. `body` assumes
+  # the caller's prelude already ran assertions + kvmCheck + start_all
+  # + waitReady + kubectlHelpers (pf_open / leader_pod) — i.e. the same
+  # shape as common.mkBootstrap or lifecycle.nix's prelude. mkBatchTest
+  # wraps this as `def _grp_cli(ctx):` (4-space indent); every k3s_server
+  # / pf_open reference resolves by closure to the prelude's
+  # module-level defs.
+  #
+  # State assumption: `cli builds` asserts the empty-state path
+  # (`.total_count == 0`). In a batch, run this group BEFORE any group
+  # that calls SubmitBuild.
+  body = ''
     # Port-forward the scheduler leader's gRPC port (9001). Unlike
     # lifecycle.nix's per-call pf_exec, this stays up for the whole
     # test — all CLI calls go through localhost:19001.
@@ -259,7 +260,24 @@ pkgs.testers.runNixOSTest {
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-cli.pid) 2>/dev/null || true")
-
-    ${common.collectCoverage fixture.pyNodeVars}
   '';
+in
+{
+  inherit body;
+
+  test = pkgs.testers.runNixOSTest {
+    name = "rio-cli";
+    skipTypeCheck = true;
+
+    # Bring-up ~3-4min + a few CLI calls. No builds, no recovery.
+    globalTimeout = 600 + common.covTimeoutHeadroom;
+
+    inherit (fixture) nodes;
+
+    testScript = ''
+      ${common.mkBootstrap { inherit fixture; }}
+      ${body}
+      ${common.collectCoverage fixture.pyNodeVars}
+    '';
+  };
 }
