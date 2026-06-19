@@ -67,6 +67,7 @@ let
         ;
     };
   pulled = import ../../docker-pulled.nix { inherit pkgs; };
+  mkContainerdSeed = import ../../containerd-seed.nix { inherit pkgs; };
   ciliumImages = [
     pulled.cilium-agent
     pulled.cilium-operator-generic
@@ -165,6 +166,26 @@ in
   # explicitly (lifecycle gc-sweep's gc-tenant-test) — see the scoping
   # rationale in common.tenantStopgapSeedSql.
   defaultTenant ? null,
+  # issue #57 1b: drop k3s-agent and run everything on the server. Nine
+  # of fourteen vm-*-k3s tests don't exercise multi-node behaviour
+  # (podAntiAffinity spread, leader fail-over, agent-netpol egress) but
+  # paid the agent's ~6 GB + ~90-120s of bring-up anyway. With
+  # singleNode=true: scheduler.replicas=1 (the antiAffinity has nowhere
+  # to spread), the server picks up the rio.build/vmtest=true node-label
+  # so worker Jobs schedule there, server RAM bumps to 10 GB to absorb
+  # what the agent was carrying, and waitReady skips every k3s-agent
+  # gate. The two-node path is unchanged for le-*, lifecycle-recovery,
+  # netpol, fetcher-split, prod-parity.
+  singleNode ? false,
+  # issue #57 1f: pre-import the airgap image set at BUILD time
+  # (nix/containerd-seed.nix) instead of letting k3s's serial pre-kubelet
+  # goroutine do it at boot. The seed's content store is loop-mounted
+  # erofs overlaid under containerd's content dir + meta.db copied into
+  # place before k3s starts; `services.k3s.images` is emptied. Same
+  # mechanism class as r[infra.node.prebake-layer-warm]. Gated off by
+  # default while the lazy-unpack path is proven on one test (vm-cli-k3s);
+  # flip per-test in nix/tests/default.nix.
+  withContainerdSeed ? false,
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -212,6 +233,13 @@ let
     extraSetTyped = {
       "coverage.enabled" = coverage;
     }
+    // pkgs.lib.optionalAttrs singleNode {
+      # No second node for podAntiAffinity to spread to. The standby
+      # replica added nothing the single-node tests assert on, and the
+      # Trailers-Only LB flake (ci-failure-patterns.md "Envoy/nginx LB
+      # to standby replica") is structurally impossible at replicas=1.
+      "scheduler.replicas" = 1;
+    }
     // pkgs.lib.optionalAttrs jwtEnabled {
       "jwt.enabled" = true;
     }
@@ -253,6 +281,19 @@ let
   # mode vmTestsCov skips it entirely.
   ++ pkgs.lib.optional (gatewayEnabled && dockerImages ? dashboard) dockerImages.dashboard
   ++ extraImages;
+
+  # Full airgap set for THIS scenario variant (varies with extraImages /
+  # gatewayEnabled). When withContainerdSeed=false this feeds
+  # `services.k3s.images` on both nodes (the historical path). When
+  # withContainerdSeed=true it feeds mkContainerdSeed instead and
+  # `services.k3s.images` is emptied — see nix/containerd-seed.nix
+  # header for the runtime mount sequence.
+  airgapImageSet = [ k3sPinned.airgap-images ] ++ rioImages ++ ciliumImages;
+  containerdSeed = mkContainerdSeed {
+    name = "k3s-full";
+    images = airgapImageSet;
+  };
+  containerdRoot = "/var/lib/rancher/k3s/agent/containerd";
 
   # ── Containerd tmpfs sizing ──────────────────────────────────────────
   # Decompressed airgap layers: ~1.5GB normal, ~2.5GB cov-mode (the
@@ -399,7 +440,7 @@ let
         # (nix/nixos-node/hardening.nix).
         "fuse.enable_uring=1"
       ];
-      supportedFilesystems = [ "xfs" ];
+      supportedFilesystems = [ "xfs" ] ++ pkgs.lib.optional withContainerdSeed "erofs";
     };
 
     # ── /var/rio on an XFS-with-prjquota loopback ──────────────────────
@@ -435,6 +476,39 @@ let
             mount -o loop,prjquota /var/rio.img /var/rio
           fi
           mkdir -p /var/rio/castore /var/rio/staging /var/rio/cache /var/rio/chunks
+        '';
+      };
+
+      # issue #57 1f: mount the pre-imported content store + drop meta.db
+      # into place BEFORE k3s starts its embedded containerd. The parent
+      # ${containerdRoot} tmpfs is stage-1 (neededForBoot below), so by
+      # the time this oneshot runs the upper/work dirs can be mkdir'd on
+      # it. erofs loop-mount → ro lower; overlay upper stays ~empty
+      # (content store is append-only, airgapped test pulls nothing).
+      # meta.db is a plain copy onto tmpfs — boltdb opens O_RDWR+mmap,
+      # which would copy-up through an overlay anyway.
+      services.containerd-seed-mount = pkgs.lib.mkIf withContainerdSeed {
+        before = [ "k3s.service" ];
+        requiredBy = [ "k3s.service" ];
+        after = [ "local-fs.target" ];
+        unitConfig.DefaultDependencies = false;
+        path = [ pkgs.util-linux ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          set -eu
+          root=${containerdRoot}
+          content=$root/io.containerd.content.v1.content
+          mkdir -p /run/containerd-seed/lower $content \
+            $root/.content-upper $root/.content-work \
+            $root/io.containerd.metadata.v1.bolt
+          mount -t erofs -o loop,ro \
+            ${containerdSeed}/content.erofs /run/containerd-seed/lower
+          mount -t overlay overlay $content -o \
+            lowerdir=/run/containerd-seed/lower,upperdir=$root/.content-upper,workdir=$root/.content-work
+          cp ${containerdSeed}/meta.db $root/io.containerd.metadata.v1.bolt/meta.db
         '';
       };
 
@@ -535,7 +609,7 @@ let
     # virtualisation.fileSystems (not plain fileSystems): qemu-vm.nix
     # does `fileSystems = mkVMOverride virtualisation.fileSystems`
     # (priority 10) — a plain `fileSystems.*` def is silently dropped.
-    virtualisation.fileSystems."/var/lib/rancher/k3s/agent/containerd" = {
+    virtualisation.fileSystems.${containerdRoot} = {
       fsType = "tmpfs";
       neededForBoot = true;
       options = [
@@ -550,7 +624,6 @@ let
       pkgs.grpc-health-probe # health-shared probe (lifecycle.nix)
       pkgs.wireguard-tools # `wg show cilium_wg0` (cilium-encrypt.nix)
     ];
-
   };
 
   # ── v6-only k3s node overlay ────────────────────────────────────────
@@ -592,7 +665,10 @@ let
         role = "server";
         clusterInit = true;
         inherit tokenFile;
-        images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
+        # withContainerdSeed: images already registered via the
+        # containerd-seed-mount oneshot above; an empty list makes k3s's
+        # serial pre-kubelet airgap goroutine return immediately.
+        images = if withContainerdSeed then [ ] else airgapImageSet;
         manifests = {
           # Cilium CNI — applied first (filename-alphabetical: `000-` sorts
           # before everything). Nothing else can schedule until cilium-agent
@@ -729,12 +805,25 @@ let
           # schedules here and every build fails at UDS connect.
           "--node-label"
           "rio.build/node-role=builder"
+        ]
+        # singleNode: server is the ONLY node, so it must carry the
+        # vmtest hwClass label (vmtest-full.yaml's [sla.hw_classes.vmtest]
+        # selects on it; without it worker Jobs go Pending forever).
+        # Two-node keeps the label agent-only so the antiAffinity-spread
+        # scheduler replica and worker Jobs land on different nodes.
+        ++ pkgs.lib.optionals singleNode [
+          "--node-label"
+          "rio.build/vmtest=true"
         ];
       };
 
-      # 8GB (was 6GB): PG (512Mi) + 5 rio pods (~2GB) + k3s control
-      # plane (~1.5GB) + containerd tmpfs (~1.5GB layers, 3G cap) +
-      # headroom. Coverage: +2GB for instrumented-image bloat.
+      # 8GB two-node / 10GB single-node. Two-node sizing: PG (512Mi)
+      # + 5 rio pods (~2GB) + k3s control plane (~1.5GB) + containerd
+      # tmpfs (~1.5GB layers, 3G cap) + headroom. Single-node absorbs
+      # what the agent carried (worker pod ~1.5Gi-with-FUSE-cache,
+      # second scheduler replica gone) — +2GB is the conservative bump,
+      # still ~4.5GB net saving vs the 14.5GB two-node total.
+      # Coverage: +2GB for instrumented-image bloat.
       # diskSize 24GB: worker pods request disk_bytes × headroom +
       # LOG_BUDGET 1Gi of ephemeral-storage (jobs.rs::
       # pod_ephemeral_request) on top of the node's own image/layer
@@ -742,7 +831,7 @@ let
       # 4G XFS loopback above. qemu disk image is sparse so the bump
       # is ~free until builds actually write.
       virtualisation = {
-        memorySize = 8192 + k3sCovMemBump;
+        memorySize = (if singleNode then 10240 else 8192) + k3sCovMemBump;
         cores = 8;
         diskSize = 24576;
       };
@@ -765,8 +854,9 @@ let
         serverAddr = "https://[${nodes.k3s-server.networking.primaryIPv6Address}]:6443";
         # Agent loads images into its OWN containerd. Pods scheduled
         # here need local images — this is where the second scheduler
-        # replica (antiAffinity) + maybe workers land.
-        images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
+        # replica (antiAffinity) + maybe workers land. withContainerdSeed:
+        # k3sBase's containerd-seed-mount already registered them.
+        images = if withContainerdSeed then [ ] else airgapImageSet;
         extraFlags = [
           "--node-ip"
           config.networking.primaryIPv6Address
@@ -821,11 +911,11 @@ rec {
     defaultTenant
     ;
 
-  # 7-node v6-only topology. k3s nodes + clients + upstreams are
-  # single-family; only `edge` keeps both (it IS the v4↔v6 boundary).
+  # 7-node v6-only topology (6 with singleNode). k3s nodes + clients +
+  # upstreams are single-family; only `edge` keeps both (it IS the
+  # v4↔v6 boundary).
   nodes = {
     k3s-server = serverNode;
-    k3s-agent = agentNode;
     edge.imports = [ ./edge.nix ];
     # v6 client → gateway NodePort directly (proves r[gw.ingress.v6-direct]).
     client-v6 = common.mkClientNode {
@@ -839,6 +929,7 @@ rec {
     };
     upstream-v6 = common.mkUpstreamNode { addressFamily = "v6"; };
   }
+  // pkgs.lib.optionalAttrs (!singleNode) { k3s-agent = agentNode; }
   // pkgs.lib.optionalAttrs withV4Nodes {
     # v4 client → edge:22 socat → gateway NodePort over v6 (proves
     # r[gw.ingress.v4-via-nat]). gatewayHost="edge" so mkClientNode's
@@ -972,9 +1063,21 @@ rec {
     ${pkgs.lib.optionalString withV4Nodes ''upstream_v4.wait_for_unit("upstream-http.service")''}
     upstream_v6.wait_for_unit("upstream-http.service")
 
-    # ── Both k3s units running ──────────────────────────────────────
-    k3s_server.wait_for_unit("k3s.service")
-    k3s_agent.wait_for_unit("k3s.service")
+    # ── k3s units running ───────────────────────────────────────────
+    # singleNode: k3s_agent doesn't exist as a Machine. Several
+    # scenarios (lifecycle/{cancel-cgroup-kill,build-timeout},
+    # security/privileged-hardening-e2e) reference `k3s_agent` in
+    # `for n in [k3s_agent, k3s_server]` loops or
+    # `… if node == "k3s-agent" else k3s_server` conditionals — both
+    # are harmless when aliased to the server (the loop runs the same
+    # check twice; the conditional never matches because no pod ever
+    # schedules to a node named "k3s-agent"). Scenarios that ASSERT
+    # something agent-specific (le-*, netpol, fetcher-split, recovery)
+    # are kept two-node in default.nix, so they never see the alias.
+    ${pkgs.lib.optionalString singleNode "k3s_agent = k3s_server"}
+    k3s_nodes = [k3s_server${pkgs.lib.optionalString (!singleNode) ", k3s_agent"}]
+    for n in k3s_nodes:
+        n.wait_for_unit("k3s.service")
     k3s_server.wait_for_file("/etc/rancher/k3s/k3s.yaml")
 
     # ── Airgap import complete on BOTH nodes (BEFORE agent-ready) ───
@@ -989,7 +1092,7 @@ rec {
     # timeout=240 post containerd-tmpfs fix (24c8537). Pre-tmpfs, agent
     # rio-controller import hit 170s vs 35-40s typical (5× builder-disk
     # tail). Tmpfs collapses that to CPU-bound decompress.
-    for n in [k3s_server, k3s_agent]:
+    for n in k3s_nodes:
         n.wait_until_succeeds(
             "k3s ctr images ls -q | grep -q pause", timeout=240
         )
@@ -1029,21 +1132,23 @@ rec {
         "k3s kubectl -n kube-system rollout status ds/cilium --timeout=240s",
         timeout=260,
     )
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl get ciliumnode k3s-agent",
-        timeout=120,
-    )
+    ${pkgs.lib.optionalString (!singleNode) ''
+      k3s_server.wait_until_succeeds(
+          "k3s kubectl get ciliumnode k3s-agent",
+          timeout=120,
+      )
 
-    # ── Agent joined ────────────────────────────────────────────────
-    # With server registered, agent-Ready now measures ONLY the
-    # agent's own kubelet start + CNI bring-up (~30-60s under TCG,
-    # not the 100+s of hidden import it previously absorbed).
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl get node k3s-agent "
-        "-o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' "
-        "| grep -qx True",
-        timeout=120,
-    )
+      # ── Agent joined ────────────────────────────────────────────────
+      # With server registered, agent-Ready now measures ONLY the
+      # agent's own kubelet start + CNI bring-up (~30-60s under TCG,
+      # not the 100+s of hidden import it previously absorbed).
+      k3s_server.wait_until_succeeds(
+          "k3s kubectl get node k3s-agent "
+          "-o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' "
+          "| grep -qx True",
+          timeout=120,
+      )
+    ''}
 
     # ── PG Ready (everything else blocks on migrations) ─────────────
     # Bitnami's sts name pattern: <release>-postgresql. Our release
@@ -1254,6 +1359,7 @@ rec {
   sshKeySetup = sshKeySetupFor (if defaultTenant != null then defaultTenant else "");
 
   # For `${common.collectCoverage pyNodeVars}`. Client excluded (no
-  # rio services → empty tarball noise).
-  pyNodeVars = "k3s_server, k3s_agent";
+  # rio services → empty tarball noise). singleNode: agent doesn't
+  # exist (and the alias would just collect the same profraws twice).
+  pyNodeVars = if singleNode then "k3s_server" else "k3s_server, k3s_agent";
 }
