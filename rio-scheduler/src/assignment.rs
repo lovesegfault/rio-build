@@ -92,7 +92,10 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 /// The seeds are therefore derived from the node's parsed derivation —
 /// the ground truth for direct inputs: the derivation's own `.drv`
 /// path ∪ `inputSrcs` ∪ every `inputDrvs` entry's `.drv` path ∪ the
-/// outputs of every `inputDrvs` entry. The `.drv` paths are seeded so
+/// CONSUMED outputs of every `inputDrvs` entry (the
+/// `input_drvs()[child]` set — exactly what the build references;
+/// unconsumed split outputs like `bash-{man,doc,debug}` are not
+/// inputs and frequently lack a narinfo). The `.drv` paths are seeded so
 /// the closure covers what nix-daemon reads through FUSE under W03
 /// closure-scope enforcement (the builder's own seed set already
 /// includes them; the scheduler's must not be narrower). Each
@@ -206,56 +209,76 @@ pub(crate) async fn attested_input_seeds(
     seeds.extend(drv.input_srcs().iter().cloned());
 
     // inputDrvs not in the in-memory DAG, batched into one
-    // `derivations.expected_output_paths` lookup after the loop.
-    let mut dag_missed: Vec<String> = Vec::new();
-    for input_drv_path in drv.input_drvs().keys() {
+    // `derivations.(output_names, expected_output_paths)` lookup after
+    // the loop. Each entry carries its consumed-output-name set so the
+    // PG fallback applies the same name filter as the DAG arm.
+    let mut dag_missed: Vec<(String, &std::collections::BTreeSet<String>)> = Vec::new();
+    for (input_drv_path, consumed) in drv.input_drvs() {
         // Seed the inputDrv's .drv path unconditionally (W03
         // forward-compat: nix-daemon reads it through FUSE).
         seeds.push(input_drv_path.clone());
         let Some(child) = dag.hash_for_path(input_drv_path).and_then(|h| dag.node(h)) else {
-            dag_missed.push(input_drv_path.clone());
+            dag_missed.push((input_drv_path.clone(), consumed));
             continue;
         };
-        // Prefer realized output paths (covers floating-CA, whose
-        // expected paths are "" pre-build); fall back to the
-        // merge-time expected paths (IA / fixed-CA). Either list may
-        // over-include sibling outputs the parent doesn't consume —
-        // harmless for a refscan candidate set (a path only becomes a
-        // recorded reference if its hash actually appears in the
-        // output bytes). What is NOT allowed is an unknown output
-        // path: any empty entry means the seed set might not cover a
-        // consumed output → no attestation.
-        let paths = if child.output_paths.is_empty() {
-            &child.expected_output_paths
-        } else {
-            &child.output_paths
-        };
-        if paths.is_empty() || paths.iter().any(String::is_empty) {
-            seeds_unknown!("child_output_unknown");
+        // Seed only the outputs the parent's `inputDrvs` declares it
+        // consumes. The build references exactly these — unconsumed
+        // sibling outputs (`bash-{man,doc,debug}`, …) are not inputs
+        // and frequently have NO narinfo (never built / never
+        // substituted), so seeding them degrades `compute_input_roots`
+        // to `Ok(None)` for every drv that depends on `bash`/`curl`.
+        // Never-narrower holds: a consumed name with no resolvable
+        // path → no attestation.
+        //
+        // `output_names` ↔ `expected_output_paths` are positional
+        // (both populated from the proto at merge time, and both
+        // persisted by `batch_upsert_derivations`). When the child
+        // completed locally (`output_paths` non-empty) every output
+        // was uploaded and has a narinfo, so the name-keyed expected
+        // path is resolvable there too; the realized list covers
+        // floating-CA (expected `""`) and is seeded wholesale below.
+        match seed_consumed(
+            &mut seeds,
+            &child.output_names,
+            &child.expected_output_paths,
+            consumed,
+        ) {
+            Ok(()) => {}
+            Err(_) if !child.output_paths.is_empty() => {
+                // Floating-CA child: expected path is the placeholder
+                // `""` but the realized paths are known. The realized
+                // list isn't name-keyed, so seed all of it — every
+                // entry has a narinfo (the worker uploaded them), so
+                // this cannot degrade `compute_input_roots`.
+                seeds.extend(child.output_paths.iter().cloned());
+            }
+            Err(_) => seeds_unknown!("child_output_unknown"),
         }
-        seeds.extend(paths.iter().cloned());
     }
 
     if !dag_missed.is_empty() {
-        let by_drv = db.expected_outputs_by_drv_path(&dag_missed).await?;
-        for drv_path in &dag_missed {
+        let missed_paths: Vec<String> = dag_missed.iter().map(|(p, _)| p.clone()).collect();
+        let by_drv = db.expected_outputs_by_drv_path(&missed_paths).await?;
+        for (drv_path, consumed) in &dag_missed {
             // The `derivations` row carries the same
-            // `expected_output_paths` a DAG node would — written from
-            // the gateway-parsed ATerm at merge time and surviving
-            // reap. No name-blind reverse lookup, no count heuristic:
-            // never-narrower by construction. A floating-CA `[""]`
-            // entry is the same unknowable-output gate as the DAG arm
-            // above; an absent row means genuinely never merged.
-            match by_drv.get(drv_path) {
-                Some(paths) if !paths.is_empty() && !paths.iter().any(String::is_empty) => {
-                    seeds.extend(paths.iter().cloned());
-                }
+            // `(output_names, expected_output_paths)` zip a DAG node
+            // would — written from the gateway-parsed ATerm at merge
+            // time and surviving reap. No name-blind reverse lookup,
+            // no count heuristic: never-narrower by construction. A
+            // floating-CA `""` for a consumed name is the same
+            // unknowable-output gate as the DAG arm above; an absent
+            // row means genuinely never merged.
+            match by_drv
+                .get(drv_path)
+                .map(|(names, paths)| seed_consumed(&mut seeds, names, paths, consumed))
+            {
+                Some(Ok(())) => {}
                 found => {
                     tracing::debug!(
                         input_drv = %drv_path,
                         row_present = found.is_some(),
                         "inputDrv not in DAG and derivations-table fallback \
-                         cannot establish its outputs; degrading to unattested"
+                         cannot establish its consumed outputs; degrading to unattested"
                     );
                     metrics::counter!(
                         "rio_scheduler_attested_seeds_pg_fallback_total",
@@ -274,6 +297,29 @@ pub(crate) async fn attested_input_seeds(
     }
 
     Ok(Some(seeds))
+}
+
+/// Push the path of every `consumed` output name onto `seeds`, looking
+/// each up via the positional `names` ↔ `paths` zip. `Err(())` if any
+/// consumed name is undeclared (not in `names`) or its path is the
+/// floating-CA placeholder `""` — the never-narrower gate: a consumed
+/// output the seed set cannot cover means no attestation.
+fn seed_consumed(
+    seeds: &mut Vec<String>,
+    names: &[String],
+    paths: &[String],
+    consumed: &std::collections::BTreeSet<String>,
+) -> Result<(), ()> {
+    for name in consumed {
+        let path = names
+            .iter()
+            .position(|n| n == name)
+            .and_then(|i| paths.get(i))
+            .filter(|p| !p.is_empty())
+            .ok_or(())?;
+        seeds.push(path.clone());
+    }
+    Ok(())
 }
 
 /// Fetch a `.drv`'s ATerm bytes from the store via `GetPath`.
@@ -372,11 +418,17 @@ mod tests {
     }
 
     /// Insert a `derivations` row for `drv_path` with the given
-    /// `expected_output_paths` — the persisted shape a
+    /// `(output_names, expected_output_paths)` — the persisted shape a
     /// substituted-then-reaped (or completed-pre-restart) inputDrv
     /// has: written at merge by `batch_upsert_derivations`, surviving
     /// in PG after the in-memory DAG node is gone.
-    async fn put_derivation_row(pool: &sqlx::PgPool, drv_path: &str, expected_outputs: &[&str]) {
+    async fn put_derivation_row(
+        pool: &sqlx::PgPool,
+        drv_path: &str,
+        output_names: &[&str],
+        expected_outputs: &[&str],
+    ) {
+        let names: Vec<String> = output_names.iter().map(|s| s.to_string()).collect();
         let outs: Vec<String> = expected_outputs.iter().map(|s| s.to_string()).collect();
         // concat! keeps `INSERT INTO` and the table name on separate
         // source lines so the production-write fence
@@ -386,10 +438,11 @@ mod tests {
         sqlx::query(concat!(
             "INSERT INTO ",
             "derivations ",
-            "(drv_hash, drv_path, system, status, expected_output_paths) ",
-            "VALUES ($1, $1, 'x86_64-linux', 'completed', $2)",
+            "(drv_hash, drv_path, system, status, output_names, expected_output_paths) ",
+            "VALUES ($1, $1, 'x86_64-linux', 'completed', $2, $3)",
         ))
         .bind(drv_path)
+        .bind(&names)
         .bind(&outs)
         .execute(pool)
         .await
@@ -552,7 +605,7 @@ mod tests {
         // The inputDrv is NOT a DAG node, but its persisted
         // `derivations` row carries expected_output_paths — the same
         // C1-hardened shape as `_fall_back_to_pg_for_substituted_…`.
-        put_derivation_row(&t.pool, &sub_drv, &[&sub_out]).await;
+        put_derivation_row(&t.pool, &sub_drv, &["out"], &[&sub_out]).await;
 
         // Parent's ATerm lives only in the store (recovered node:
         // `drv_content` empty in-memory). Same ATerm
@@ -647,7 +700,7 @@ mod tests {
 
         // The inputDrv is NOT a DAG node, but its persisted
         // `derivations` row carries expected_output_paths.
-        put_derivation_row(&t.pool, &sub_drv, &[&sub_out]).await;
+        put_derivation_row(&t.pool, &sub_drv, &["out"], &[&sub_out]).await;
         dag.insert_recovered_node(make_attest_parent(&sub_drv, &src));
 
         let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
@@ -667,6 +720,92 @@ mod tests {
         assert!(
             got.contains(&sub_drv),
             "inputDrv .drv path must be seeded (W03): {got:?}"
+        );
+    }
+
+    /// Round-3 dag-actor stall: an inputDrv with split outputs
+    /// (`[out, man, doc, debug]`) where the parent consumes only
+    /// `["out"]` must seed only the `out` path. Seeding all four
+    /// `expected_output_paths` is over-broad for the refscan candidate
+    /// set (harmless there) but fatal for `compute_input_roots`: the
+    /// unconsumed split outputs (`-man`, `-doc`, `-debug`) are never
+    /// built or substituted (nothing wants them), so they have no
+    /// narinfo row → the closure walk degrades to unattested for every
+    /// derivation that depends on `bash`/`curl`/etc.
+    ///
+    /// The consumed-output set is exactly `drv.input_drvs()[child]` —
+    /// the build only references what `inputDrvs` declares — so
+    /// seeding consumed-only is never-narrower by construction.
+    // r[verify sched.dispatch.input-roots+3]
+    // r[verify sched.dispatch.never-narrower]
+    #[tokio::test]
+    async fn attested_seeds_only_consumed_outputs() {
+        let (_t, db) = test_db().await;
+        let mut dag = DerivationDag::new();
+        let child_drv = rio_test_support::fixtures::test_drv_path("attest-split");
+        let p_out = rio_test_support::fixtures::test_store_path("attest-split-out");
+        let p_man = rio_test_support::fixtures::test_store_path("attest-split-man");
+        let p_doc = rio_test_support::fixtures::test_store_path("attest-split-doc");
+        let p_debug = rio_test_support::fixtures::test_store_path("attest-split-debug");
+        let src = rio_test_support::fixtures::test_store_path("attest-src");
+
+        // Child declares 4 outputs; expected_output_paths is positional
+        // with output_names (both come from the proto at merge time).
+        let mut child = DerivationState::try_from_node(
+            &make_derivation_node("attest-split", "x86_64-linux").into(),
+        )
+        .unwrap();
+        child.output_names = vec!["out".into(), "man".into(), "doc".into(), "debug".into()];
+        child.expected_output_paths =
+            vec![p_out.clone(), p_man.clone(), p_doc.clone(), p_debug.clone()];
+        dag.insert_recovered_node(child);
+
+        // Parent's inputDrvs declares it consumes ["out"] only
+        // (make_attest_parent builds inputDrvs=[(child,["out"])]).
+        dag.insert_recovered_node(make_attest_parent(&child_drv, &src));
+        dag.insert_recovered_edge("attest-parent".into(), "attest-split".into());
+
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+            .await
+            .unwrap()
+            .expect("split-output inputDrv with the consumed output known is attestable");
+        assert!(
+            got.contains(&p_out),
+            "the consumed output `out` must be seeded: {got:?}"
+        );
+        assert!(
+            !got.contains(&p_man) && !got.contains(&p_doc) && !got.contains(&p_debug),
+            "unconsumed split outputs must NOT be seeded — they have no \
+             narinfo and would degrade compute_input_roots to None: {got:?}"
+        );
+    }
+
+    /// Same as [`attested_seeds_only_consumed_outputs`] but through the
+    /// PG fallback (inputDrv not in the in-memory DAG). The persisted
+    /// `derivations` row carries `(output_names, expected_output_paths)`
+    /// and the consumed-name filter applies there too.
+    // r[verify sched.dispatch.input-roots+3]
+    #[tokio::test]
+    async fn attested_seeds_only_consumed_outputs_pg_fallback() {
+        let (t, db) = test_db().await;
+        let mut dag = DerivationDag::new();
+        let child_drv = rio_test_support::fixtures::test_drv_path("attest-split-pg");
+        let p_out = rio_test_support::fixtures::test_store_path("attest-split-pg-out");
+        let p_man = rio_test_support::fixtures::test_store_path("attest-split-pg-man");
+        let src = rio_test_support::fixtures::test_store_path("attest-src");
+
+        // No DAG node — only the persisted row.
+        put_derivation_row(&t.pool, &child_drv, &["out", "man"], &[&p_out, &p_man]).await;
+        dag.insert_recovered_node(make_attest_parent(&child_drv, &src));
+
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+            .await
+            .unwrap()
+            .expect("PG fallback resolves the consumed output");
+        assert!(got.contains(&p_out), "consumed `out` seeded: {got:?}");
+        assert!(
+            !got.contains(&p_man),
+            "unconsumed `man` must NOT be seeded via PG fallback: {got:?}"
         );
     }
 
@@ -696,8 +835,14 @@ mod tests {
         put_narinfo_with_deriver(&t.pool, &dev, Some(&multi_drv)).await;
         put_narinfo_with_deriver(&t.pool, &man, Some(&multi_drv)).await;
         put_narinfo_with_deriver(&t.pool, &out, None).await;
-        // The persisted authority: full expected_output_paths.
-        put_derivation_row(&t.pool, &multi_drv, &[&out, &dev, &man]).await;
+        // The persisted authority: full (output_names, expected_output_paths).
+        put_derivation_row(
+            &t.pool,
+            &multi_drv,
+            &["out", "dev", "man"],
+            &[&out, &dev, &man],
+        )
+        .await;
 
         // Parent declares it consumes ["out"] only (make_attest_parent
         // builds inputDrvs=[(child,["out"])]).
@@ -744,7 +889,7 @@ mod tests {
         let mut dag = DerivationDag::new();
         let ca_drv = rio_test_support::fixtures::test_drv_path("attest-floating-ca");
         let src = rio_test_support::fixtures::test_store_path("attest-src");
-        put_derivation_row(&t.pool, &ca_drv, &[""]).await;
+        put_derivation_row(&t.pool, &ca_drv, &["out"], &[""]).await;
         dag.insert_recovered_node(make_attest_parent(&ca_drv, &src));
 
         assert!(

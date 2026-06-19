@@ -114,8 +114,8 @@ impl SchedulerDb {
         ))
     }
 
-    /// Resolve `expected_output_paths` for a batch of `.drv` paths via
-    /// the persisted `derivations` table. Used by
+    /// Resolve `(output_names, expected_output_paths)` for a batch of
+    /// `.drv` paths via the persisted `derivations` table. Used by
     /// [`crate::assignment::attested_input_seeds`] when an `inputDrvs`
     /// entry is not an in-memory DAG node (substituted-then-reaped, or
     /// completed pre-restart so recovery skipped it).
@@ -123,27 +123,34 @@ impl SchedulerDb {
     /// The `derivations` row exists for every drv that was ever merged
     /// (gateway sends the full transitive closure;
     /// `batch_upsert_derivations` persists it; reap removes from the
-    /// in-memory DAG only) and carries the same `expected_output_paths`
-    /// the DAG node would have — so this is the same authority a fresh
-    /// merge would have used, with never-narrower preserved by
-    /// construction (no name-blind reverse lookup, no count heuristic).
+    /// in-memory DAG only) and carries the same
+    /// `(output_names, expected_output_paths)` zip the DAG node would
+    /// have — so this is the same authority a fresh merge would have
+    /// used, with never-narrower preserved by construction (no
+    /// name-blind reverse lookup, no count heuristic). The two arrays
+    /// are positional (`output_names[i]` ↔ `expected_output_paths[i]`)
+    /// per `batch_upsert_derivations`.
     ///
-    /// Returns `drv_path → expected_output_paths`; a drv_path with no
-    /// row (genuinely never merged) is absent from the map.
+    /// Returns `drv_path → (output_names, expected_output_paths)`; a
+    /// drv_path with no row (genuinely never merged) is absent from the
+    /// map.
     pub(crate) async fn expected_outputs_by_drv_path(
         &self,
         drv_paths: &[String],
-    ) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
+    ) -> Result<HashMap<String, (Vec<String>, Vec<String>)>, sqlx::Error> {
         if drv_paths.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
-            "SELECT drv_path, expected_output_paths \
+        let rows: Vec<(String, Vec<String>, Vec<String>)> = sqlx::query_as(
+            "SELECT drv_path, output_names, expected_output_paths \
                FROM derivations WHERE drv_path = ANY($1::text[])",
         )
         .bind(drv_paths)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().collect())
+        Ok(rows
+            .into_iter()
+            .map(|(p, names, paths)| (p, (names, paths)))
+            .collect())
     }
 }
