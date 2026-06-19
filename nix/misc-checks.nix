@@ -762,6 +762,14 @@ in
     ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux" { }).drvPath}
     ${builtins.unsafeDiscardStringContext (nodeAmi "aarch64-linux" { }).drvPath}
     ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux" { efi = false; }).drvPath}
+    ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux" { seedExecutor = false; }).drvPath}
+    ${builtins.unsafeDiscardStringContext (nodeAmi "aarch64-linux" { seedExecutor = false; }).drvPath}
+    ${builtins.unsafeDiscardStringContext
+      (nodeAmi "x86_64-linux" {
+        efi = false;
+        seedExecutor = false;
+      }).drvPath
+    }
     EOF
   '';
 

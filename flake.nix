@@ -1043,6 +1043,9 @@
                 # for `.#packages.<target>-linux.ami` explicitly.
                 # ──────────────────────────────────────────────────────────
                 ami = nodeAmi system { };
+                # #58: seedless dev variant — drvPath stable across rust
+                # changes, so `up --wipe` reuses the registered AMI.
+                ami-dev = nodeAmi system { seedExecutor = false; };
               }
               // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
                 # I-205: x86 .metal SKUs are legacy-bios ONLY (zero support
@@ -1050,6 +1053,10 @@
                 # is UEFI, so this attr is meaningless there — see nodeAmi
                 # comment for the EC2NodeClass split.
                 ami-bios = nodeAmi system { efi = false; };
+                ami-bios-dev = nodeAmi system {
+                  efi = false;
+                  seedExecutor = false;
+                };
               }
               // {
                 # CRD YAML for the crds-drift check. runCommand invokes

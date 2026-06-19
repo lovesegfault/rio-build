@@ -23,6 +23,13 @@ nodeSystem:
   # rio-metal) while rio-default keeps the UEFI/UKI image for
   # virtualized + arm64 .metal.
   efi ? true,
+  # #58: when false, omit the executorSeed OCI archive from the
+  # baked-in seedImages. The seedless drvPath only moves when
+  # nixos-node config / nixpkgs does (NOT every rust commit), so
+  # the content-addressed rio.build/ami tag stays stable and
+  # `up --ami` is a find_existing hit. Dev default; the prod image
+  # (seedExecutor=true) keeps r[infra.node.prebake-layer-warm].
+  seedExecutor ? true,
 }:
 (nixpkgs.lib.nixosSystem {
   system = nodeSystem;
@@ -34,7 +41,7 @@ nodeSystem:
     # — flake-parts resolves the cross-arch attr without
     # recursion (nodeSystem ≠ eval system is the common
     # case: x86 host builds the aarch64 AMI).
-    rioSeedImages = [
+    rioSeedImages = nixpkgs.lib.optionals seedExecutor [
       self.packages.${nodeSystem}.dockerImages.executorSeed
     ];
   };
