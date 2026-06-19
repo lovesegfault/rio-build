@@ -68,6 +68,14 @@ impl RecoveredInstant {
         self.recovered_at.elapsed() + self.age_at_recovery
     }
 
+    /// [`Self::elapsed`] against an externally-captured `now` instead
+    /// of an inline `Instant::now()` read. Callers that already hold a
+    /// tick-anchored `now` use this so a predicate evaluated twice in
+    /// one pass (collect, then recount) is pure on the same anchor.
+    pub fn age_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.recovered_at) + self.age_at_recovery
+    }
+
     /// Test/debug seeding: a moment `secs_ago` seconds in the past,
     /// regardless of process uptime (tokio paused time cannot mock
     /// `Instant`; this is the `DebugBackdate*` mechanism).

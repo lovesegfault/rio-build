@@ -709,7 +709,7 @@ pub(crate) struct JobViewEntry {
     defer_until: Option<std::time::Instant>,
     /// Failover-exact mirror of `materialization_jobs.created_at`
     /// (migration 078): the phase-15 unclaimed age-out arm's
-    /// `created_at.elapsed() > age_out_after` predicate reads this
+    /// `created_at.age_at(now) > age_out_after` predicate reads this
     /// IN-MEMORY. Both arms' per-entry PG await is the
     /// `classify_durable_evidence` read (one shared
     /// [`MAX_AGEOUT_PER_TICK`] budget so the 7725-row
@@ -2502,7 +2502,7 @@ fn classify_stalled(
     }
     if e.parked_until.is_some_and(|until| until > now) {
         Some(StalledClass::Parked)
-    } else if e.created_at.elapsed() > age_out_after {
+    } else if e.created_at.age_at(now) > age_out_after {
         Some(StalledClass::AgedOut)
     } else {
         None
@@ -4485,13 +4485,13 @@ impl DagActor {
                 "phase-15 stalled backlog over MAX_AGEOUT_PER_TICK; the \
                  over-quota tail stays in the view (re-evaluated next tick)"
             );
-            if parked.len() >= aged_out.len() {
-                parked.truncate(MAX_AGEOUT_PER_TICK.saturating_sub(aged_out.len()));
-                aged_out.truncate(MAX_AGEOUT_PER_TICK);
+            let (longer, shorter) = if parked.len() >= aged_out.len() {
+                (&mut parked, &mut aged_out)
             } else {
-                aged_out.truncate(MAX_AGEOUT_PER_TICK.saturating_sub(parked.len()));
-                parked.truncate(MAX_AGEOUT_PER_TICK);
-            }
+                (&mut aged_out, &mut parked)
+            };
+            longer.truncate(MAX_AGEOUT_PER_TICK.saturating_sub(shorter.len()));
+            shorter.truncate(MAX_AGEOUT_PER_TICK);
         }
         for (drv_hash, job_id, origin) in parked {
             // Classify over the DURABLE relation (T-D2.2/PD-D4 — the

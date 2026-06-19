@@ -9945,17 +9945,25 @@ async fn aged_out_survives_when_evidence_holed() -> TestResult {
 
 /// sh-044 r3 — *phase-15's per-tick PG-await budget is shared and
 /// bounded (R17: [`MAX_AGEOUT_PER_TICK`], violable + testable)*: the
-/// `moot_sweep_is_bounded_per_tick` pattern. Seeding CAP+1 aged-out
-/// entries resolves at most CAP on the first tick (the truncated
-/// remainder keeps its view entry — `classify_stalled` matches again)
-/// and the second tick drains it (level-triggered). A refactor that
-/// drops the truncate, flips `>` to `>=`, or evicts over-quota entries
-/// from the view passes every other grid cell (all single-entry).
+/// `moot_sweep_is_bounded_per_tick` pattern, MIXED-CLASS. Seeding
+/// `CAP/2+1` parked + `CAP/2+1` aged-out entries (`n = CAP+2`, BOTH
+/// arms over their per-arm half-share) resolves at most CAP on the
+/// first tick — the over-quota tail keeps its view entry
+/// (`classify_stalled` matches again) — and the second tick drains
+/// it (level-triggered). The mixed seeding is the load-bearing pin:
+/// under a per-arm cap (each arm independently `truncate(CAP)`),
+/// `129+129` would all process on tick 1 and the `≤ CAP` assertion
+/// fails; the prior r4 aged-out-only seeding (`parked=0`) could not
+/// witness SHARED because both policies coincide when one arm is
+/// empty. A refactor that drops the truncate, reverts to per-arm
+/// caps, or evicts over-quota entries from the view passes every
+/// other grid cell (all single-entry).
 // r[verify sched.materialize.unclaimed-age-out]
 #[tokio::test]
 async fn phase15_per_tick_is_bounded() -> TestResult {
     use crate::actor::materialize::MAX_AGEOUT_PER_TICK;
-    let n = MAX_AGEOUT_PER_TICK + 1;
+    let half = MAX_AGEOUT_PER_TICK / 2 + 1;
+    let n = 2 * half;
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_cfg(
@@ -9997,11 +10005,19 @@ async fn phase15_per_tick_is_bounded() -> TestResult {
     )
     .await?;
     tx.commit().await?;
-    for ((hash, jc), drv) in hashes.iter().zip(&created).zip(&drv_ids) {
+    let park_until = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    for (i, ((hash, jc), drv)) in hashes.iter().zip(&created).zip(&drv_ids).enumerate() {
         actor.test_inject_ready(hash, None, "x86_64-linux", false);
         actor.dag.node_mut(hash).expect("just injected").db_id = Some(*drv);
         let mut entry = crate::actor::materialize::JobViewEntry::test_unclaimed(jc.job_id);
-        entry.test_set_created_at(crate::state::RecoveredInstant::backdated(240));
+        if i < half {
+            // Parked: `parked_until > now` short-circuits
+            // `classify_stalled` to Parked regardless of created_at.
+            entry.test_set_parked_until(Some(park_until));
+        } else {
+            // AgedOut: 240s ago > the 3×60s threshold.
+            entry.test_set_created_at(crate::state::RecoveredInstant::backdated(240));
+        }
         actor
             .materialization_jobs
             .insert(DrvHash::from(hash.as_str()), entry);
@@ -10016,18 +10032,20 @@ async fn phase15_per_tick_is_bounded() -> TestResult {
     .await?;
     assert!(
         after_first as usize <= MAX_AGEOUT_PER_TICK,
-        "first tick resolves at most the cap (one shared per-tick \
-         classify_durable_evidence budget across both arms): {after_first}"
+        "first tick resolves at most the cap (ONE shared per-tick \
+         classify_durable_evidence budget across both arms — a per-arm \
+         cap would resolve {n} > CAP here): {after_first}"
     );
+    let survivors = actor.materialization_jobs.iter().count();
     assert_eq!(
-        actor.materialization_jobs.iter().count(),
+        survivors,
         n - after_first as usize,
         "the over-quota tail keeps its view entry for the next tick \
          (truncate, NOT evict — classify_stalled matches again)"
     );
     assert!(
-        actor.materialization_jobs.iter().count() >= 1,
-        "CAP+1 seeded → at least one entry survives the first tick"
+        survivors >= n - MAX_AGEOUT_PER_TICK,
+        "CAP+2 seeded across both arms → at least 2 survive the first tick"
     );
     actor.tick_reevaluate_materialization_jobs(&authority).await;
     let after_second: i64 = sqlx::query_scalar(
