@@ -149,6 +149,17 @@ in
   # + KWOK Stage rules here so the §13b nodeclaim_pool reconciler can
   # be exercised without EC2.
   extraManifests ? { },
+  # issue #57 1b: drop k3s-agent and run everything on the server. Nine
+  # of fourteen vm-*-k3s tests don't exercise multi-node behaviour
+  # (podAntiAffinity spread, leader fail-over, agent-netpol egress) but
+  # paid the agent's ~6 GB + ~90-120s of bring-up anyway. With
+  # singleNode=true: scheduler.replicas=1 (the antiAffinity has nowhere
+  # to spread), the server picks up the rio.build/vmtest=true node-label
+  # so worker Jobs schedule there, server RAM bumps to 10 GB to absorb
+  # what the agent was carrying, and waitReady skips every k3s-agent
+  # gate. The two-node path is unchanged for le-*, lifecycle-recovery,
+  # netpol, fetcher-split, prod-parity.
+  singleNode ? false,
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -195,6 +206,13 @@ let
     # "false" becomes truthy (non-empty string). jwt.enabled likewise.
     extraSetTyped = {
       "coverage.enabled" = coverage;
+    }
+    // pkgs.lib.optionalAttrs singleNode {
+      # No second node for podAntiAffinity to spread to. The standby
+      # replica added nothing the single-node tests assert on, and the
+      # Trailers-Only LB flake (ci-failure-patterns.md "Envoy/nginx LB
+      # to standby replica") is structurally impossible at replicas=1.
+      "scheduler.replicas" = 1;
     }
     // pkgs.lib.optionalAttrs jwtEnabled {
       "jwt.enabled" = true;
@@ -654,12 +672,25 @@ let
           # (IO-starved by the airgap image import). We don't use
           # etcd snapshots in an ephemeral VM test.
           "--etcd-disable-snapshots"
+        ]
+        # singleNode: server is the ONLY node, so it must carry the
+        # vmtest hwClass label (vmtest-full.yaml's [sla.hw_classes.vmtest]
+        # selects on it; without it worker Jobs go Pending forever).
+        # Two-node keeps the label agent-only so the antiAffinity-spread
+        # scheduler replica and worker Jobs land on different nodes.
+        ++ pkgs.lib.optionals singleNode [
+          "--node-label"
+          "rio.build/vmtest=true"
         ];
       };
 
-      # 8GB (was 6GB): PG (512Mi) + 5 rio pods (~2GB) + k3s control
-      # plane (~1.5GB) + containerd tmpfs (~1.5GB layers, 3G cap) +
-      # headroom. Coverage: +2GB for instrumented-image bloat.
+      # 8GB two-node / 10GB single-node. Two-node sizing: PG (512Mi)
+      # + 5 rio pods (~2GB) + k3s control plane (~1.5GB) + containerd
+      # tmpfs (~1.5GB layers, 3G cap) + headroom. Single-node absorbs
+      # what the agent carried (worker pod ~1.5Gi-with-FUSE-cache,
+      # second scheduler replica gone) — +2GB is the conservative bump,
+      # still ~4.5GB net saving vs the 14.5GB two-node total.
+      # Coverage: +2GB for instrumented-image bloat.
       # diskSize 24GB: controller adds PoolSpec.fuseCacheBytes (4Gi
       # via vmtest-full.yaml; CRD default 8Gi for non-helm Pools;
       # helm prod 50Gi) + LOG_BUDGET 1Gi on top of
@@ -667,7 +698,7 @@ let
       # worker pod requests ≥7GiB ephemeral-storage. qemu disk image
       # is sparse so the bump is ~free until builds actually write.
       virtualisation = {
-        memorySize = 8192 + k3sCovMemBump;
+        memorySize = (if singleNode then 10240 else 8192) + k3sCovMemBump;
         cores = 8;
         diskSize = 24576;
       };
@@ -740,11 +771,11 @@ rec {
     hmacKeys
     ;
 
-  # 7-node v6-only topology. k3s nodes + clients + upstreams are
-  # single-family; only `edge` keeps both (it IS the v4↔v6 boundary).
+  # 7-node v6-only topology (6 with singleNode). k3s nodes + clients +
+  # upstreams are single-family; only `edge` keeps both (it IS the
+  # v4↔v6 boundary).
   nodes = {
     k3s-server = serverNode;
-    k3s-agent = agentNode;
     edge.imports = [ ./edge.nix ];
     # v6 client → gateway NodePort directly (proves r[gw.ingress.v6-direct]).
     client-v6 = common.mkClientNode {
@@ -758,6 +789,7 @@ rec {
     };
     upstream-v6 = common.mkUpstreamNode { addressFamily = "v6"; };
   }
+  // pkgs.lib.optionalAttrs (!singleNode) { k3s-agent = agentNode; }
   // pkgs.lib.optionalAttrs withV4Nodes {
     # v4 client → edge:22 socat → gateway NodePort over v6 (proves
     # r[gw.ingress.v4-via-nat]). gatewayHost="edge" so mkClientNode's
@@ -891,9 +923,21 @@ rec {
     ${pkgs.lib.optionalString withV4Nodes ''upstream_v4.wait_for_unit("upstream-http.service")''}
     upstream_v6.wait_for_unit("upstream-http.service")
 
-    # ── Both k3s units running ──────────────────────────────────────
-    k3s_server.wait_for_unit("k3s.service")
-    k3s_agent.wait_for_unit("k3s.service")
+    # ── k3s units running ───────────────────────────────────────────
+    # singleNode: k3s_agent doesn't exist as a Machine. Several
+    # scenarios (lifecycle/{cancel-cgroup-kill,build-timeout},
+    # security/privileged-hardening-e2e) reference `k3s_agent` in
+    # `for n in [k3s_agent, k3s_server]` loops or
+    # `… if node == "k3s-agent" else k3s_server` conditionals — both
+    # are harmless when aliased to the server (the loop runs the same
+    # check twice; the conditional never matches because no pod ever
+    # schedules to a node named "k3s-agent"). Scenarios that ASSERT
+    # something agent-specific (le-*, netpol, fetcher-split, recovery)
+    # are kept two-node in default.nix, so they never see the alias.
+    ${pkgs.lib.optionalString singleNode "k3s_agent = k3s_server"}
+    k3s_nodes = [k3s_server${pkgs.lib.optionalString (!singleNode) ", k3s_agent"}]
+    for n in k3s_nodes:
+        n.wait_for_unit("k3s.service")
     k3s_server.wait_for_file("/etc/rancher/k3s/k3s.yaml")
 
     # ── Airgap import complete on BOTH nodes (BEFORE agent-ready) ───
@@ -908,7 +952,7 @@ rec {
     # timeout=240 post containerd-tmpfs fix (24c8537). Pre-tmpfs, agent
     # rio-controller import hit 170s vs 35-40s typical (5× builder-disk
     # tail). Tmpfs collapses that to CPU-bound decompress.
-    for n in [k3s_server, k3s_agent]:
+    for n in k3s_nodes:
         n.wait_until_succeeds(
             "k3s ctr images ls -q | grep -q pause", timeout=240
         )
@@ -948,21 +992,23 @@ rec {
         "k3s kubectl -n kube-system rollout status ds/cilium --timeout=240s",
         timeout=260,
     )
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl get ciliumnode k3s-agent",
-        timeout=120,
-    )
+    ${pkgs.lib.optionalString (!singleNode) ''
+      k3s_server.wait_until_succeeds(
+          "k3s kubectl get ciliumnode k3s-agent",
+          timeout=120,
+      )
 
-    # ── Agent joined ────────────────────────────────────────────────
-    # With server registered, agent-Ready now measures ONLY the
-    # agent's own kubelet start + CNI bring-up (~30-60s under TCG,
-    # not the 100+s of hidden import it previously absorbed).
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl get node k3s-agent "
-        "-o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' "
-        "| grep -qx True",
-        timeout=120,
-    )
+      # ── Agent joined ────────────────────────────────────────────────
+      # With server registered, agent-Ready now measures ONLY the
+      # agent's own kubelet start + CNI bring-up (~30-60s under TCG,
+      # not the 100+s of hidden import it previously absorbed).
+      k3s_server.wait_until_succeeds(
+          "k3s kubectl get node k3s-agent "
+          "-o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' "
+          "| grep -qx True",
+          timeout=120,
+      )
+    ''}
 
     # ── PG Ready (everything else blocks on migrations) ─────────────
     # Bitnami's sts name pattern: <release>-postgresql. Our release
@@ -1136,6 +1182,7 @@ rec {
   sshKeySetup = sshKeySetupFor "";
 
   # For `${common.collectCoverage pyNodeVars}`. Client excluded (no
-  # rio services → empty tarball noise).
-  pyNodeVars = "k3s_server, k3s_agent";
+  # rio services → empty tarball noise). singleNode: agent doesn't
+  # exist (and the alias would just collect the same profraws twice).
+  pyNodeVars = if singleNode then "k3s_server" else "k3s_server, k3s_agent";
 }

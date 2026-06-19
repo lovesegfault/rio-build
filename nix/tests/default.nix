@@ -226,6 +226,16 @@ let
     inherit pkgs common;
     fixture = k3sFull { jwtEnabled = true; };
   };
+  # issue #57 1b: single-node variant for the lifecycle splits that
+  # don't assert multi-node behaviour. recovery stays on lifecycleMod
+  # (two-node) — its store-rollout subtest churns pods across nodes.
+  lifecycleModSingle = lifecycle {
+    inherit pkgs common;
+    fixture = k3sFull {
+      jwtEnabled = true;
+      singleNode = true;
+    };
+  };
 
   leMod = leader-election {
     inherit pkgs common;
@@ -614,6 +624,7 @@ in
   #   exists + subtree_control writable → build completes over FUSE).
   vm-security-nonpriv-k3s = security.privileged-hardening-e2e {
     fixture = k3sFull {
+      singleNode = true;
       # Layer vmtest-full-nonpriv.yaml for workerPool.privileged:false.
       # /dev/fuse comes from k3s containerd base_runtime_spec (the
       # containerdConfigTemplate in fixtures/k3s-full.nix). No extra
@@ -673,7 +684,7 @@ in
   #
   # P0294: ctrlrestart + reconnect splits removed (Build CRD rip).
   # build-crd-flow + build-crd-errors dropped from core.
-  vm-lifecycle-core-k3s = lifecycleMod.mkTest {
+  vm-lifecycle-core-k3s = lifecycleModSingle.mkTest {
     name = "core";
     subtests = [
       # r[verify sec.jwt.pubkey-mount+2]
@@ -707,7 +718,7 @@ in
   # the tail of the pipeline's critical path. Both fragments build
   # their own paths (no shared state with core's remaining subtests),
   # so the split costs one more k3s boot and nothing else.
-  vm-lifecycle-gc-k3s = lifecycleMod.mkTest {
+  vm-lifecycle-gc-k3s = lifecycleModSingle.mkTest {
     name = "gc";
     subtests = [
       "gc-dry-run"
@@ -735,7 +746,7 @@ in
     ];
   };
 
-  vm-lifecycle-autoscale-k3s = lifecycleMod.mkTest {
+  vm-lifecycle-autoscale-k3s = lifecycleModSingle.mkTest {
     name = "autoscale";
     subtests = [
       # r[verify ctrl.pool.ephemeral+1]
@@ -797,6 +808,7 @@ in
   vm-sla-sizing-kwok = forecast-provisioning {
     inherit pkgs common;
     fixture = k3sFull {
+      singleNode = true;
       extraImages = kwok.airgapImages;
       extraManifests = kwok.manifests;
       extraValuesTyped = {
@@ -876,6 +888,7 @@ in
   vm-componentscaler-k3s = componentscaler {
     inherit pkgs common;
     fixture = k3sFull {
+      singleNode = true;
       extraValuesTyped = {
         "componentScaler.store.enabled" = true;
         "componentScaler.store.min" = 1;
@@ -912,6 +925,7 @@ in
   vm-substitute-scale-k3s = substitute-scale {
     inherit pkgs common;
     fixture = k3sFull {
+      singleNode = true;
       jwtEnabled = true;
       extraValuesTyped = {
         "componentScaler.store.enabled" = true;
@@ -971,7 +985,7 @@ in
   # AdminService. ~5min (mostly k3s bring-up).
   vm-cli-k3s = cli {
     inherit pkgs common;
-    fixture = k3sFull { };
+    fixture = k3sFull { singleNode = true; };
   };
 
   # r[verify dash.envoy.grpc-web-translate+3]
@@ -1002,7 +1016,10 @@ in
   #   subtests only; the nginx pod is absent so its curls are skipped.
   vm-dashboard-k3s = dashboard-gateway {
     inherit pkgs common;
-    fixture = k3sFull { gatewayEnabled = true; };
+    fixture = k3sFull {
+      singleNode = true;
+      gatewayEnabled = true;
+    };
     withDashboardCurls = dockerImages ? dashboard;
   };
 
@@ -1041,6 +1058,9 @@ in
   # r[verify sec.transport.cilium-wireguard]
   # r[verify gw.ingress.v6-direct]
   # r[verify gw.ingress.v4-via-nat]
+  # NOT singleNode: ingress-v4v6 imports cilium-encrypt.nix whose
+  # `wg show cilium_wg0` assertion needs inter-node WireGuard — with
+  # one k3s node there is no peer and the tunnel never comes up.
   vm-ingress-v4v6-k3s = ingress-v4v6 {
     inherit pkgs common;
     fixture = k3sFull { withV4Nodes = true; };
