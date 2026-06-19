@@ -95,17 +95,20 @@ pub(crate) use db_str_enum;
 /// which arm is conservative for its read (e.g. `JobOrigin::
 /// CacheOpportunity` for the age-out label, `PriorityClass::default()`
 /// for the recovery rebuild). `T: Debug` so the operator sees which
-/// arm the mirror is operating on; per-call row identity (e.g.
-/// `build_id`, `drv_hash`) goes into a caller-side `#[instrument]`
-/// span — the span fields are the row-locality context.
-pub(crate) fn parse_or_error_default<T>(col: &'static str, raw: &str, default: T) -> T
+/// arm the mirror is operating on; `row` carries per-call row identity
+/// (`build_id`, `drv_hash` — whatever locates the offending row from
+/// the log alone) and is formatted on the error arm only, so the
+/// hot-path recovered-row loop pays nothing for it.
+pub(crate) fn parse_or_error_default<T, R>(col: &'static str, raw: &str, default: T, row: R) -> T
 where
     T: std::str::FromStr + std::fmt::Debug,
+    R: std::fmt::Display,
 {
     raw.parse().unwrap_or_else(|_| {
         tracing::error!(
             column = col,
             raw,
+            row = %row,
             default = ?default,
             "db_str_enum_drift: TEXT column not in the known alphabet \
              (CHECK constraint drift); defaulting the in-memory mirror"

@@ -710,11 +710,11 @@ pub(crate) struct JobViewEntry {
     /// Failover-exact mirror of `materialization_jobs.created_at`
     /// (migration 078): the phase-15 unclaimed age-out arm's
     /// `created_at.elapsed() > age_out_after` predicate reads this
-    /// IN-MEMORY. The aged-out arm's per-entry PG await is the
-    /// `classify_durable_evidence` read (capped at
-    /// [`MAX_AGEOUT_PER_TICK`] so the 7725-row first-post-deploy
-    /// backlog drains over `7725/256 ≈ 31` ticks instead of one
-    /// serial-PG burst).
+    /// IN-MEMORY. Both arms' per-entry PG await is the
+    /// `classify_durable_evidence` read (one shared
+    /// [`MAX_AGEOUT_PER_TICK`] budget so the 7725-row
+    /// first-post-deploy backlog drains over `7725/256 ≈ 31` ticks
+    /// instead of one serial-PG burst).
     created_at: crate::state::RecoveredInstant,
     /// Failover-exact, PG-authoritative mirror of
     /// `materialization_jobs.origin` (migration 078): both phase-15
@@ -2007,6 +2007,7 @@ impl DagActor {
                 "materialization_jobs.origin",
                 &row.origin,
                 crate::state::JobOrigin::CacheOpportunity,
+                &row.drv_hash,
             ),
         }
     }
@@ -2092,6 +2093,14 @@ impl DagActor {
         // prevent). When `upgraded=true` PG wrote `origin` exactly as
         // requested, so the unguarded `= origin` is the authoritative
         // value.
+        debug_assert!(
+            !upgraded || matches!(origin, crate::state::JobOrigin::Pruned),
+            "feed_job_view_entry: upgraded ⟹ origin==Pruned \
+             (db/materialization.rs JobCreateResult.upgraded = \
+             matches!(r.origin, Pruned) && upgraded.contains(&job_id)) — \
+             a caller passing upgraded=true with a non-Pruned origin would \
+             write the REQUESTED value into the PG-authoritative mirror"
+        );
         if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
             if upgraded {
                 entry.origin = origin;
@@ -2441,31 +2450,77 @@ pub(super) fn refusal_from_wire(refusal: i32) -> Refusal {
 /// edit point — a refactor that drops the `ChildlessLeaf` origin
 /// conjunct cannot drift between the parked-conversion and age-out
 /// settlements.
+///
+/// `origin` is the in-memory PG-authoritative mirror, always known —
+/// the `Option` arm (sh-044 r2's "PG read returned `None` → stay
+/// parked" conservative fallback) died with the per-entry PG origin
+/// read; the two arms read `entry.origin` directly.
 fn from_source_viable(
     evidence: rio_evidence_kernel::ClosureEvidence,
-    origin: Option<crate::state::JobOrigin>,
+    origin: crate::state::JobOrigin,
 ) -> bool {
     use rio_evidence_kernel::ClosureEvidence;
     match evidence {
         ClosureEvidence::Vouched | ClosureEvidence::Pending => true,
-        ClosureEvidence::ChildlessLeaf => {
-            origin.is_some_and(|o| o != crate::state::JobOrigin::Pruned)
-        }
+        ClosureEvidence::ChildlessLeaf => origin != crate::state::JobOrigin::Pruned,
         ClosureEvidence::Holed => false,
     }
 }
 
-/// Per-tick quota on the aged-out arm's serial
-/// `classify_durable_evidence` PG awaits (sh-044 r2): the aged-out
-/// arm's per-entry evidence read is unbounded over the
-/// first-post-deploy/post-outage backlog (the project's own comments
-/// cite "hundreds in one pass" and a 7725-row backlog); at ~3 ms RTT
-/// a 3500+ backlog exceeds 11 s inside `handle_tick` phase-15 —
-/// guard-isolated, so `/readyz` shed rather than self-fence, but
-/// still a multi-second actor stall. The cap drains the backlog over
-/// `⌈backlog/256⌉` ticks; over-quota entries stay in the view
-/// unchanged (the predicate matches again next tick).
-const MAX_AGEOUT_PER_TICK: usize = 256;
+/// The phase-15 partition classifier (sh-044 r3 chokepoint): the ONE
+/// predicate the collect loop AND the post-loop stalled-gauge recount
+/// both call, so the gauge population cannot drift from the population
+/// the loop processes. `Parked`/`AgedOut` PARTITION `holder()=None` on
+/// the park axis — `is_some_and(|u| u > now)` and its exact Boolean
+/// complement `is_none_or(|u| u <= now)` (no gap, no overlap;
+/// `parked_until` is written only at `{new_unclaimed, park,
+/// entry_from_recovered_row}` and no live-process path resets
+/// `Some→None`, so a once-parked-then-abandoned entry sits at
+/// `Some(past)` indefinitely and an `is_none()` predicate would miss
+/// it). A RetryLater-deferred job (`defer_until=Some`,
+/// `parked_until=None`, `holder=None` — merged_bug_178 view-only
+/// pacing) MATCHES `AgedOut` intentionally: a job that has only ever
+/// been deferred for `max_attempts × attempt_deadline_secs` without
+/// one settled close IS the never-touched case the age-out arm
+/// targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StalledClass {
+    /// `parked_until > now`: durable backoff active.
+    Parked,
+    /// Never-parked OR park-expired, unclaimed, past the threshold.
+    AgedOut,
+}
+
+/// See [`StalledClass`].
+fn classify_stalled(
+    e: &JobViewEntry,
+    now: std::time::Instant,
+    age_out_after: std::time::Duration,
+) -> Option<StalledClass> {
+    if e.holder().is_some() {
+        return None;
+    }
+    if e.parked_until.is_some_and(|until| until > now) {
+        Some(StalledClass::Parked)
+    } else if e.created_at.elapsed() > age_out_after {
+        Some(StalledClass::AgedOut)
+    } else {
+        None
+    }
+}
+
+/// Per-tick quota on phase-15's serial `classify_durable_evidence` PG
+/// awaits (sh-044 r3 — ONE budget shared by BOTH arms): each arm's
+/// per-entry evidence read is unbounded over the first-post-deploy /
+/// post-outage backlog (the project's own comments cite "hundreds in
+/// one pass" and a 7725-row backlog; a store/infra outage parks
+/// thousands). At ~3 ms RTT a 3500+ backlog exceeds 11 s inside
+/// `handle_tick` phase-15 — guard-isolated, so `/readyz` shed rather
+/// than self-fence, but still a multi-second actor stall. The cap
+/// drains the backlog over `⌈backlog/256⌉` ticks; over-quota entries
+/// stay in the view unchanged ([`classify_stalled`] matches again next
+/// tick). Witness: `phase15_per_tick_is_bounded`.
+pub(super) const MAX_AGEOUT_PER_TICK: usize = 256;
 
 /// One report's batched-consumption intent (sh-007c S6 phase B
 /// product): the per-item routing decision over PREFETCHED inputs,
@@ -4302,6 +4357,38 @@ impl DagActor {
             .then_some(d)
     }
 
+    /// The phase-15 per-entry PG-await prefix shared by BOTH arms
+    /// (sh-044 r3, the [`MAX_AGEOUT_PER_TICK`] budget unit): db_id
+    /// lookup → `classify_durable_evidence` → [`from_source_viable`]
+    /// gate. Returns `Some(evidence)` iff from-source is viable;
+    /// `None` (no db_id, evidence query failed, or gate refused) keeps
+    /// the entry in the view — counted as stalled by the post-loop
+    /// recount, re-evaluated next tick. The conservative `None` on a
+    /// query error is the parked arm's "the armed action remains
+    /// park-expiry re-claim" / the aged-out arm's "the backstop sweep
+    /// folds moot rows" — neither arm's `continue` had a side effect.
+    /// One helper, one edit point: the next shared change (e.g.
+    /// batching `classify_durable_evidence`) is a single-site edit,
+    /// and the bc84397f9 class — one arm's gate diverging from the
+    /// other's — is unrepresentable.
+    async fn phase15_viable_evidence(
+        &self,
+        drv_hash: &DrvHash,
+        origin: crate::state::JobOrigin,
+        arm: &'static str,
+    ) -> Option<rio_evidence_kernel::ClosureEvidence> {
+        let db_id = self.dag.node(drv_hash.as_str()).and_then(|s| s.db_id)?;
+        let evidence = match self.db.classify_durable_evidence(db_id).await {
+            Ok(ev) => ev,
+            Err(e) => {
+                warn!(drv_hash = %drv_hash, error = %e, arm,
+                      "phase-15 evidence query failed; job stays in view (stalled)");
+                return None;
+            }
+        };
+        from_source_viable(evidence, origin).then_some(evidence)
+    }
+
     // r[impl obs.metric.materialization-stalled+2]
     // r[impl sched.materialize.routing+7]
     /// PD-20 (design §2.5, Phase B T-6.1): the materialization-job
@@ -4374,82 +4461,54 @@ impl DagActor {
         // one pass.
         let mut requeue: Vec<DrvHash> = Vec::new();
         for (h, e) in self.materialization_jobs.iter() {
-            if e.holder().is_some() {
-                continue;
-            }
-            // The two arms PARTITION `holder()=None` on the park axis:
-            // `is_none_or(|u| u <= now)` is the exact Boolean
-            // complement of `is_some_and(|u| u > now)` — no gap, no
-            // overlap. `parked_until` is written only at
-            // `{new_unclaimed, park, entry_from_recovered_row}` and no
-            // live-process path resets `Some→None` (the four
-            // claim-lifecycle mutators write `episode`/`defer_until`
-            // only), so a once-parked-then-abandoned entry sits at
-            // `Some(past)` indefinitely; `is_none()` would miss it.
-            if e.parked_until.is_some_and(|until| until > now) {
-                parked.push((h.clone(), e.job_id, e.origin));
-            } else if e.created_at.elapsed() > age_out_after {
-                // Never-parked OR park-expired, unclaimed, past the
-                // age-out threshold. A RetryLater-deferred job
-                // (`defer_until=Some`, `parked_until=None`,
-                // `holder=None` — merged_bug_178 view-only pacing)
-                // MATCHES intentionally: a job that has only ever been
-                // deferred for `max_attempts × attempt_deadline_secs`
-                // (default 3 h) without one settled close IS the
-                // never-touched case this arm targets.
-                aged_out.push((h.clone(), e.job_id, e.origin));
+            // The partition predicate is `classify_stalled` (the ONE
+            // chokepoint the recount below also calls — see its doc
+            // for the parked_until/defer_until conjunct rationale).
+            match classify_stalled(e, now, age_out_after) {
+                Some(StalledClass::Parked) => parked.push((h.clone(), e.job_id, e.origin)),
+                Some(StalledClass::AgedOut) => aged_out.push((h.clone(), e.job_id, e.origin)),
+                None => {}
             }
         }
-        // sh-044 r2: per-tick PG-await quota on the aged-out arm.
-        // Over-quota entries stay in the view unchanged; the predicate
-        // matches again next tick (the cap drains the backlog over
-        // ⌈backlog/MAX_AGEOUT_PER_TICK⌉ ticks instead of one
-        // serial-PG burst).
-        if aged_out.len() > MAX_AGEOUT_PER_TICK {
+        // sh-044 r3: ONE per-tick PG-await budget across BOTH arms
+        // (each arm's loop body is the same serial
+        // `classify_durable_evidence` await — a parked backlog stalls
+        // the actor exactly as an aged-out one does). Over-quota
+        // entries stay in the view unchanged; `classify_stalled`
+        // matches again next tick. The longer vec is shrunk first; if
+        // the shorter alone fills the budget it is capped too.
+        if parked.len() + aged_out.len() > MAX_AGEOUT_PER_TICK {
             tracing::warn!(
+                parked = parked.len(),
                 aged_out = aged_out.len(),
                 cap = MAX_AGEOUT_PER_TICK,
-                "phase-15 aged-out backlog over MAX_AGEOUT_PER_TICK; the \
+                "phase-15 stalled backlog over MAX_AGEOUT_PER_TICK; the \
                  over-quota tail stays in the view (re-evaluated next tick)"
             );
-            aged_out.truncate(MAX_AGEOUT_PER_TICK);
+            if parked.len() >= aged_out.len() {
+                parked.truncate(MAX_AGEOUT_PER_TICK.saturating_sub(aged_out.len()));
+                aged_out.truncate(MAX_AGEOUT_PER_TICK);
+            } else {
+                aged_out.truncate(MAX_AGEOUT_PER_TICK.saturating_sub(parked.len()));
+                parked.truncate(MAX_AGEOUT_PER_TICK);
+            }
         }
         for (drv_hash, job_id, origin) in parked {
             // Classify over the DURABLE relation (T-D2.2/PD-D4 — the
             // same three-part criterion the consumption routing uses;
             // a stale in-memory view must neither strand a buildable
             // closure nor auto-resolve on dead previous-generation
-            // evidence). One query per parked job: bounded by the
-            // stalled population, which is small by construction
-            // (alerted at >0 for 15m).
-            let Some(db_id) = self.dag.node(drv_hash.as_str()).and_then(|s| s.db_id) else {
+            // evidence). The origin read is the IN-MEMORY mirror
+            // (merged_bug_301 / sh-044 r2): `entry.origin` is
+            // PG-authoritative (upward-only refresh on the
+            // dedup-upgrade edge in `feed_job_view_entry`), so both
+            // arms read the same single source of truth.
+            let Some(evidence) = self
+                .phase15_viable_evidence(&drv_hash, origin, "parked")
+                .await
+            else {
                 continue;
             };
-            let evidence = match self.db.classify_durable_evidence(db_id).await {
-                Ok(ev) => ev,
-                Err(e) => {
-                    // Conservative: an unanswerable classification
-                    // keeps the job parked (the armed action remains
-                    // park-expiry re-claim).
-                    warn!(drv_hash = %drv_hash, error = %e,
-                          "park re-evaluation evidence query failed; job stays parked");
-                    continue;
-                }
-            };
-            // The origin read is the IN-MEMORY mirror (merged_bug_301
-            // / sh-044 r2): `entry.origin` is PG-authoritative
-            // (upward-only refresh on the dedup-upgrade edge in
-            // `feed_job_view_entry`), so both arms read the same
-            // single source of truth and the second per-entry PG
-            // round-trip (`unresolved_job_for_derivation` solely for
-            // origin) is dead. The ChildlessLeaf cell is
-            // from-source-viable exactly when the origin is not
-            // `pruned` — a structural leaf has no closure to be
-            // missing, while a pruned root's closure was deliberately
-            // dropped.
-            if !from_source_viable(evidence, Some(origin)) {
-                continue;
-            }
             // r[impl sched.materialize.conversion-strictness]
             // Item T strictness gate (default-off; whole-arm scope —
             // every origin's Vouched/Pending conversion). Both halves
@@ -4502,10 +4561,6 @@ impl DagActor {
                     continue;
                 }
             }
-            // Item T conversion visibility: the origin label reuses
-            // the in-memory PG-authoritative mirror (the upward-only
-            // refresh keeps it equal to the durable column).
-            let origin_label = origin.as_str();
             // From-source is viable: resolve the job (no exec_id — the
             // re-evaluation, not an execution, resolved it) and requeue
             // the node. The spawn-intent filter and the admission table
@@ -4530,7 +4585,7 @@ impl DagActor {
                 if d == WriteDisposition::Applied {
                     metrics::counter!(
                         "rio_scheduler_materialization_converted_total",
-                        "origin" => origin_label
+                        "origin" => origin.as_str()
                     )
                     .increment(1);
                 }
@@ -4538,7 +4593,7 @@ impl DagActor {
                     drv_hash = %drv_hash,
                     %job_id,
                     ?evidence,
-                    origin = origin_label,
+                    origin = origin.as_str(),
                     "parked materialization job re-evaluated: from-source is viable; \
                      resolved from_source and requeued (PD-20)"
                 );
@@ -4563,39 +4618,25 @@ impl DagActor {
         // `{origin,reason}` live series would desync from the seeded
         // `{origin}`-only series — birth-gap protection lost).
         //
-        // The `from_source_viable` gate IS consulted (mirroring the
-        // parked arm): a `ChildlessLeaf+Pruned` node — closure
-        // deliberately dropped — must NOT be evicted-and-requeued (it
-        // would re-probe cached → new mat job → 3h loop, or dispatch a
-        // build whose closure was dropped) and must stay in the stalled
-        // gauge. The evidence read is the per-entry
-        // `classify_durable_evidence` PG round-trip (the same
-        // serial-await shape the parked arm already exhibits, capped at
-        // `MAX_AGEOUT_PER_TICK` so the first-post-deploy backlog cannot
-        // serial-drain in one tick); the ORIGIN read is in-memory
-        // `entry.origin` (the PG-authoritative mirror — same source as
-        // the parked arm).
+        // The `from_source_viable` gate IS consulted (the same
+        // `phase15_viable_evidence` helper as the parked arm): a
+        // `ChildlessLeaf+Pruned` node — closure deliberately dropped
+        // — must NOT be evicted-and-requeued (it would re-probe
+        // cached → new mat job → 3h loop, or dispatch a build whose
+        // closure was dropped) and must stay in the stalled gauge.
+        // The evidence read is the per-entry
+        // `classify_durable_evidence` PG round-trip (the shared
+        // `MAX_AGEOUT_PER_TICK` budget caps both arms together); the
+        // ORIGIN read is in-memory `entry.origin` (the
+        // PG-authoritative mirror — same source as the parked arm).
         // r[impl sched.materialize.unclaimed-age-out]
         for (drv_hash, job_id, origin) in aged_out {
-            let Some(db_id) = self.dag.node(drv_hash.as_str()).and_then(|s| s.db_id) else {
-                // No durable identity → no evidence to classify; the
-                // job stays in the view (the backstop sweep folds moot
-                // rows). Counted as stalled by the post-loop recount.
+            let Some(evidence) = self
+                .phase15_viable_evidence(&drv_hash, origin, "aged_out")
+                .await
+            else {
                 continue;
             };
-            let evidence = match self.db.classify_durable_evidence(db_id).await {
-                Ok(ev) => ev,
-                Err(e) => {
-                    warn!(drv_hash = %drv_hash, error = %e,
-                          "age-out evidence query failed; job stays unclaimed (stalled)");
-                    continue;
-                }
-            };
-            if !from_source_viable(evidence, Some(origin)) {
-                // Same as the parked arm's `continue`: not viable →
-                // stays in the view, counted as stalled.
-                continue;
-            }
             if let Some(d) = self.settle_resolved_from_source(&drv_hash, job_id).await {
                 if d == WriteDisposition::Applied {
                     metrics::counter!(
@@ -4626,20 +4667,18 @@ impl DagActor {
         // aged-out arm's Fenced/Failed-resolve `None` path —
         // `settle_resolved_from_source` returns `None`, the entry
         // survives, no `+= 1` ran, and the gauge undercounted by
-        // exactly that population). The recount is the same
-        // `holder()=None` partition predicate the loop above used:
-        // parked entries the conversion did not resolve PLUS aged-out
-        // entries the `from_source_viable` gate (or the resolve, or
-        // the per-tick quota) refused — both are genuinely stuck; the
-        // §2.5 operator signal.
+        // exactly that population). The recount calls the same
+        // `classify_stalled` chokepoint the collect loop above used —
+        // the gauge population is BY CONSTRUCTION the population the
+        // loop processes minus what `settle_resolved_from_source`
+        // evicted: parked entries the conversion did not resolve PLUS
+        // aged-out entries the `from_source_viable` gate (or the
+        // resolve, or the per-tick quota) refused — both are
+        // genuinely stuck; the §2.5 operator signal.
         let still_parked = self
             .materialization_jobs
             .iter()
-            .filter(|(_, e)| {
-                e.holder().is_none()
-                    && (e.parked_until.is_some_and(|u| u > now)
-                        || e.created_at.elapsed() > age_out_after)
-            })
+            .filter(|(_, e)| classify_stalled(e, now, age_out_after).is_some())
             .count();
         crate::observability::LeaderGauge::MaterializationStalled.set(still_parked as f64);
     }

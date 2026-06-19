@@ -582,17 +582,12 @@ impl DagActor {
                       "unknown build status in PG, skipping");
                 continue;
             };
-            let priority_class = tracing::info_span!(
-                "recover_build_row",
-                build_id = %row.build_id
-            )
-            .in_scope(|| {
-                crate::state::db_str::parse_or_error_default(
-                    "builds.priority_class",
-                    &row.priority_class,
-                    crate::state::PriorityClass::default(),
-                )
-            });
+            let priority_class = crate::state::db_str::parse_or_error_default(
+                "builds.priority_class",
+                &row.priority_class,
+                crate::state::PriorityClass::default(),
+                row.build_id,
+            );
             let options = row.options_json.map(|j| j.0).unwrap_or_default();
             let hashes = build_drv_hashes.remove(&row.build_id).unwrap_or_default();
 
