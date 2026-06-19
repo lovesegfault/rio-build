@@ -973,6 +973,14 @@ impl JobViewEntry {
         self.created_at = at;
     }
 
+    /// Test seeding of the origin mirror (the production writers are
+    /// `new_unclaimed`/`entry_from_recovered_row` and the
+    /// `feed_job_view_entry` upgraded-gated refresh).
+    #[cfg(test)]
+    pub(super) fn test_set_origin(&mut self, origin: crate::state::JobOrigin) {
+        self.origin = origin;
+    }
+
     /// Test seeding of the deferral axis (the production writer is the
     /// RetryLater consumption arm).
     #[cfg(test)]

@@ -789,6 +789,17 @@ pub enum DebugCmd {
         status: crate::state::DerivationStatus,
         reply: oneshot::Sender<bool>,
     },
+    /// Overwrite the in-memory `JobViewEntry.origin` mirror. For
+    /// parked-conversion tests that previously SQL-UPDATEd
+    /// `materialization_jobs.origin = 'pruned'` and relied on the
+    /// (now-removed) per-entry PG read; both phase-15 arms read the
+    /// in-memory mirror so the test must seed it too. Replies `false`
+    /// when no view entry exists.
+    SetJobOrigin {
+        drv_hash: String,
+        origin: crate::state::JobOrigin,
+        reply: oneshot::Sender<bool>,
+    },
     /// Overwrite a derivation's `output_paths`. For tests staging a
     /// pre-existing Completed/Skipped node without driving the full
     /// worker→completion path (which is one-shot per worker).

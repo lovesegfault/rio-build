@@ -94,6 +94,20 @@ impl DagActor {
                 });
                 let _ = reply.send(ok);
             }
+            DebugCmd::SetJobOrigin {
+                drv_hash,
+                origin,
+                reply,
+            } => {
+                let ok = self
+                    .materialization_jobs
+                    .get_mut(&crate::state::DrvHash::from(drv_hash.as_str()))
+                    .is_some_and(|e| {
+                        e.test_set_origin(origin);
+                        true
+                    });
+                let _ = reply.send(ok);
+            }
             DebugCmd::SetOutputPaths {
                 drv_hash,
                 paths,

@@ -4356,12 +4356,7 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     .bind(exec4)
     .execute(&db.pool)
     .await?;
-    sqlx::query(
-        "UPDATE materialization_jobs SET origin = 'pruned' \
-          WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = 'tot-pending')",
-    )
-    .execute(&db.pool)
-    .await?;
+    set_origin_pruned(&handle, &db.pool, "tot-pending").await?;
     tick(&handle).await?;
     barrier(&handle).await;
     let (job_state, infra_rows, park4): (String, i64, Option<f64>) = sqlx::query_as(
@@ -5864,9 +5859,7 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
     // merged_bug_301: a NON-pruned childless leaf now CONVERTS at the
     // re-evaluation; the stays-parked arm of this test is the
     // pruned-origin shape (closure deliberately dropped).
-    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'pd20-broken'")
-        .execute(&db.pool)
-        .await?;
+    set_origin_pruned(&handle, &db.pool, "pd20-broken").await?;
 
     // ── The tick: re-evaluation + the gauge. ──
     tick(&handle).await?;
@@ -6902,6 +6895,29 @@ async fn dedup_upgrade_preserves_parked_armament() -> TestResult {
 // Phase D' T-D2.2 (PD-D4): routing/park evidence classification
 // re-sources to the durable relation (the THREE-part strict criterion)
 // ════════════════════════════════════════════════════════════════════
+
+/// Set a job's origin to `Pruned` in BOTH PG and the in-memory mirror
+/// (sh-044 r2): both phase-15 arms now read `entry.origin` (the
+/// PG-authoritative mirror) instead of the per-entry PG round-trip,
+/// so a test that SQL-UPDATEs PG alone leaves the mirror at
+/// `CacheOpportunity` and `from_source_viable(ChildlessLeaf,
+/// CacheOpportunity)=true` — the parked entry resolves instead of
+/// staying parked.
+async fn set_origin_pruned(
+    handle: &ActorHandle,
+    pool: &sqlx::PgPool,
+    drv_hash: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = $1")
+        .bind(drv_hash)
+        .execute(pool)
+        .await?;
+    let ok = handle
+        .debug_set_job_origin(drv_hash, JobOrigin::Pruned)
+        .await?;
+    anyhow::ensure!(ok, "no view entry for {drv_hash} to set origin on");
+    Ok(())
+}
 
 /// Insert a phantom derivation row directly into PG (a child the
 /// in-memory DAG does NOT track — the truncation/divergence shapes).
@@ -8241,9 +8257,7 @@ async fn establishment_only_charges_park_at_max_attempts() -> TestResult {
     // survives the same ticks' re-evaluation (a NON-pruned childless
     // leaf converts now); this test's subject is the party-blind
     // establishment budget, not the conversion.
-    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'est-park'")
-        .execute(&db.pool)
-        .await?;
+    set_origin_pruned(&handle, &db.pool, "est-park").await?;
 
     // max_attempts establishment cycles: claim → the replica dies
     // unreported (assignment aged out) → the sweep establishes the
@@ -8977,11 +8991,7 @@ async fn flag_on_parked_jobs_leave_substituting_bucket() -> TestResult {
     // tick (a non-pruned childless leaf would convert at the
     // re-evaluation now) — this test pins the gauge semantics of a
     // parked job, not the conversion.
-    sqlx::query(
-        "UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'parked-bucket'",
-    )
-    .execute(&db.pool)
-    .await?;
+    set_origin_pruned(&handle, &db.pool, "parked-bucket").await?;
 
     tick(&handle).await?;
     let snap = handle.cluster_snapshot_cached();
@@ -9302,9 +9312,7 @@ async fn parked_pruned_childless_stays_parked() -> TestResult {
     .await
     .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
     barrier(&handle).await;
-    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'a4prn'")
-        .execute(&db.pool)
-        .await?;
+    set_origin_pruned(&handle, &db.pool, "a4prn").await?;
 
     tick(&handle).await?;
     barrier(&handle).await;

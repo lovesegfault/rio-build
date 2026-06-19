@@ -253,6 +253,21 @@ impl ActorHandle {
         .await
     }
 
+    /// Overwrite the in-memory `JobViewEntry.origin` mirror.
+    pub async fn debug_set_job_origin(
+        &self,
+        drv_hash: &str,
+        origin: crate::state::JobOrigin,
+    ) -> Result<bool, ActorError> {
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::SetJobOrigin {
+            drv_hash,
+            origin,
+            reply,
+        })
+        .await
+    }
+
     /// Backdate `running_since` and force Running status. For
     /// backstop-timeout tests. Returns `false` if not found or not in
     /// Assigned/Running.
