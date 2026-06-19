@@ -2294,7 +2294,7 @@ behind it. Any future partitioning of the probe groups inherits the
 bound by construction because the budget, not the loop shape, owns the
 clock.
 
-#r("sched.dispatch.probe-sweep-budget")[
+#r("sched.dispatch.probe-sweep-budget+2")[
   The phase-17 ready-cache sweep's on-actor `FindMissingPaths` MUST be
   bounded at `DISPATCH_PROBE_SWEEP_BUDGET` (= `SELF_FENCE_AFTER`/2); on
   expiry the unprobed tail fails open to the next `probe_generation`.

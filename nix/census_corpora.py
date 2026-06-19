@@ -843,6 +843,10 @@ DURATION_CENSUS_ROWS = {
         "wall (reqwest per-request connect+read budget over the same tokio runtime clock; per-pod scrape bound)",
         "sh-028 (sh007e S4): same-domain — best-effort: timeout → that pod's annotation stays stale this tick, never a crash; the tick-rate retry IS the conversion",
     ),
+    ("rio-scheduler/src/actor/mod.rs", "DISPATCH_PROBE_SWEEP_BUDGET"): (
+        "wall (tokio Instant elapsed at the dag-actor's own per-sweep stamp — the AttemptBudget min(grpc_timeout, BUDGET) and the post-FMP started.elapsed() skip gate share the same Instant domain as the lease guard's SELF_FENCE_AFTER it derives from)",
+        "sh-044 (d0427e56a): named SELF_FENCE_AFTER/2 by const checked_div — same-domain by derivation; W: probe_sweep_hung_tenants_are_capped_by_the_min asserts the AttemptBudget cap is exactly grpc_timeout.min(DISPATCH_PROBE_SWEEP_BUDGET)",
+    ),
 }
 DURATION_GRANDFATHER = "nix/duration-census-grandfather.txt"
 
@@ -1053,6 +1057,18 @@ EXIT_EDGE_ROWS = {
     ("rio-store/src/gc/mod.rs", "give-up-pred", "MAX_ATTEMPTS"): (
         "feeder-scoped reset: the deleted=FALSE collect re-decision resets live-chunk rows through the guarded conflict arm; tombstoned rows are TYPED parked-operator (no production reset — by design)",
         "W12-S feeder-witnessed both faces (parked left parked by a full production cycle; finite face end-to-end candidate-scan->reset->drain) + W12-R carried-key chain (S3 c4-c5)",
+    ),
+    # sh-044 (d0427e56a): NOT a latch — a per-tick fail-open wall-clock
+    # cap. The sweep re-arms structurally at every probe_generation
+    # advance (the unstamped tail keeps probed_generation < probe_gen,
+    # so the next generation's candidate filter re-admits it); within a
+    # generation the over-budget tail fails open (Ready dispatches from
+    # source via the normal drain). The name carries _BUDGET for the
+    # AttemptBudget it parameterizes, which is what const-family keys
+    # on.
+    ("rio-scheduler/src/actor/mod.rs", "const-family", "DISPATCH_PROBE_SWEEP_BUDGET"): (
+        "per-generation re-arm: the probe_generation advance is the reset event (the unstamped over-budget tail is re-admitted by the next generation's candidate filter); fail-open within a generation (Ready dispatches from source — never an absorbing state)",
+        "sh-044: probe_sweep_hung_tenants_are_capped_by_the_min (the cap binds) + batch_probe_skips_pending_mat_jobs (the tail-serving filter); the WARN at sweep_ready_cached names the skip explicitly",
     ),
 }
 

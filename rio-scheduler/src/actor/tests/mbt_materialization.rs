@@ -984,7 +984,29 @@ impl MbtSystem {
                     !present.is_empty(),
                     "completeReadyFromStore({d}) with nothing present"
                 );
-                self.probe_sweep(&[], &present).await
+                // sh-044: the dispatch-probe candidate filter now skips
+                // nodes that carry a view entry (`jobs.get(*h).is_none()`
+                // at dispatch.rs `batch_probe_cached_ready`), but the
+                // model's `completeReadyFromStore` ALSO covers the
+                // merge-time `apply_cached_hits` lane (unfiltered) — its
+                // own doc: "Job-carrying nodes that complete this way
+                // are closed by obsoleteOnProduced". Drive the
+                // production join-point both lanes call directly so the
+                // action's stated semantics ("a node whose live-wanted
+                // outputs are all present completes without any
+                // attempt") hold regardless of view state. The store
+                // seed is kept for downstream pin/reference writes.
+                for p in &present {
+                    self.store.seed_with_content(p, b"mbt-present");
+                }
+                self.actor
+                    .complete_ready_from_store_batch(&[(
+                        DrvHash::from(d.as_str()),
+                        crate::db::live_pins::StampProvenance::AllTenantProbe,
+                    )])
+                    .await;
+                self.store.state.paths.write().unwrap().clear();
+                Ok(())
             }
             Act::BuildTerminal { b } => {
                 // The model's builds exist (live) from init; production

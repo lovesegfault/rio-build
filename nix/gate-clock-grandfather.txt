@@ -7,10 +7,13 @@ rio-controller/src/reconcilers/pool/job.rs	gate	.retain(|_, inserted| inserted.e
 rio-gateway/src/handler/build.rs	gate	&& since.elapsed() >= Self::LIVE_TENURE_RESET
 rio-gateway/src/quota.rs	gate	if e.fetched_at.elapsed() < QUOTA_CACHE_TTL {
 rio-lease/src/lib.rs	lossy	2 * FENCE_MARGIN.as_secs() > RENEW_INTERVAL.as_secs(),
+rio-scheduler/src/actor/dispatch.rs	gate	if started.elapsed() <= super::DISPATCH_PROBE_SWEEP_BUDGET {
 rio-scheduler/src/actor/event.rs	gate	.is_some_and(|t| t.elapsed() < PROGRESS_DEBOUNCE)
 rio-scheduler/src/actor/housekeeping.rs	gate	&& build.submitted_at.elapsed().as_secs() > build.options.build_timeout.raw()
 rio-scheduler/src/actor/housekeeping.rs	gate	&& poisoned_at.elapsed() > POISON_TTL
 rio-scheduler/src/actor/materialize.rs	gate	.is_some_and(|began| began.elapsed().as_secs() >= dwell_secs);
+rio-scheduler/src/actor/materialize.rs	gate	} else if e.created_at.elapsed() > age_out_after {
+rio-scheduler/src/actor/materialize.rs	gate	|| e.created_at.elapsed() > age_out_after)
 rio-store/src/cas.rs	gate	|| g.0.elapsed() >= HEARTBEAT_TIME_INTERVAL
 rio-store/src/gc/mod.rs	gate	if self.consulted_at.elapsed() > bound {
 rio-store/src/grpc/put_path/common.rs	lossy	< crate::substitute::DEFAULT_SUBSTITUTE_STALL_WINDOW.as_secs()

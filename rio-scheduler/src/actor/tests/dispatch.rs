@@ -3139,7 +3139,7 @@ async fn queued_by_system_equal_across_both_rpcs_under_backoff() {
 /// folds every hung probe to `TimedOut` at exactly that budget — the
 /// fail-open arm `batch_probe_cached_ready` re-admits next generation.
 // r[verify sched.dispatch.probe-budget]
-// r[verify sched.dispatch.probe-sweep-budget]
+// r[verify sched.dispatch.probe-sweep-budget+2]
 #[tokio::test(start_paused = true)]
 async fn hung_tenant_sweep_is_bounded_by_one_timeout() {
     use crate::actor::dispatch::{ProbeOutcome, fan_out_probes};

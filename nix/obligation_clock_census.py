@@ -125,6 +125,21 @@ CLOCK_ROWS = {
     # note_live_strike, the StrikeEntry::expired idiom). The clock
     # description lives in the anchor's doc per the row convention.
     "live-strike-wall-floor": ("landed", "S11", "rio-controller/src/reconcilers/pool/jobs.rs", r"STRIKE_WALL_FLOOR"),
+    # sh-044 (d0427e56a): the phase-17 sweep's post-FMP skip gate —
+    # deadline-shaped on the sweep's own monotonic Instant (started +
+    # DISPATCH_PROBE_SWEEP_BUDGET vs Instant::now() through
+    # started.elapsed(); same Instant domain as the AttemptBudget the
+    # FMP it follows is priced by). Fail-open: over-budget skips the
+    # batch create, the next probe_generation re-probes.
+    "dispatch-probe-sweep-budget": ("landed", "sh044", "rio-scheduler/src/actor/dispatch.rs", r"DISPATCH_PROBE_SWEEP_BUDGET"),
+    # sh-044 (c9aad6de6): the phase-15 unclaimed-age-out predicate —
+    # deadline-shaped on the entry's own RecoveredInstant
+    # (created_at.elapsed() vs max_attempts × attempt_deadline_secs;
+    # the failover-exact PG-epoch mirror, same age domain as the
+    # phase-12 attempt-expiry it factors). Two production sites: the
+    # partition predicate AND the post-loop stalled-gauge recount —
+    # both compare the same created_at against the same age_out_after.
+    "mat-unclaimed-age-out": ("landed", "sh044", "rio-scheduler/src/actor/materialize.rs", r"age_out_after"),
 }
 
 # The lossy-witness-arithmetic grammar (live from birth): seconds

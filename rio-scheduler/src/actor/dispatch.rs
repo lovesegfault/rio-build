@@ -364,7 +364,7 @@ impl DagActor {
         // applies when `candidates.len() > DISPATCH_PROBE_TICK_QUOTA`
         // — it does NOT shard a within-quota batch.
         // r[impl sched.dispatch.probe-budget]
-        // r[impl sched.dispatch.probe-sweep-budget]
+        // r[impl sched.dispatch.probe-sweep-budget+2]
         let budget = rio_common::transport::AttemptBudget::new(
             self.grpc_timeout.min(super::DISPATCH_PROBE_SWEEP_BUDGET),
         );
