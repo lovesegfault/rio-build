@@ -199,7 +199,14 @@ let
   # values containing `[` / `"`. Block-style throughout; the gojq
   # selector keys are single-quoted so the embedded `|` and `"` parse
   # as scalar.
-  kwokManifests = pkgs.writeText "kwok-deploy.yaml" ''
+  #
+  # The YAML is split into three derivations so the kwok-only fixture
+  # (fixtures/kwok-only.nix) can reuse the Stage CRD + nodeclaim Stages
+  # WITHOUT the in-cluster Deployment/RBAC (kwok-only runs the kwok
+  # binary as a host systemd unit with the cluster-admin kubeconfig).
+  # `kwokManifests` below re-concatenates them so the k3s-full overlay
+  # sees the same single-file shape `services.k3s.manifests` expects.
+  stageCRD = pkgs.writeText "kwok-stage-crd.yaml" ''
     apiVersion: apiextensions.k8s.io/v1
     kind: CustomResourceDefinition
     metadata:
@@ -219,7 +226,9 @@ let
             openAPIV3Schema:
               type: object
               x-kubernetes-preserve-unknown-fields: true
-    ---
+  '';
+
+  kwokK8sDeployment = pkgs.writeText "kwok-k8s-deploy.yaml" ''
     apiVersion: v1
     kind: ServiceAccount
     metadata:
@@ -281,7 +290,9 @@ let
                 - --manage-nodes-with-annotation-selector=kwok.x-k8s.io/node=fake
                 - --enable-crds=Stage
                 - --node-lease-duration-seconds=40
-    ---
+  '';
+
+  nodeclaimStages = pkgs.writeText "kwok-nodeclaim-stages.yaml" ''
     apiVersion: kwok.x-k8s.io/v1alpha1
     kind: Stage
     metadata:
@@ -384,8 +395,31 @@ let
               message: ""
               lastTransitionTime: '{{ Now }}'
   '';
+
+  # Preserve the single-file shape `services.k3s.manifests` expects.
+  # bash process-substitution (`<(echo ---)`) would need
+  # `runCommandLocal` with bash; printf is POSIX-sh-safe under stdenv.
+  kwokManifests = pkgs.runCommand "kwok-deploy.yaml" { } ''
+    {
+      cat ${stageCRD}
+      printf '\n---\n'
+      cat ${kwokK8sDeployment}
+      printf '\n---\n'
+      cat ${nodeclaimStages}
+    } > $out
+  '';
 in
 {
+  # Raw YAML pieces for fixtures/kwok-only.nix (kubectl-apply path —
+  # no k3s deploy-controller, kwok runs as a host systemd unit).
+  inherit
+    karpenterCRDs
+    ec2NodeClassStub
+    kwokDefaultStages
+    stageCRD
+    nodeclaimStages
+    ;
+
   airgapImages = [
     kwokImage
     kubeSchedulerImage

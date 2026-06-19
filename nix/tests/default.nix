@@ -32,6 +32,11 @@ let
   standalone = import ./fixtures/standalone.nix fixtureArgs;
   toxiproxy = import ./fixtures/toxiproxy.nix fixtureArgs;
   k3sFull = import ./fixtures/k3s-full.nix fixtureArgs;
+  # issue #57 1d: bare apiserver+etcd+KCM+kube-scheduler + KWOK +
+  # rio-* as systemd. ~2.5 GB / ~30 s boot vs k3s-full's ~18 GB /
+  # ~4 min — for object-state-only controller tests (Pool /
+  # ComponentScaler / nodeclaim_pool reconcilers).
+  kwokOnly = import ./fixtures/kwok-only.nix fixtureArgs;
   # Prod-parity overlay: bootstrap.enabled=true on top of k3s-full.
   # Three prod regressions from P0493/P0494 all had the same root
   # cause: bootstrap Job never renders in CI. See plan-0500 +
@@ -48,6 +53,7 @@ let
   security = import ./scenarios/security.nix { inherit pkgs common; };
   observability = import ./scenarios/observability.nix;
   lifecycle = import ./scenarios/lifecycle.nix;
+  controller-kwok = import ./scenarios/controller-kwok.nix;
   leader-election = import ./scenarios/leader-election.nix;
   cli = import ./scenarios/cli.nix;
   dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
@@ -235,6 +241,16 @@ let
       jwtEnabled = true;
       singleNode = true;
     };
+  };
+
+  # kwok-only lifecycle: bare apiserver/etcd/KCM + kwok + rio-*
+  # systemd. Prelude is the trimmed controller-kwok.nix variant (no
+  # pods/proxy metric path, no JWT mint via Secret); the
+  # scenarios/lifecycle/ fragment dir is shared but only the
+  # object-state fragments are evaluated.
+  controllerKwokMod = controller-kwok {
+    inherit pkgs common;
+    fixture = kwokOnly { };
   };
 
   leMod = leader-election {
@@ -761,6 +777,32 @@ in
     globalTimeout = 700;
   };
 
+  # ── kwok-only lifecycle splits (issue #57 1d) ────────────────────────
+  # Object-state halves of pool-lifecycle / ephemeral-pool against the
+  # bare-apiserver fixture: ~60-90 s each vs ~7-8 min on k3s-full. The
+  # k3s variants above stay until these are proven green; r[verify]
+  # markers are duplicated (not moved) for the same reason.
+  vm-lifecycle-pool-kwok-only = controllerKwokMod.mkTest {
+    name = "pool";
+    subtests = [
+      # r[verify ctrl.pool.reconcile]
+      # r[verify ctrl.crd.pool]
+      "pool-lifecycle"
+    ];
+    globalTimeout = 240;
+  };
+
+  vm-lifecycle-autoscale-kwok-only = controllerKwokMod.mkTest {
+    name = "autoscale";
+    subtests = [
+      # r[verify ctrl.pool.ephemeral+1]
+      # r[verify ctrl.ephemeral.intent-deadline]
+      # r[verify ctrl.crd.host-users-network-exclusive]
+      "ephemeral-spawn"
+    ];
+    globalTimeout = 240;
+  };
+
   #
   # Own split (not folded into autoscale): fresh fixture → clean
   # state → fast finalizers. ~4min boot + ~3min subtests.
@@ -789,7 +831,8 @@ in
   #
   # Distinct runNixOSTest name `rio-forecast-provisioning` (NOT a
   # `vm-sla-sizing-*` variant — sla-sizing.nix is standalone-tied;
-  # this is k3s+kubectl-only).
+  # this is the kwok-only fixture: bare apiserver + KWOK + systemd
+  # rio-controller, issue #57 1d).
   #
   # nodeclaim_pool config flows through the chart's first-class values:
   # `scheduler.sla.{hwClasses,leadTimeSeed,maxFleetCores,...}`
@@ -807,10 +850,8 @@ in
   # r[verify ctrl.nodeclaim.placeable-gate+4]
   vm-sla-sizing-kwok = forecast-provisioning {
     inherit pkgs common;
-    fixture = k3sFull {
-      singleNode = true;
-      extraImages = kwok.airgapImages;
-      extraManifests = kwok.manifests;
+    fixture = kwokOnly {
+      withKarpenter = true;
       extraValuesTyped = {
         "buildScheduler.enabled" = true;
       };
@@ -889,6 +930,25 @@ in
     inherit pkgs common;
     fixture = k3sFull {
       singleNode = true;
+      extraValuesTyped = {
+        "componentScaler.store.enabled" = true;
+        "componentScaler.store.min" = 1;
+        "componentScaler.store.max" = 4;
+        "componentScaler.store.seedRatio" = 10;
+      };
+    };
+  };
+
+  # issue #57 1d kwok-only variant. Same scenario; the fixture exports
+  # `controllerIsSystemd = true` so the observedLoadFactor assertion is
+  # logged-only (no kube-dns / no real store-headless endpoints under
+  # KWOK) and restart-preserves-ratio uses `systemctl restart`. The
+  # k3s variant above stays until this is proven green.
+  # r[verify ctrl.scaler.component+2]
+  # r[verify ctrl.scaler.ratio-learn+2]
+  vm-componentscaler-kwok-only = componentscaler {
+    inherit pkgs common;
+    fixture = kwokOnly {
       extraValuesTyped = {
         "componentScaler.store.enabled" = true;
         "componentScaler.store.min" = 1;

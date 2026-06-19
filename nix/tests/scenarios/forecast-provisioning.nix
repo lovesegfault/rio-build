@@ -49,34 +49,22 @@ pkgs.testers.runNixOSTest {
     import json as _json
 
     # ── kwok-controller + kube-build-scheduler up ────────────────────
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n kube-system rollout status deploy/kwok-controller "
-        "--timeout=60s",
-        timeout=120,
-    )
+    # kwok-only fixture: kwok-controller is a host systemd unit and the
+    # karpenter CRDs are applied BEFORE it starts (kwok-apply-manifests
+    # ordering), so KWOK's StagesManager RESTMapper discovery resolves
+    # NodeClaim on first informer sync — the k3s-full `rollout restart
+    # deploy/kwok-controller` workaround is no longer needed. The
+    # kube-build-scheduler Deployment is KWOK-faked-Ready (no real
+    # second kube-scheduler process); the assertion below checks that
+    # builder Jobs are STAMPED with `schedulerName: kube-build-scheduler`,
+    # not that the second scheduler bound them.
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} rollout status deploy/kube-build-scheduler "
         "--timeout=60s",
         timeout=120,
     )
-    # NodeClaim CRD established (k3s deploy-controller retries on
-    # NotFound; this gates the rio-controller's first list).
     k3s_server.wait_until_succeeds(
         "k3s kubectl get crd nodeclaims.karpenter.sh", timeout=60
-    )
-    # KWOK's StagesManager runs RESTMapper discovery once on Stage-CR
-    # add; the k3s deploy-controller starts kwok-controller alongside
-    # the karpenter CRDs, so the karpenter.sh apigroup commonly isn't
-    # served yet → `failed to get gvk for gvr` and the NodeClaim
-    # resourceRef is dropped permanently. Restart now that the CRD is
-    # established so discovery resolves.
-    k3s_server.succeed(
-        "k3s kubectl -n kube-system rollout restart deploy/kwok-controller"
-    )
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n kube-system rollout status deploy/kwok-controller "
-        "--timeout=60s",
-        timeout=90,
     )
 
     # ── submit a build → scheduler emits SpawnIntents ────────────────
@@ -88,7 +76,7 @@ pkgs.testers.runNixOSTest {
     client.succeed(
         "nix-build ${drvs.fanout} "
         "--arg busybox '(builtins.storePath ${common.busybox})' "
-        "--no-out-link --store 'ssh-ng://k3s-server:32222' "
+        "--no-out-link --store 'ssh-ng://k3s-server' "
         ">/tmp/build.log 2>&1 &"
     )
 
@@ -104,7 +92,9 @@ pkgs.testers.runNixOSTest {
         )
     except Exception:
         print("=== nodeclaim_pool failed to create NodeClaim ===")
-        print(kubectl("logs deploy/rio-controller --tail=200"))
+        print(k3s_server.execute(
+            "journalctl -u rio-controller --no-pager -n 200"
+        )[1])
         raise
 
     with subtest("nodeclaim labelled shim-nodepool + hw-class"):
@@ -135,7 +125,7 @@ pkgs.testers.runNixOSTest {
         print(k3s_server.execute(
             "k3s kubectl get nodeclaims -o yaml; "
             "k3s kubectl get stages.kwok.x-k8s.io -o yaml; "
-            "k3s kubectl -n kube-system logs deploy/kwok-controller --tail=200"
+            "journalctl -u kwok-controller --no-pager -n 200"
         )[1])
         raise
     alloc = k3s_server.succeed(

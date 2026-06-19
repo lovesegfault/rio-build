@@ -31,6 +31,13 @@
 }:
 let
   inherit (fixture) ns nsStore;
+  # kwok-only fixture: rio-controller is a host systemd unit (the
+  # chart-rendered Deployment exists in apiserver but its pod is
+  # KWOK-faked). Restart-preserves-ratio must restart the REAL
+  # process, and observedLoadFactor's headless-DNS fan-out has no
+  # endpoints (KWOK pods carry no real podIP). k3sFull doesn't set
+  # this attr → defaults false → existing assertions unchanged.
+  controllerIsSystemd = fixture.controllerIsSystemd or false;
 
   # 30 leaves × `sleep 120`. NOT lib/derivations/fifty-fanout.nix —
   # those leaves are `echo > $out` and complete in <5s total; the
@@ -224,12 +231,26 @@ pkgs.testers.runNixOSTest {
             "get componentscaler store -o jsonpath='{.status.observedLoadFactor}'",
             ns="${nsStore}",
         ).strip()
-        assert load != "", (
-            "observedLoadFactor empty — controller couldn't reach any "
-            "rio-store-headless endpoint for GetLoad. Check cross-ns "
-            "DNS (loadEndpoint FQDN) and store-admin TLS."
-        )
-        print(f"scale-up-predictive: observedLoadFactor={load} ✓")
+        ${
+          if controllerIsSystemd then
+            ''
+              # kwok-only: rio-store pods are KWOK-faked (no real
+              # GetLoad endpoint, no kube-dns). The /scale patch above
+              # already proved the predictive path; observedLoadFactor
+              # is logged-only here. The store.admin.get-load r[verify]
+              # marker stays on vm-substitute-scale-k3s.
+              print(f"componentscaler: observedLoadFactor={load!r} (kwok-only — not asserted)")
+            ''
+          else
+            ''
+              assert load != "", (
+                  "observedLoadFactor empty — controller couldn't reach any "
+                  "rio-store-headless endpoint for GetLoad. Check cross-ns "
+                  "DNS (loadEndpoint FQDN) and store-admin TLS."
+              )
+              print(f"scale-up-predictive: observedLoadFactor={load} ✓")
+            ''
+        }
 
     # ── restart-preserves-ratio: controller restart ≠ seed reset ─────
     # The exit criterion: learnedRatio persists in .status across
@@ -253,20 +274,39 @@ pkgs.testers.runNixOSTest {
         # anchor to the OLD controller's second-to-last write — the
         # poll loop then breaks on its LAST write and `after` is read
         # before the NEW controller has reconciled at all.
-        old_pod = kubectl(
-            "get pod -l app.kubernetes.io/name=rio-controller "
-            "-o jsonpath='{.items[0].metadata.name}'",
-        ).strip()
-        kubectl(f"delete pod {old_pod} --wait=true")
-        rv_before = int(kubectl(
-            "get componentscaler store -o jsonpath='{.metadata.resourceVersion}'",
-            ns="${nsStore}",
-        ).strip())
-        k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${ns} wait --for=condition=Ready "
-            "pod -l app.kubernetes.io/name=rio-controller --timeout=120s",
-            timeout=130,
-        )
+        ${
+          if controllerIsSystemd then
+            ''
+              # kwok-only: the chart-rendered controller Deployment's pod
+              # is KWOK-faked; the REAL process is a systemd unit. Restart
+              # that. rv_before captured AFTER the unit is back so the RV
+              # poll below can't anchor to a stale write (mirrors the
+              # `--wait=true` ordering in the k3s arm).
+              k3s_server.succeed("systemctl restart rio-controller.service")
+              k3s_server.wait_for_unit("rio-controller.service")
+              rv_before = int(kubectl(
+                  "get componentscaler store -o jsonpath='{.metadata.resourceVersion}'",
+                  ns="${nsStore}",
+              ).strip())
+            ''
+          else
+            ''
+              old_pod = kubectl(
+                  "get pod -l app.kubernetes.io/name=rio-controller "
+                  "-o jsonpath='{.items[0].metadata.name}'",
+              ).strip()
+              kubectl(f"delete pod {old_pod} --wait=true")
+              rv_before = int(kubectl(
+                  "get componentscaler store -o jsonpath='{.metadata.resourceVersion}'",
+                  ns="${nsStore}",
+              ).strip())
+              k3s_server.wait_until_succeeds(
+                  "k3s kubectl -n ${ns} wait --for=condition=Ready "
+                  "pod -l app.kubernetes.io/name=rio-controller --timeout=120s",
+                  timeout=130,
+              )
+            ''
+        }
 
         # The reconciler skips status writes when computed values are
         # unchanged (status_changed(), componentscaler/mod.rs:228). A
