@@ -326,6 +326,23 @@ const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_se
 ///   self-heal) is what tests pin, not the number.
 pub(crate) const DISPATCH_PROBE_TICK_QUOTA: usize = 2048;
 
+/// Wall-clock ceiling for the phase-17 ready-cache sweep's on-actor
+/// `FindMissingPaths` (and its on-actor siblings — the phase-12
+/// orphan-output probe, the per-outcome `reprobe_live_wanted_paths`).
+/// Named `SELF_FENCE_AFTER/2` (= 5.5 s): the threshold past which the
+/// pre-guard-isolated lease shape would have starved a renew, and the
+/// budget the phase-17 WARN names. With sh-044's candidate filter the
+/// steady-state set is the freshly-Ready frontier only (≪ 1047), so
+/// this is defense-in-depth — it bounds the cold-merge / store-slow
+/// tail at the same threshold the existing skip already guards. On
+/// expiry the unprobed tail fails open: the next `probe_generation`
+/// re-admits it (Ready dispatches from source via the normal drain).
+///
+/// `checked_div(2).unwrap()` is const-stable since 1.58 / `unwrap`
+/// since 1.83; `SELF_FENCE_AFTER` = 11 s → 5_500_000_000 ns exactly.
+pub(crate) const DISPATCH_PROBE_SWEEP_BUDGET: std::time::Duration =
+    rio_lease::SELF_FENCE_AFTER.checked_div(2).unwrap();
+
 /// Concurrency ceiling for the per-tenant store-probe fan-out (the
 /// sweep's wall-clock is owned by its `AttemptBudget`, not this knob;
 /// this only caps simultaneous in-flight FindMissingPaths RPCs so a

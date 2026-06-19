@@ -136,19 +136,20 @@ impl DagActor {
         // `DISPATCH_PROBE_TICK_QUOTA` ledger already bounds the FMP
         // batch; this WARN names the residual (the
         // `complete_ready_from_store_batch` 3× serial PG awaits) when
-        // it crosses `SELF_FENCE_AFTER/2 = 5.5s`, the threshold past
-        // which the pre-guard shape would have starved a renew.
+        // it crosses `DISPATCH_PROBE_SWEEP_BUDGET` (= 5.5s), the
+        // threshold past which the pre-guard shape would have starved
+        // a renew.
         let t0 = std::time::Instant::now();
         let _ = self.batch_probe_cached_ready().await;
         let elapsed = t0.elapsed();
-        if elapsed * 2 > rio_lease::SELF_FENCE_AFTER {
+        if elapsed > super::DISPATCH_PROBE_SWEEP_BUDGET {
             tracing::warn!(
                 ?elapsed,
-                budget_secs = rio_lease::SELF_FENCE_AFTER.as_secs_f64() / 2.0,
-                "17-ready-cache-sweep exceeded SELF_FENCE_AFTER/2; the lease is \
-                 guard-isolated so this no longer self-fences, but the dag-actor \
-                 is head-of-line blocked — the quota-deferred tail is served by \
-                 the next probe_generation"
+                budget_secs = super::DISPATCH_PROBE_SWEEP_BUDGET.as_secs_f64(),
+                "17-ready-cache-sweep exceeded DISPATCH_PROBE_SWEEP_BUDGET; the \
+                 lease is guard-isolated so this no longer self-fences, but the \
+                 dag-actor is head-of-line blocked — the quota-deferred tail is \
+                 served by the next probe_generation"
             );
         }
     }
@@ -346,8 +347,25 @@ impl DagActor {
         // arm. Worst-case actor stall: 1 x grpc_timeout regardless of
         // tenant count — inherited by any future partitioning of the
         // probe groups by construction.
+        //
+        // sh-044: capped at `DISPATCH_PROBE_SWEEP_BUDGET` (= 5.5 s).
+        // Candidates are stamped at `probed_generation` BEFORE the FMP
+        // fires; with a within-quota single-tenant batch the RPC is
+        // all-or-nothing under `tokio::time::timeout(attempt_bound)` —
+        // a >5.5 s store yields `ProbeOutcome::TimedOut` with NO
+        // partial answer (`answers.is_empty()` → early return below),
+        // so neither `locally_present` nor `to_create_job` makes
+        // progress that tick. Fail-open (Ready dispatches from source
+        // via the normal drain); under nominal store latency
+        // (~100 ms/1k) headroom is ~50×. The oldest-first self-heal
+        // is the OVER-QUOTA truncation mechanism (sort by
+        // `probed_generation`, leave the tail unstamped) and only
+        // applies when `candidates.len() > DISPATCH_PROBE_TICK_QUOTA`
+        // — it does NOT shard a within-quota batch.
         // r[impl sched.dispatch.probe-budget]
-        let budget = rio_common::transport::AttemptBudget::new(self.grpc_timeout);
+        let budget = rio_common::transport::AttemptBudget::new(
+            self.grpc_timeout.min(super::DISPATCH_PROBE_SWEEP_BUDGET),
+        );
         let probes: Vec<(Option<Uuid>, tonic::Request<FindMissingPathsRequest>)> = probe_groups
             .into_iter()
             .map(|(tenant, store_paths)| {
@@ -519,12 +537,13 @@ impl DagActor {
         // helper, no enclosing transaction (design §2.1 row 3).
         // sh-007c S5: one fenced batch over `to_create_job` (was N
         // serial `begin_fenced` round-trips). Defense-in-depth: skip
-        // when the sweep has already crossed `SELF_FENCE_AFTER/2` —
-        // the lease loop is guard-isolated so this no longer
-        // self-fences, but the batch's commit is best skipped past the
-        // budget the WARN above names; the next probe_generation
-        // re-probes (self-healing, no carrier at stake on this lane).
-        if started.elapsed() * 2 <= rio_lease::SELF_FENCE_AFTER {
+        // when the sweep has already crossed
+        // `DISPATCH_PROBE_SWEEP_BUDGET` — the lease loop is
+        // guard-isolated so this no longer self-fences, but the
+        // batch's commit is best skipped past the budget the WARN
+        // above names; the next probe_generation re-probes
+        // (self-healing, no carrier at stake on this lane).
+        if started.elapsed() <= super::DISPATCH_PROBE_SWEEP_BUDGET {
             self.create_materialization_jobs_batch(
                 &to_create_job,
                 crate::state::JobOrigin::CacheOpportunity,
