@@ -630,10 +630,32 @@ pub struct SizingCfg {
     pub budget: u32,
     pub fuse_cache_bytes: u64,
     /// sh-043: the third law term — `max_inflight_unlaunched −
-    /// |{live: Launched≠True}| − created.len()` (this-tick-so-far).
-    /// `cover_deficit` recomputes per cell from the same accumulator
-    /// `created_cores` reads. Tests pass `u32::MAX` for the no-op.
+    /// |{live: Launched≠True ∧ ¬registered ∧ ¬terminating}| −
+    /// created.len()` (this-tick-so-far). `cover_deficit` recomputes
+    /// per cell from the same accumulator `created_cores` reads.
+    /// Tests pass `u32::MAX` (the [`Default`]) for the no-op.
     pub inflight_headroom: u32,
+}
+
+/// Test-side defaults so per-field additions don't fan out across the
+/// 8 inline `SizingCfg { … }` literals (sh-043-r1: adding
+/// `inflight_headroom` produced 8 mechanical `u32::MAX` hunks). The
+/// `256*GI`/`450*GI` node caps and `u32::MAX` headroom are the values
+/// every existing site re-stated; per-test variation goes in the
+/// struct-update spread.
+#[cfg(test)]
+impl Default for SizingCfg {
+    fn default() -> Self {
+        const GI: u64 = 1 << 30;
+        Self {
+            max_node_cores: 64,
+            max_node_mem: 256 * GI,
+            max_node_disk: 450 * GI,
+            budget: u32::MAX,
+            fuse_cache_bytes: 0,
+            inflight_headroom: u32::MAX,
+        }
+    }
 }
 
 /// Per-claim `(cores, mem, ephemeral-storage)` requests covering `u`'s
@@ -771,6 +793,20 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
             over_cap: over,
         };
     }
+    // sh-043: when headroom is already exhausted (live_unlaunched ≥
+    // cap, or earlier cells minted it dry) the FFD bin-search +
+    // affordability walk below would clamp to 0 anyway — skip the
+    // per-iteration intent clones, sim LiveNode allocs, and
+    // simulate() calls. Runs AFTER the over-cap warn loop so
+    // `reclassify_over_cap` still sees `over`; `min_eta=f64::MAX` is
+    // unread (the caller `continue`s on `claims.is_empty()`).
+    if cfg.inflight_headroom == 0 {
+        return Sizing {
+            claims: Vec::new(),
+            min_eta: f64::MAX,
+            over_cap: over,
+        };
+    }
     let (sum_c, sum_m, sum_d, max_c, max_m, max_d) = fits
         .iter()
         .map(|i| intent_pod_footprint(i, cfg.fuse_cache_bytes).as_triple())
@@ -797,19 +833,10 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
         .unwrap_or(n_hi);
     // r[impl ctrl.nodeclaim.mint-deficit-proportional+3]
     // sh-043: the three-term mint law — demand × budget ×
-    // inflight-headroom. The headroom term is a GLOBAL
-    // concurrent-unlaunched ceiling: under healthy launch throughput
-    // (`live_unlaunched≈0` between 10s ticks) it acts as a global
-    // ≈`max_inflight_unlaunched`/tick velocity cap matched to
-    // Karpenter's downstream launch rate; under backlog it tightens
-    // to zero so `Synced()=false` windows stay ≪ tick. live_049 L1's
-    // retired cap was per-CELL × arbitrary-8 × backlog-BLIND; this
-    // is GLOBAL (round-robin fair) × throughput-matched-50 ×
-    // backlog-ADAPTIVE — it bounds the `Synced()`-blocking
-    // population, which the L1 cap never targeted. The L1 cap
-    // stretched the live ramp to 18 ticks while protecting nothing:
-    // every claim it deferred was demanded (placeable-gated),
-    // budget-affordable, and right-sized.
+    // inflight-headroom. Rationale (healthy-throughput / backlog
+    // behavior, the L1-cap comparison) lives at the [`sizing`] doc
+    // comment and the spec rule body — one home each, not restated
+    // here (sh-043-r1).
     //
     // bug_062: affordability QUANTIFIES over the claim family.
     // `uniform_claim` is weakly decreasing in n down to
@@ -1243,11 +1270,9 @@ mod tests {
     fn cfg(max_node_cores: u32, budget: u32) -> SizingCfg {
         SizingCfg {
             max_node_cores,
-            max_node_mem: 256 * GI,
-            max_node_disk: 450 * GI,
             budget,
             fuse_cache_bytes: 50 * GI,
-            inflight_headroom: u32::MAX,
+            ..Default::default()
         }
     }
 
@@ -1284,12 +1309,9 @@ mod tests {
         // max_node_cores=1 → n_aff=100 (one claim per intent);
         // budget/chunk=1000/1=1000; only headroom varies.
         let scfg = |h: u32| SizingCfg {
-            max_node_cores: 1,
-            max_node_mem: 256 * GI,
-            max_node_disk: 450 * GI,
-            budget: 1000,
             fuse_cache_bytes: 0,
             inflight_headroom: h,
+            ..cfg(1, 1000)
         };
         let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &scfg(10));
         assert_eq!(
@@ -1310,7 +1332,8 @@ mod tests {
             "sh-043: headroom tightens under backlog — 5 unlaunched in \
              `live` ⇒ mint 5 (pre-fix RED: 100)"
         );
-        // headroom=0 ⇒ claims.is_empty() ⇒ the :2536 early-continue.
+        // headroom=0 ⇒ short-circuit before the FFD bin-search ⇒
+        // claims.is_empty() ⇒ cover_deficit's early-continue.
         let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &scfg(0));
         assert!(
             c.is_empty(),
@@ -1582,14 +1605,7 @@ mod tests {
             intent_hd("r1", 4, GI, GI, Some(true)),
         ];
         u.extend((0..2).map(|k| intent_hd(&format!("f{k}"), 6, GI, GI, Some(false))));
-        let scfg = SizingCfg {
-            max_node_cores: 10,
-            max_node_mem: 256 * GI,
-            max_node_disk: 450 * GI,
-            budget: u32::MAX,
-            fuse_cache_bytes: 50 * GI,
-            inflight_headroom: u32::MAX,
-        };
+        let scfg = cfg(10, u32::MAX);
         let refs: Vec<&SpawnIntent> = u.iter().collect();
         let Sizing { claims, .. } = sizing(&h_spot(), &refs, &scfg);
         assert!(
@@ -2873,18 +2889,7 @@ mod tests {
             claims,
             over_cap: over,
             ..
-        } = sizing(
-            &cell,
-            &u,
-            &SizingCfg {
-                max_node_cores: 64,
-                max_node_mem: 256 * GI,
-                max_node_disk: 450 * GI,
-                budget: u32::MAX,
-                fuse_cache_bytes: 0,
-                inflight_headroom: u32::MAX,
-            },
-        );
+        } = sizing(&cell, &u, &SizingCfg::default());
         assert!(
             claims.is_empty(),
             "premise: the intent was over-cap dropped"
@@ -3259,12 +3264,8 @@ mod mint_law_tests {
                     cell,
                     &refs,
                     &SizingCfg {
-                        max_node_cores: 64,
-                        max_node_mem: 256 * GI,
-                        max_node_disk: 450 * GI,
-                        budget: u32::MAX,
                         fuse_cache_bytes: 50 * GI,
-                        inflight_headroom: u32::MAX,
+                        ..Default::default()
                     },
                 )
                 .claims

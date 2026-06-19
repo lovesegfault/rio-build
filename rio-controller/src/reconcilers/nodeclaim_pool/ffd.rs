@@ -2723,11 +2723,8 @@ pub(crate) mod tests {
                         u,
                         &cover::SizingCfg {
                             max_node_cores: 16,
-                            max_node_mem: 256 * GI,
-                            max_node_disk: 450 * GI,
                             budget,
-                            fuse_cache_bytes: 0,
-                            inflight_headroom: u32::MAX,
+                            ..Default::default()
                         },
                     )
                     .claims
@@ -2921,12 +2918,8 @@ pub(crate) mod tests {
                         cell,
                         u,
                         &cover::SizingCfg {
-                            max_node_cores: 64,
-                            max_node_mem: 256 * GI,
-                            max_node_disk: 450 * GI,
                             budget,
-                            fuse_cache_bytes: 0,
-                            inflight_headroom: u32::MAX,
+                            ..Default::default()
                         },
                     )
                     .claims
