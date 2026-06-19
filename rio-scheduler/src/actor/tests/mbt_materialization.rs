@@ -990,12 +990,21 @@ impl MbtSystem {
                 // model's `completeReadyFromStore` ALSO covers the
                 // merge-time `apply_cached_hits` lane (unfiltered) — its
                 // own doc: "Job-carrying nodes that complete this way
-                // are closed by obsoleteOnProduced". Drive the
-                // production join-point both lanes call directly so the
-                // action's stated semantics ("a node whose live-wanted
-                // outputs are all present completes without any
-                // attempt") hold regardless of view state. The store
-                // seed is kept for downstream pin/reference writes.
+                // are closed by obsoleteOnProduced". Drive BOTH lanes
+                // (sh-044 r3): the dispatch-probe sweep with `present`
+                // populated (probe_generation advance +
+                // `sweep_ready_cached` + `batch_probe_cached_ready`'s
+                // locally-present filter — the lane the model
+                // ORIGINALLY exercised; a regression where the filter
+                // mis-stamps `probed_generation` on a present-path node
+                // is otherwise model-unreachable) AND the production
+                // join-point both lanes converge on, so the action's
+                // stated semantics ("a node whose live-wanted outputs
+                // are all present completes without any attempt") hold
+                // regardless of view state. `probe_sweep` seeds and
+                // clears the store itself; re-seed for the join-point's
+                // downstream pin/reference writes.
+                self.probe_sweep(&[], &present).await?;
                 for p in &present {
                     self.store.seed_with_content(p, b"mbt-present");
                 }

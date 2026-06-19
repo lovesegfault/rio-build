@@ -9798,7 +9798,7 @@ async fn assert_unclaimed_ages_out(
     assert!(
         !survived,
         "the age-out arm collects holder()=None && parked_until.\
-         is_none_or(|u| u <= now) && created_at.elapsed() > 3s → \
+         is_none_or(|u| u <= now) && created_at.elapsed() > 3×60s → \
          resolve_materialization_job(ResolvedFromSource) → \
          remove_settled evicts the entry (240s > 3×60s threshold); \
          pre-fix the phase-15 filter was parked_until.is_some_and(|u| \
@@ -9896,7 +9896,7 @@ async fn aged_out_survives_when_holder_some() -> TestResult {
 
 /// sh-044 r2 gate-refusal pin (origin axis): an aged-out
 /// `ChildlessLeaf` entry with `origin=Pruned` MUST stay in the view
-/// — `from_source_viable(ChildlessLeaf, Some(Pruned))=false`. A
+/// — `from_source_viable(ChildlessLeaf, Pruned)=false`. A
 /// refactor that drops the `from_source_viable` call from the
 /// aged-out arm (reverting to r1's unconditional resolve) passes
 /// every other grid cell: this and the `Holed` cell below are the
@@ -9940,6 +9940,106 @@ async fn aged_out_survives_when_evidence_holed() -> TestResult {
          `from_source_viable` gate must refuse (a previous-generation \
          child without a live voucher means from-source is NOT viable)"
     );
+    Ok(())
+}
+
+/// sh-044 r3 — *phase-15's per-tick PG-await budget is shared and
+/// bounded (R17: [`MAX_AGEOUT_PER_TICK`], violable + testable)*: the
+/// `moot_sweep_is_bounded_per_tick` pattern. Seeding CAP+1 aged-out
+/// entries resolves at most CAP on the first tick (the truncated
+/// remainder keeps its view entry — `classify_stalled` matches again)
+/// and the second tick drains it (level-triggered). A refactor that
+/// drops the truncate, flips `>` to `>=`, or evicts over-quota entries
+/// from the view passes every other grid cell (all single-entry).
+// r[verify sched.materialize.unclaimed-age-out]
+#[tokio::test]
+async fn phase15_per_tick_is_bounded() -> TestResult {
+    use crate::actor::materialize::MAX_AGEOUT_PER_TICK;
+    let n = MAX_AGEOUT_PER_TICK + 1;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            materialization: crate::config::MaterializationConfig {
+                max_attempts: 3,
+                attempt_deadline_secs: 60,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let generation = actor.serving_generation();
+    let hashes: Vec<String> = (0..n).map(|i| format!("p15bound-{i:05}")).collect();
+    // N pending jobs in ONE batched tx (the moot_sweep pattern).
+    // `classify_durable_evidence` is an aggregate over
+    // `derivation_edges` — zero edges → ChildlessLeaf regardless of
+    // whether the derivation row exists, so a fresh derivation_id is
+    // sufficient.
+    let drv_ids: Vec<Uuid> = (0..n).map(|_| Uuid::new_v4()).collect();
+    let rows: Vec<crate::db::materialization::NewJobRow<'_>> = drv_ids
+        .iter()
+        .zip(&hashes)
+        .map(|(drv, hash)| crate::db::materialization::NewJobRow {
+            derivation_id: *drv,
+            drv_hash: hash,
+            tenant_id: None,
+            origin: JobOrigin::CacheOpportunity,
+            priority: 0.0,
+            carried_realized_paths: None,
+        })
+        .collect();
+    let mut tx = db.pool.begin().await?;
+    let created = crate::db::SchedulerDb::create_materialization_jobs_in_tx(
+        &mut tx,
+        &rows,
+        generation.as_i64(),
+    )
+    .await?;
+    tx.commit().await?;
+    for ((hash, jc), drv) in hashes.iter().zip(&created).zip(&drv_ids) {
+        actor.test_inject_ready(hash, None, "x86_64-linux", false);
+        actor.dag.node_mut(hash).expect("just injected").db_id = Some(*drv);
+        let mut entry = crate::actor::materialize::JobViewEntry::test_unclaimed(jc.job_id);
+        entry.test_set_created_at(crate::state::RecoveredInstant::backdated(240));
+        actor
+            .materialization_jobs
+            .insert(DrvHash::from(hash.as_str()), entry);
+    }
+
+    let authority = actor.dag_authority().expect("always-leader test actor");
+    actor.tick_reevaluate_materialization_jobs(&authority).await;
+    let after_first: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs WHERE state = 'resolved_from_source'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        after_first as usize <= MAX_AGEOUT_PER_TICK,
+        "first tick resolves at most the cap (one shared per-tick \
+         classify_durable_evidence budget across both arms): {after_first}"
+    );
+    assert_eq!(
+        actor.materialization_jobs.iter().count(),
+        n - after_first as usize,
+        "the over-quota tail keeps its view entry for the next tick \
+         (truncate, NOT evict — classify_stalled matches again)"
+    );
+    assert!(
+        actor.materialization_jobs.iter().count() >= 1,
+        "CAP+1 seeded → at least one entry survives the first tick"
+    );
+    actor.tick_reevaluate_materialization_jobs(&authority).await;
+    let after_second: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs WHERE state = 'resolved_from_source'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        after_second as usize, n,
+        "second tick drains the remainder (level-triggered)"
+    );
+    assert_eq!(actor.materialization_jobs.iter().count(), 0);
     Ok(())
 }
 
