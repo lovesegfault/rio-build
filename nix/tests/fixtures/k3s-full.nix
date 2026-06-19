@@ -67,6 +67,7 @@ let
         ;
     };
   pulled = import ../../docker-pulled.nix { inherit pkgs; };
+  mkContainerdSeed = import ../../containerd-seed.nix { inherit pkgs; };
   ciliumImages = [
     pulled.cilium-agent
     pulled.cilium-operator-generic
@@ -160,6 +161,15 @@ in
   # gate. The two-node path is unchanged for le-*, lifecycle-recovery,
   # netpol, fetcher-split, prod-parity.
   singleNode ? false,
+  # issue #57 1f: pre-import the airgap image set at BUILD time
+  # (nix/containerd-seed.nix) instead of letting k3s's serial pre-kubelet
+  # goroutine do it at boot. The seed's content store is loop-mounted
+  # erofs overlaid under containerd's content dir + meta.db copied into
+  # place before k3s starts; `services.k3s.images` is emptied. Same
+  # mechanism class as r[infra.node.prebake-layer-warm]. Gated off by
+  # default while the lazy-unpack path is proven on one test (vm-cli-k3s);
+  # flip per-test in nix/tests/default.nix.
+  withContainerdSeed ? false,
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -255,6 +265,19 @@ let
   # mode vmTestsCov skips it entirely.
   ++ pkgs.lib.optional (gatewayEnabled && dockerImages ? dashboard) dockerImages.dashboard
   ++ extraImages;
+
+  # Full airgap set for THIS scenario variant (varies with extraImages /
+  # gatewayEnabled). When withContainerdSeed=false this feeds
+  # `services.k3s.images` on both nodes (the historical path). When
+  # withContainerdSeed=true it feeds mkContainerdSeed instead and
+  # `services.k3s.images` is emptied — see nix/containerd-seed.nix
+  # header for the runtime mount sequence.
+  airgapImageSet = [ k3sPinned.airgap-images ] ++ rioImages ++ ciliumImages;
+  containerdSeed = mkContainerdSeed {
+    name = "k3s-full";
+    images = airgapImageSet;
+  };
+  containerdRoot = "/var/lib/rancher/k3s/agent/containerd";
 
   # ── Containerd tmpfs sizing ──────────────────────────────────────────
   # Decompressed airgap layers: ~1.5GB normal, ~2.5GB cov-mode (the
@@ -383,11 +406,14 @@ let
       containerdConfigTemplate = k3sContainerdConfigTmpl;
     };
     swapDevices = [ ];
-    boot.kernelModules = [
-      "fuse"
-      "wireguard"
-    ];
-    boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
+    boot = {
+      kernelModules = [
+        "fuse"
+        "wireguard"
+      ];
+      supportedFilesystems = pkgs.lib.mkIf withContainerdSeed [ "erofs" ];
+      kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
+    };
 
     networking.firewall = {
       allowedTCPPorts = [
@@ -423,20 +449,79 @@ let
       "lxc*"
     ];
 
-    systemd.services.k3s.serviceConfig = {
-      # Pick the base_runtime_spec variant matching host /dev/kvm
-      # presence (k3s embeds containerd, so this runs pre-containerd).
-      # List form so it merges with the nixpkgs k3s module's preStart.
-      ExecStartPre = [ baseRuntimeSpec.pickExecStartPre ];
-      # containerd needs cgroup delegation for pod cgroups. Without:
-      # ContainerCreating forever.
-      Delegate = "yes";
-      # Drop the 1Hz retry spam during the ~180s airgap-import window
-      # (apiserver up, kubelet blocked on serial image import → node
-      # not yet registered). 182 lines/run pre-filter. "~" prefix =
-      # exclude matching from journal ingestion (systemd 253+) — never
-      # reaches console→serial→testlog. Other k3s logs unaffected.
-      LogFilterPatterns = "~Unable to set control-plane role label";
+    systemd = {
+      services.k3s.serviceConfig = {
+        # Pick the base_runtime_spec variant matching host /dev/kvm
+        # presence (k3s embeds containerd, so this runs pre-containerd).
+        # List form so it merges with the nixpkgs k3s module's preStart.
+        ExecStartPre = [ baseRuntimeSpec.pickExecStartPre ];
+        # containerd needs cgroup delegation for pod cgroups. Without:
+        # ContainerCreating forever.
+        Delegate = "yes";
+        # Drop the 1Hz retry spam during the ~180s airgap-import window
+        # (apiserver up, kubelet blocked on serial image import → node
+        # not yet registered). 182 lines/run pre-filter. "~" prefix =
+        # exclude matching from journal ingestion (systemd 253+) — never
+        # reaches console→serial→testlog. Other k3s logs unaffected.
+        LogFilterPatterns = "~Unable to set control-plane role label";
+      };
+
+      # issue #57 1f: mount the pre-imported content store + drop meta.db
+      # into place BEFORE k3s starts its embedded containerd. The parent
+      # ${containerdRoot} tmpfs is stage-1 (neededForBoot below), so by
+      # the time this oneshot runs the upper/work dirs can be mkdir'd on
+      # it. erofs loop-mount → ro lower; overlay upper stays ~empty
+      # (content store is append-only, airgapped test pulls nothing).
+      # meta.db is a plain copy onto tmpfs — boltdb opens O_RDWR+mmap,
+      # which would copy-up through an overlay anyway.
+      services.containerd-seed-mount = pkgs.lib.mkIf withContainerdSeed {
+        before = [ "k3s.service" ];
+        requiredBy = [ "k3s.service" ];
+        after = [ "local-fs.target" ];
+        unitConfig.DefaultDependencies = false;
+        path = [ pkgs.util-linux ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          set -eu
+          root=${containerdRoot}
+          content=$root/io.containerd.content.v1.content
+          mkdir -p /run/containerd-seed/lower $content \
+            $root/.content-upper $root/.content-work \
+            $root/io.containerd.metadata.v1.bolt
+          mount -t erofs -o loop,ro \
+            ${containerdSeed}/content.erofs /run/containerd-seed/lower
+          mount -t overlay overlay $content -o \
+            lowerdir=/run/containerd-seed/lower,upperdir=$root/.content-upper,workdir=$root/.content-work
+          cp ${containerdSeed}/meta.db $root/io.containerd.metadata.v1.bolt/meta.db
+        '';
+      };
+
+      # r[impl builder.seccomp.localhost-profile+3]
+      # Same tmpfiles delivery as the NixOS AMI (nix/nixos-node/hardening.nix):
+      # profiles are store paths, copied into kubelet's seccomp dir before k3s
+      # (and its embedded kubelet) starts. k3s passes `--root-dir
+      # /var/lib/kubelet` to kubelet, so the path matches EKS — no
+      # /var/lib/rancher indirection. By the time any pod schedules the file
+      # is guaranteed present; rio-controller emits Localhost without a wait.
+      # `C` (copy, not `L` symlink): runc opens the profile via the literal
+      # localhostProfile path; a /nix/store symlink would have a different
+      # store path on every fixture rebuild.
+      tmpfiles.rules = [
+        "d /var/lib/kubelet/seccomp/operator 0755 root root -"
+        "C /var/lib/kubelet/seccomp/operator/rio-builder.json 0644 root root - ${../../nixos-node/seccomp/rio-builder.json}"
+        "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${../../nixos-node/seccomp/rio-fetcher.json}"
+      ]
+      # Belt-and-suspenders for coverage mode: pre-empt kubelet's
+      # DirectoryOrCreate (which creates 0755 root:root) so the cov
+      # hostPath is world-writable regardless of pod UID. The helm
+      # chart's rio.podSecurityContext sets runAsUser: 0 under
+      # coverage (the primary fix), but image-UID drift would
+      # silently re-break profraw flush without this — tmpfiles runs
+      # at boot, before k3s.
+      ++ pkgs.lib.optional coverage "d /var/lib/rio/cov 0777 root root -";
     };
 
     # ── Containerd image store on tmpfs ────────────────────────────────
@@ -461,7 +546,7 @@ let
     # virtualisation.fileSystems (not plain fileSystems): qemu-vm.nix
     # does `fileSystems = mkVMOverride virtualisation.fileSystems`
     # (priority 10) — a plain `fileSystems.*` def is silently dropped.
-    virtualisation.fileSystems."/var/lib/rancher/k3s/agent/containerd" = {
+    virtualisation.fileSystems.${containerdRoot} = {
       fsType = "tmpfs";
       neededForBoot = true;
       options = [
@@ -476,30 +561,6 @@ let
       pkgs.grpc-health-probe # health-shared probe (lifecycle.nix)
       pkgs.wireguard-tools # `wg show cilium_wg0` (cilium-encrypt.nix)
     ];
-
-    # r[impl builder.seccomp.localhost-profile+3]
-    # Same tmpfiles delivery as the NixOS AMI (nix/nixos-node/hardening.nix):
-    # profiles are store paths, copied into kubelet's seccomp dir before k3s
-    # (and its embedded kubelet) starts. k3s passes `--root-dir
-    # /var/lib/kubelet` to kubelet, so the path matches EKS — no
-    # /var/lib/rancher indirection. By the time any pod schedules the file
-    # is guaranteed present; rio-controller emits Localhost without a wait.
-    # `C` (copy, not `L` symlink): runc opens the profile via the literal
-    # localhostProfile path; a /nix/store symlink would have a different
-    # store path on every fixture rebuild.
-    systemd.tmpfiles.rules = [
-      "d /var/lib/kubelet/seccomp/operator 0755 root root -"
-      "C /var/lib/kubelet/seccomp/operator/rio-builder.json 0644 root root - ${../../nixos-node/seccomp/rio-builder.json}"
-      "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${../../nixos-node/seccomp/rio-fetcher.json}"
-    ]
-    # Belt-and-suspenders for coverage mode: pre-empt kubelet's
-    # DirectoryOrCreate (which creates 0755 root:root) so the cov
-    # hostPath is world-writable regardless of pod UID. The helm
-    # chart's rio.podSecurityContext sets runAsUser: 0 under
-    # coverage (the primary fix), but image-UID drift would
-    # silently re-break profraw flush without this — tmpfiles runs
-    # at boot, before k3s.
-    ++ pkgs.lib.optional coverage "d /var/lib/rio/cov 0777 root root -";
   };
 
   # ── v6-only k3s node overlay ────────────────────────────────────────
@@ -541,7 +602,10 @@ let
         role = "server";
         clusterInit = true;
         inherit tokenFile;
-        images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
+        # withContainerdSeed: images already registered via the
+        # containerd-seed-mount oneshot above; an empty list makes k3s's
+        # serial pre-kubelet airgap goroutine return immediately.
+        images = if withContainerdSeed then [ ] else airgapImageSet;
         manifests = {
           # Cilium CNI — applied first (filename-alphabetical: `000-` sorts
           # before everything). Nothing else can schedule until cilium-agent
@@ -721,8 +785,9 @@ let
         serverAddr = "https://[${nodes.k3s-server.networking.primaryIPv6Address}]:6443";
         # Agent loads images into its OWN containerd. Pods scheduled
         # here need local images — this is where the second scheduler
-        # replica (antiAffinity) + maybe workers land.
-        images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
+        # replica (antiAffinity) + maybe workers land. withContainerdSeed:
+        # k3sBase's containerd-seed-mount already registered them.
+        images = if withContainerdSeed then [ ] else airgapImageSet;
         extraFlags = [
           "--node-ip"
           config.networking.primaryIPv6Address
