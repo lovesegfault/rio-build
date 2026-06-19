@@ -9,6 +9,12 @@
 //! `rio-system` is the one namespace NOT deleted, so internal auth
 //! Secrets (`rio-jwt-signing`, `rio-service-hmac`, `rio-postgres*`)
 //! survive; `rio-gateway-ssh` (tenant keys) is wiped explicitly.
+//!
+//! `--reset` is the lighter variant: same data resets (PG schema,
+//! S3 chunks, tenant SSH keys, leases) but the helm release STAYS.
+//! No `helm uninstall`, no namespace deletes, no NodeClaim drain
+//! wait. The deploy phase's `helm upgrade --wait` restores the
+//! replica counts that `reset` scaled to 0. Target wall-clock <2min.
 
 use std::collections::BTreeMap;
 
@@ -125,6 +131,131 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
             info!("k3s: PG/S3 are in-cluster; helm uninstall already cleared them");
         }
     }
+
+    Ok(())
+}
+
+/// `up --reset`: data-only reset that keeps the `rio` helm release.
+///
+/// vs `--wipe`: skips `helm uninstall`, namespace deletes, and the
+/// NodeClaim drain (the chart's NodePools stay, so Karpenter has
+/// nothing to reconcile). The controller stays running, so Pool CR
+/// finalizers clear themselves — no finalizer-strip needed.
+///
+/// Caller MUST run the Deploy phase after this returns: `helm
+/// upgrade --wait` is what restores `rio-store`/`rio-scheduler`
+/// replica counts and re-runs the migration Job against the empty
+/// schema. `UpOpts::phases()` enforces that by selecting
+/// `[Push, Deploy]` for `--reset`.
+pub(super) async fn reset(kind: ProviderKind) -> Result<()> {
+    let client = kube::client().await?;
+
+    // Capture PG URL up front — same reason as `run()`: the Secret
+    // is ExternalSecret-managed and we're about to scale the readers
+    // to 0, but here the ES CR stays so the Secret survives. Read it
+    // now anyway so a missing Secret surfaces before we've half-reset.
+    let pg_url = if matches!(kind, ProviderKind::Eks) {
+        kube::get_secret_key(&client, NS, "rio-postgres", "url").await?
+    } else {
+        None
+    };
+
+    // ── 1. Delete Pool CRs + force-delete builder Jobs ──────────────
+    // Pool delete first so the (still-running) controller starts
+    // draining and clears its own finalizer. Jobs are controller-
+    // created (not chart-owned); force-delete so we don't wait on
+    // running builds whose output is about to be thrown away.
+    ui::step("delete Pool CRs + builder Jobs", || async {
+        for &ns in &[NS_BUILDERS, NS_FETCHERS] {
+            k(&[
+                "-n",
+                ns,
+                "delete",
+                "pool",
+                "--all",
+                "--ignore-not-found",
+                "--wait=false",
+            ])
+            .await?;
+        }
+        k(&[
+            "-n",
+            NS_BUILDERS,
+            "delete",
+            "job",
+            "--all",
+            "--ignore-not-found",
+            "--force",
+            "--grace-period=0",
+            "--wait=false",
+        ])
+        .await?;
+        Ok(())
+    })
+    .await?;
+
+    // ── 2. Scale store + scheduler to 0 ─────────────────────────────
+    // Releases PG connections so DROP SCHEMA CASCADE doesn't block,
+    // and stops the scheduler from re-dispatching the Jobs we just
+    // deleted. helm upgrade (deploy phase) restores the chart's
+    // replica counts.
+    ui::step("scale rio-store/rio-scheduler → 0", || async {
+        for (ns, dep) in [(NS_STORE, "rio-store"), (NS, "rio-scheduler")] {
+            k(&["-n", ns, "scale", &format!("deploy/{dep}"), "--replicas=0"]).await?;
+        }
+        // `rollout status` returns immediately on a 0-replica spec
+        // even while old pods are Terminating; wait on the pods
+        // directly so PG conns are actually closed before step 3.
+        for (ns, dep) in [(NS_STORE, "rio-store"), (NS, "rio-scheduler")] {
+            k(&[
+                "-n",
+                ns,
+                "wait",
+                "--for=delete",
+                "pod",
+                "-l",
+                &format!("app.kubernetes.io/name={dep}"),
+                "--timeout=120s",
+            ])
+            .await?;
+        }
+        Ok(())
+    })
+    .await?;
+
+    // ── 3–4. Provider-specific data resets ──────────────────────────
+    match kind {
+        ProviderKind::Eks => {
+            match pg_url {
+                Some(url) => reset_pg_schema(&url).await?,
+                None => warn!(
+                    "rio-postgres Secret missing — skipping schema reset; \
+                     migration Job will fail if old tables remain"
+                ),
+            }
+            empty_chunk_buckets().await?;
+        }
+        ProviderKind::K3s => {
+            // TODO: in-cluster PG/rook reset without helm uninstall.
+            // For now --reset on k3s only clears Pool CRs/Jobs/leases;
+            // use --wipe for a full data reset.
+            warn!("k3s: --reset does not clear in-cluster PG/S3; use --wipe");
+        }
+    }
+
+    // ── 5. SSH secret + leader Leases ───────────────────────────────
+    // Same rationale as `run()` steps 3b/4.
+    ui::step("delete rio-gateway-ssh Secret", || async {
+        kube::delete_secret(&client, NS, "rio-gateway-ssh").await
+    })
+    .await?;
+    ui::step("delete stale leader Leases", || async {
+        for lease in ["rio-scheduler-leader", "rio-controller-nodeclaim-pool"] {
+            k(&["-n", NS, "delete", "lease", lease, "--ignore-not-found"]).await?;
+        }
+        Ok(())
+    })
+    .await?;
 
     Ok(())
 }

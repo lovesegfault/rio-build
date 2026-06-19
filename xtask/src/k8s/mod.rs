@@ -102,6 +102,15 @@ pub struct UpOpts {
     /// drift is also expected; `--wipe --ami` rebuilds the node image.
     #[arg(long)]
     wipe: bool,
+    /// Data-only reset that KEEPS the helm release: delete Pool CRs +
+    /// builder Jobs, scale store/scheduler to 0, drop the PG schema,
+    /// empty chunk buckets, delete the SSH secret + leader Leases,
+    /// then run `--push --deploy` so `helm upgrade --wait` restores
+    /// replicas and re-runs migrations. ~2min vs `--wipe`'s 13-50min
+    /// (no helm uninstall / namespace deletes / NodeClaim drain).
+    /// Incompatible with phase flags and with `--wipe`.
+    #[arg(long, conflicts_with = "wipe")]
+    reset: bool,
 
     // Namespaced per-phase opts. NO clap `requires` attribute —
     // validated at runtime by `validate_phase_opts()` so the
@@ -178,6 +187,14 @@ impl UpOpts {
                 .filter(|p| WIPE_BASE.contains(p) || self.has(*p))
                 .collect();
         }
+        if self.reset {
+            // --reset keeps the helm release → only push+deploy needed
+            // to bring the chart back to HEAD and restore replicas.
+            // Phase flags are rejected in validate_phase_opts (no
+            // additive escape hatch — reset's invariant is "infra
+            // untouched").
+            return vec![Phase::Push, Phase::Deploy];
+        }
         let any = Phase::ALL.iter().any(|&p| self.has(p));
         if !any {
             return Phase::ALL.to_vec();
@@ -192,6 +209,19 @@ impl UpOpts {
     /// explicit and `--deploy` isn't among them.
     fn validate_phase_opts(&self, selected: &[Phase]) -> Result<()> {
         let explicit = selected.len() != Phase::ALL.len();
+        // --reset narrows `selected` to [Push, Deploy] in `phases()`,
+        // so `explicit` is always true here — check the raw flags.
+        if self.reset && Phase::ALL.iter().any(|&p| self.has(p)) {
+            let flags: Vec<_> = Phase::ALL
+                .iter()
+                .filter(|&&p| self.has(p))
+                .map(|p| format!("--{}", p.name()))
+                .collect();
+            bail!(
+                "--reset implies --push --deploy; drop {} or drop --reset",
+                flags.join(" ")
+            );
+        }
         if !explicit {
             return Ok(());
         }
@@ -728,13 +758,17 @@ pub(super) async fn run_up(
         eks::init_backend(&cfg).await?;
     }
 
-    if o.wipe {
-        // wipe makes kube/kubectl/helm calls before the kubeconfig
-        // phase ever runs — same staleness, one layer up. Refresh
-        // first so wipe targets the cluster `tofu output` names, not
-        // whatever `.kube/config` was last written against.
+    if o.wipe || o.reset {
+        // wipe/reset make kube/kubectl/helm calls before the
+        // kubeconfig phase ever runs — same staleness, one layer up.
+        // Refresh first so they target the cluster `tofu output`
+        // names, not whatever `.kube/config` was last written against.
         ui::step("kubeconfig", || p.kubeconfig(&cfg)).await?;
-        wipe::run(kind).await?;
+        if o.wipe {
+            wipe::run(kind).await?;
+        } else {
+            wipe::reset(kind).await?;
+        }
     }
 
     ui::step("k8s up", || async move {
@@ -901,6 +935,27 @@ mod tests {
     }
 
     #[test]
+    fn reset_selects_push_deploy() {
+        let mut o = opts();
+        o.reset = true;
+        assert_eq!(o.phases(), vec![Phase::Push, Phase::Deploy]);
+        // bare --reset → OK (no explicit phase flags)
+        assert!(o.validate_phase_opts(&o.phases()).is_ok());
+    }
+
+    #[test]
+    fn reset_rejects_phase_flags() {
+        let mut o = opts();
+        o.reset = true;
+        o.ami = true;
+        let e = o.validate_phase_opts(&o.phases()).unwrap_err().to_string();
+        assert!(
+            e.contains("--reset implies --push --deploy") && e.contains("--ami"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn ami_arch_default_doesnt_trip_validation() {
         // --ami-arch defaults to All; validation should only fire on
         // a non-default value with explicit phases.
@@ -953,6 +1008,9 @@ mod tests {
             &[Kubeconfig, Push, Deploy]
         ));
         assert!(needs_upfront_backend_init(eks, true, &Phase::ALL));
+        // --reset selects [Push, Deploy] → no Bootstrap → init via the
+        // `!contains(Bootstrap)` arm; no signature change needed.
+        assert!(needs_upfront_backend_init(eks, false, &[Push, Deploy]));
 
         // Fresh-account bootstrap: bucket may not exist; provision
         // init's after bootstrap creates it. Skipping here keeps a
