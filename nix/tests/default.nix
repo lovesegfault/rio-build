@@ -1047,7 +1047,13 @@ in
   vm-cli-k3s =
     (cli {
       inherit pkgs common;
-      fixture = k3sFull { singleNode = true; };
+      # issue #57 1f: first (smallest) test on the pre-imported
+      # containerd seed. Once proven green, flip the rest and drop the
+      # `services.k3s.images` path from k3s-full.nix.
+      fixture = k3sFull {
+        singleNode = true;
+        withContainerdSeed = true;
+      };
     }).test;
 
   # ── k3s batch A (issue #57 1e: one boot, sequential groups) ──────────
