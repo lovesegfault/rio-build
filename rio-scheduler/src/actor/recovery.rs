@@ -2078,7 +2078,11 @@ impl DagActor {
         };
         let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         rio_proto::interceptor::inject_current(req.metadata_mut());
-        let grpc_timeout = self.grpc_timeout;
+        // sh-044: capped at `DISPATCH_PROBE_SWEEP_BUDGET` (= 5.5 s) —
+        // the on-actor sibling of the phase-17 cap. SINGLE caller
+        // (housekeeping.rs phase-12 expired-mat sweep); fail-open
+        // `StoreProbe::Unavailable` → phase-12 retries next tick.
+        let grpc_timeout = self.grpc_timeout.min(super::DISPATCH_PROBE_SWEEP_BUDGET);
         match tokio::time::timeout(grpc_timeout, client.find_missing_paths(req)).await {
             Ok(Ok(resp)) => {
                 self.cache_breaker.record_success();

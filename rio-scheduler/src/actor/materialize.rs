@@ -3965,11 +3965,19 @@ impl DagActor {
         let mut rows: Vec<(Vec<PathProbeCell>, bool)> = Vec::with_capacity(tenants.len());
         // One AttemptBudget prices the whole reprobe (bug_127, the
         // same law as the dispatch sweep): T tenants share a single
-        // grpc_timeout instead of paying it each; an expired budget
-        // poisons the answer exactly like a per-tenant failure (B3:
-        // a partial view must not confirm).
+        // budget instead of paying it each; an expired budget poisons
+        // the answer exactly like a per-tenant failure (B3: a partial
+        // view must not confirm). sh-044: capped at
+        // `DISPATCH_PROBE_SWEEP_BUDGET` (= 5.5 s) — the on-actor
+        // sibling of the phase-17 cap. A 5.5 s budget over T tenants
+        // in a serial loop means tenant 2+ may hit `budget.expired()`
+        // → `return None` → caller does `companion_release` (bare
+        // re-arm). Same as today's 30 s budget under a hung store,
+        // just earlier; benign (settlement is level-triggered).
         // r[impl sched.dispatch.probe-budget]
-        let budget = rio_common::transport::AttemptBudget::new(self.grpc_timeout);
+        let budget = rio_common::transport::AttemptBudget::new(
+            self.grpc_timeout.min(super::DISPATCH_PROBE_SWEEP_BUDGET),
+        );
         for tenant in tenants {
             if budget.expired() {
                 return None;
