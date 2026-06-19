@@ -4,27 +4,18 @@
 # default in values.yaml covers nil; the template MUST NOT shadow it
 # (the 47-template-default-ban single-default convention). Explicit 0
 # is the meaningful kill-switch the law's own doc treats as halt.
+#
+# r3: `required` because Sprig `int64 nil`/`float64 nil` coerce to 0 —
+# `--set …=null` would otherwise silently render the dangerous 0 (the
+# value values.yaml's own comment forbids). Helm `required` checks
+# nil/"" only, so explicit 0 still passes the guard.
 
-render_toml() {
-  helm template rio . \
-    --set karpenter.enabled=true \
-    --set karpenter.clusterName=ci \
-    --set karpenter.nodeRoleName=ci-role \
-    --set karpenter.amiTag=test \
-    --set global.image.tag=test \
-    --set postgresql.enabled=false \
-    "$@" \
-    | yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-controller-config")
-             | .data."controller.toml"'
-}
+. "$(dirname "$0")/_lib.sh"
 
-# `|| true` inside the pipelines: grep's no-match exit must reach the
-# DEDICATED failure message below, not die silently in a `set -e`
-# command substitution (the stdenv-pipefail trap; same guard as 39).
-extract() { { grep -E '^max_inflight_unlaunched = ' || true; } | grep -oE '[0-9]+' || true; }
-
-# Explicit 0 renders 0 (NOT the Sprig-swallowed 50).
-got=$(render_toml --set karpenter.nodeclaimPool.maxInflightUnlaunched=0 | extract)
+# Explicit 0 renders 0 (NOT the Sprig-swallowed 50; NOT a `required`
+# refusal — Helm `required` checks nil/"" only).
+got=$(render_controller_toml --set karpenter.nodeclaimPool.maxInflightUnlaunched=0 \
+  | toml_int_key max_inflight_unlaunched)
 test "$got" = "0" || {
   echo "FAIL: maxInflightUnlaunched=0 rendered max_inflight_unlaunched=$got, want 0" >&2
   echo "  (Sprig 'default N' treats integer 0 as empty — the operator's mint-halt" >&2
@@ -33,8 +24,30 @@ test "$got" = "0" || {
 }
 
 # Unset renders the values.yaml default (50).
-got=$(render_toml | extract)
+got=$(render_controller_toml | toml_int_key max_inflight_unlaunched)
 test "$got" = "50" || {
   echo "FAIL: unset maxInflightUnlaunched rendered $got, want values.yaml default 50" >&2
+  exit 1
+}
+
+# nil → render REFUSES (the planted-red gate leg). Without the
+# `required` wrapper, `int64 nil` / `float64 nil` coerce to 0.
+err=$TMPDIR/nil-guard.err
+if render_karpenter --set karpenter.nodeclaimPool.maxInflightUnlaunched=null >/dev/null 2>"$err"; then
+  echo "FAIL: maxInflightUnlaunched=null rendered — required guard fail-open (nil→0 is the mint-halt)" >&2
+  exit 1
+fi
+grep -q "maxInflightUnlaunched must be set" "$err" || {
+  echo "FAIL: maxInflightUnlaunched=null refused but without naming the key:" >&2
+  sed 's/^/  /' "$err" >&2
+  exit 1
+}
+if render_karpenter --set scheduler.sla.defaultLeadTimeSeed=null >/dev/null 2>"$err"; then
+  echo "FAIL: defaultLeadTimeSeed=null rendered — required guard fail-open (nil→0.0 reaps every NodeClaim before boot)" >&2
+  exit 1
+fi
+grep -q "defaultLeadTimeSeed must be set" "$err" || {
+  echo "FAIL: defaultLeadTimeSeed=null refused but without naming the key:" >&2
+  sed 's/^/  /' "$err" >&2
   exit 1
 }

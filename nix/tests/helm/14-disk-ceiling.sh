@@ -15,6 +15,8 @@
 # nvme hw-classes are exempt (instance-store, not this EBS volume) — this
 # only guards the rio-default EC2NodeClass.
 
+. "$(dirname "$0")/_lib.sh"
+
 # Mirror jobs.rs constants. headroom(n_eff) is bounded above by
 # headroom(1.0) = 1.25 + 0.7 = 1.95.
 OVERLAY_HEADROOM_PCT=195   # worst-case headroom(n_eff=1)
@@ -26,23 +28,15 @@ fuse=$(yq '.poolDefaults.fuseCacheBytes' values.yaml)
 # Render controller.toml — single source for both fuse_cache_bytes and
 # max_node_disk (the values cover::sizing actually reads).
 toml=$TMPDIR/ctrl.toml
-helm template rio . \
-  --set karpenter.enabled=true \
-  --set karpenter.clusterName=ci \
-  --set karpenter.nodeRoleName=ci-role \
-  --set karpenter.amiTag=test \
-  --set global.image.tag=test \
-  --set postgresql.enabled=false \
-  | yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-controller-config")
-           | .data."controller.toml"' >"$toml"
+render_controller_toml >"$toml"
 
-got_fuse=$(grep -E '^fuse_cache_bytes = ' "$toml" | grep -oE '[0-9]+')
+got_fuse=$(toml_int_key fuse_cache_bytes <"$toml")
 test "$got_fuse" = "$fuse" || {
   echo "FAIL: controller.toml fuse_cache_bytes=$got_fuse != poolDefaults.fuseCacheBytes=$fuse" >&2
   exit 1
 }
 
-max_node_disk=$(grep -E '^max_node_disk = ' "$toml" | grep -oE '[0-9]+')
+max_node_disk=$(toml_int_key max_node_disk <"$toml")
 need=$(( max_disk * OVERLAY_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
 
 test "$max_node_disk" -ge "$need" || {

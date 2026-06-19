@@ -7,15 +7,10 @@
 # template-side NotIn AND the controller-side metal_sizes are injected
 # from it. This check asserts both stay in lockstep.
 
+. "$(dirname "$0")/_lib.sh"
+
 karp=$TMPDIR/karp-metal.yaml
-helm template rio . \
-  --set karpenter.enabled=true \
-  --set karpenter.clusterName=ci \
-  --set karpenter.nodeRoleName=ci-role \
-  --set karpenter.amiTag=test \
-  --set global.image.tag=test \
-  --set postgresql.enabled=false \
-  >"$karp"
+render_karpenter >"$karp"
 
 # live_050(d): metal-96xl joined the partition list — its omission let
 # 96xl metal variants leak through the band classes' NotIn partition
@@ -59,9 +54,7 @@ done < <(yq -N 'select(.kind=="NodePool") | .metadata.name' "$karp")
 # this for the `instance-size In/NotIn` partition; if it drifts from the
 # NodePool NotIn list, a metal NodeClaim could resolve to a UEFI-pool
 # instance size or vice versa.
-ctrl_toml=$(yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-controller-config")
-                   | .data."controller.toml"' "$karp")
-ctrl_metal=$(printf '%s\n' "$ctrl_toml" \
+ctrl_metal=$(toml_body rio-controller-config controller.toml "$karp" \
   | grep '^metal_sizes' | sed 's/^metal_sizes = //' | jq -sc 'add // [] | sort')
 test "$ctrl_metal" = "$want" || {
   echo "FAIL: controller.toml metal_sizes ($ctrl_metal) != karpenter.metalSizes ($want)" >&2

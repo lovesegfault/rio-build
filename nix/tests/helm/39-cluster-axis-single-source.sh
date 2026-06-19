@@ -27,6 +27,8 @@
 #    (the shared-capable topology declaration) is enabled, via the
 #    rio.clusterIdentity helper both TOML lines include.
 
+. "$(dirname "$0")/_lib.sh"
+
 out=$TMPDIR/cluster-axis.yaml
 helm template rio . --set global.image.tag=test >"$out"
 
@@ -49,11 +51,7 @@ test "$strategy" = "Recreate" || {
 # load), not the values tree — a template typo cannot pass. `|| true`
 # inside the pipelines: grep's no-match exit must reach the DEDICATED
 # failure message below, not die silently in a `set -e` command
-# substitution (the stdenv-pipefail trap).
-toml_body() { # <configmap-name> <toml-key-file> <render-file>
-  yq -N "select(.kind==\"ConfigMap\" and .metadata.name==\"$1\") | .data.\"$2\"" "$3"
-}
-
+# substitution (the stdenv-pipefail trap). `toml_body` from _lib.sh.
 toml_cluster() { # <configmap-name> <toml-key-file> <render-file>
   toml_body "$1" "$2" "$3" \
     | { grep -E '^cluster = ' || true; } | head -1 | sed -E 's/^cluster = "(.*)"$/\1/'
