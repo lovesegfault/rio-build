@@ -9680,19 +9680,23 @@ fn recovered_row_with_infinite_park_does_not_panic() {
     ));
 }
 
-/// Shared body of the sh-044 unclaimed-age-out predicate grid. Seeds
-/// one entry under a 3×1s threshold, varies the three predicate
-/// conjuncts (holder, parked_until, created_at backdate), runs
-/// phase-15, and returns whether the entry SURVIVED (still in the
-/// view + durable row still pending). The age-out arm's
-/// `from_source_viable` gate sees `ChildlessLeaf` (the test
-/// derivation has zero children) × `CacheOpportunity` → viable, so
-/// the predicate alone is the variable under test.
+/// Shared body of the sh-044 unclaimed-age-out grid. Seeds one entry
+/// under a 3×60s threshold, varies the three predicate conjuncts
+/// (holder, parked_until, created_at backdate) AND the two
+/// `from_source_viable` gate inputs (origin, evidence — via
+/// `seed_holed_child`), runs phase-15, and returns whether the entry
+/// SURVIVED (still in the view + durable row still pending). With
+/// `origin=CacheOpportunity` and `seed_holed_child=false` the gate
+/// sees `ChildlessLeaf × CacheOpportunity` → viable, so the predicate
+/// alone is the variable under test; the gate-refusal cells set one
+/// of the two.
 async fn run_age_out_predicate(
     hash: &str,
     backdate_secs: u64,
     parked_until: Option<std::time::Instant>,
     holder: Option<crate::state::ExecutorId>,
+    origin: JobOrigin,
+    seed_holed_child: bool,
 ) -> anyhow::Result<bool> {
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
@@ -9701,7 +9705,11 @@ async fn run_age_out_predicate(
         DagActorConfig {
             materialization: crate::config::MaterializationConfig {
                 max_attempts: 3,
-                attempt_deadline_secs: 1,
+                // 60s slack convention (recovered_instant.rs:101): the
+                // predicate's std::Instant comparison is un-mockable —
+                // 1s margins are the ci-failure-patterns.md
+                // 'Wall-clock gate under load' class.
+                attempt_deadline_secs: 60,
                 ..Default::default()
             },
             ..Default::default()
@@ -9709,8 +9717,15 @@ async fn run_age_out_predicate(
     );
     let drv = insert_test_derivation_local(&db.pool, hash).await?;
     // The age-out arm's `from_source_viable` gate reads
-    // `dag.node(..).db_id` → `classify_durable_evidence` (zero
-    // children → `ChildlessLeaf`) → viable for `CacheOpportunity`.
+    // `dag.node(..).db_id` → `classify_durable_evidence`. Zero
+    // children → `ChildlessLeaf`. `seed_holed_child` adds one
+    // 'completed' child WITH NO live co-owning build voucher
+    // (`CHILD_PRODUCED_SQL=true ∧ CHILD_LIVE_VOUCHER_SQL=false`) →
+    // `Holed`.
+    if seed_holed_child {
+        let child = insert_pg_derivation(&db.pool, &format!("{hash}-child"), "completed").await?;
+        pg_edge(&db.pool, drv, child).await?;
+    }
     actor.test_inject_ready(hash, None, "x86_64-linux", false);
     actor.dag.node_mut(hash).expect("just injected").db_id = Some(drv);
     let created = sdb(&db.pool)
@@ -9718,7 +9733,7 @@ async fn run_age_out_predicate(
             drv,
             hash,
             None,
-            JobOrigin::CacheOpportunity,
+            origin,
             None,
             0.0,
             actor.serving_generation(),
@@ -9727,7 +9742,7 @@ async fn run_age_out_predicate(
     let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("job create must apply");
     };
-    let mut entry = crate::actor::materialize::JobViewEntry::test_unclaimed(job_id);
+    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None, origin);
     // RecoveredInstant::backdated (the DebugBackdate* mechanism) —
     // NOT tokio::time::pause()/advance(): RecoveredInstant.elapsed()
     // reads std::time::Instant which tokio's paused clock cannot
@@ -9757,20 +9772,29 @@ async fn run_age_out_predicate(
 }
 
 /// Positive-path wrapper: the two `is_none_or(|u| u <= now)` arms
-/// (never-parked and park-expired) at 4s > 3×1s threshold, no holder.
+/// (never-parked and park-expired) at 240s > 3×60s threshold, no
+/// holder, viable gate inputs.
 async fn assert_unclaimed_ages_out(
     hash: &str,
     parked_until: Option<std::time::Instant>,
 ) -> TestResult {
-    let survived = run_age_out_predicate(hash, 4, parked_until, None).await?;
+    let survived = run_age_out_predicate(
+        hash,
+        240,
+        parked_until,
+        None,
+        JobOrigin::CacheOpportunity,
+        false,
+    )
+    .await?;
     assert!(
         !survived,
         "the age-out arm collects holder()=None && parked_until.\
          is_none_or(|u| u <= now) && created_at.elapsed() > 3s → \
          resolve_materialization_job(ResolvedFromSource) → \
-         remove_settled evicts the entry; pre-fix the phase-15 filter \
-         was parked_until.is_some_and(|u| u > now) only — never-parked \
-         AND park-expired entries excluded"
+         remove_settled evicts the entry (240s > 3×60s threshold); \
+         pre-fix the phase-15 filter was parked_until.is_some_and(|u| \
+         u > now) only — never-parked AND park-expired entries excluded"
     );
     Ok(())
 }
@@ -9817,10 +9841,18 @@ async fn park_expired_unclaimed_job_ages_out_to_from_source() -> TestResult {
 // r[verify sched.materialize.unclaimed-age-out]
 #[tokio::test]
 async fn aged_out_survives_under_threshold() -> TestResult {
-    let survived = run_age_out_predicate("ageout-fresh", 2, None, None).await?;
+    let survived = run_age_out_predicate(
+        "ageout-fresh",
+        0,
+        None,
+        None,
+        JobOrigin::CacheOpportunity,
+        false,
+    )
+    .await?;
     assert!(
         survived,
-        "2s ≤ 3×1s threshold: the age-out arm's `created_at.elapsed() \
+        "0s ≤ 3×60s threshold: the age-out arm's `created_at.elapsed() \
          > age_out_after` conjunct must NOT match a fresh entry"
     );
     Ok(())
@@ -9838,9 +9870,11 @@ async fn aged_out_survives_under_threshold() -> TestResult {
 async fn aged_out_survives_when_holder_some() -> TestResult {
     let survived = run_age_out_predicate(
         "ageout-held",
-        4,
+        240,
         None,
         Some(crate::state::ExecutorId::from("store-0-w0")),
+        JobOrigin::CacheOpportunity,
+        false,
     )
     .await?;
     assert!(
@@ -9848,6 +9882,55 @@ async fn aged_out_survives_when_holder_some() -> TestResult {
         "holder()=Some past the threshold: the partition's \
          `e.holder().is_some() → continue` guard must keep the \
          actively-claimed entry out of BOTH arms"
+    );
+    Ok(())
+}
+
+/// sh-044 r2 gate-refusal pin (origin axis): an aged-out
+/// `ChildlessLeaf` entry with `origin=Pruned` MUST stay in the view
+/// — `from_source_viable(ChildlessLeaf, Some(Pruned))=false`. A
+/// refactor that drops the `from_source_viable` call from the
+/// aged-out arm (reverting to r1's unconditional resolve) passes
+/// every other grid cell: this and the `Holed` cell below are the
+/// only pins that vary the gate inputs themselves.
+// r[verify sched.materialize.unclaimed-age-out]
+#[tokio::test]
+async fn aged_out_survives_when_origin_pruned() -> TestResult {
+    let survived =
+        run_age_out_predicate("ageout-pruned", 240, None, None, JobOrigin::Pruned, false).await?;
+    assert!(
+        survived,
+        "ChildlessLeaf+Pruned past the threshold: the age-out arm's \
+         `from_source_viable` gate must refuse (the bc84397f9 hazard \
+         — a pruned root's closure was deliberately dropped and must \
+         NOT evict-and-requeue)"
+    );
+    Ok(())
+}
+
+/// sh-044 r2 gate-refusal pin (evidence axis): an aged-out entry
+/// whose durable evidence is `Holed` MUST stay in the view —
+/// `from_source_viable(Holed, _)=false` regardless of origin. The
+/// 1-child seed (completed, no live co-owning build voucher) is the
+/// `CHILD_PRODUCED_SQL ∧ ¬CHILD_LIVE_VOUCHER_SQL` previous-generation
+/// shape.
+// r[verify sched.materialize.unclaimed-age-out]
+#[tokio::test]
+async fn aged_out_survives_when_evidence_holed() -> TestResult {
+    let survived = run_age_out_predicate(
+        "ageout-holed",
+        240,
+        None,
+        None,
+        JobOrigin::CacheOpportunity,
+        true,
+    )
+    .await?;
+    assert!(
+        survived,
+        "Holed evidence past the threshold: the age-out arm's \
+         `from_source_viable` gate must refuse (a previous-generation \
+         child without a live voucher means from-source is NOT viable)"
     );
     Ok(())
 }
