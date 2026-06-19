@@ -24,6 +24,36 @@
 # class, outside this close's grant; routed in the wave-log DONE
 # record, never silent). A stale entry fails; a NEW site fails.
 #
+# KNOWN FALSE-NEGATIVES (sh-043-r4, the §Nth-strike scoped retreat):
+# r2/r3 widened the operand class three times; r4 review found four
+# more shape gaps. Each is best-effort-unfixable in a per-line regex
+# scope-tracker — closing one opens another (r3 adding `if` to the
+# end-paired set introduced the inline `{{if}}{{end}}` over-count it
+# could not see). The lint stays at its r3 reach with the residual
+# population NAMED here, not chased:
+#   - `with required "…" $alias.X` / `with $alias.X` opens a
+#     .Values-rooted scope WITH_VALUES_RE cannot recognize (the
+#     `required` wrapper and a `$s := .Values.…` alias both defeat
+#     `with\s+(?:\$\.|\.)\s*Values`); bare `.k` inside reads as
+#     unscoped → exempt. The one live instance (scheduler.yaml
+#     `.probe.deadlineSecs` under `with required … $s.sla`) is carried
+#     in BURNDOWN below.
+#   - single-line `{{ if … }}…{{ end }}` inside a tracked `with` body
+#     net-+1s with_depth (the elif chain sees one action per line, so
+#     the same-line `end` is skipped); depth then leaks past the
+#     enclosing `with` and false-positives later range-item bare `.X`.
+#   - a `range` nested under `with .Values` puts range-ITEM fields at
+#     with_depth>0, so `{{ .itemField | default LIT }}` flags a
+#     documented-legal list-entry default (lines above: list entries
+#     have no values.yaml home).
+#   - bare→bare fallthrough inside `with .Values` (`.name | default
+#     .fallbackName`) trips: the fallback exemption only recognizes
+#     `.Values.`/`$…Values.` prefixes, not the with-scoped bare form.
+# None of the latter three has a live template line today; the first
+# is BURNDOWN-carried. Regex scope-tracking is best-effort; the
+# structural close is values.schema.json (Helm-native nullability) or
+# a helm-template AST walk — carry to r28.
+#
 # Self-test (W11-CB): the planted literal-default on a direct .Values
 # ref and on a values-bound alias must both fire; the range-var,
 # fallthrough, and null-guard plants must not — the check cannot pass
@@ -62,7 +92,16 @@ BURNDOWN = {
     ("templates/controller.yaml", ".Values.karpenter.nodeclaimPool.leaseName"),
     ("templates/rbac.yaml", ".Values.karpenter.nodeclaimPool.leaseName"),
     ("templates/rbac.yaml", ".Values.scheduler.leaseName"),
+    # sh-043-r4: the one live instance the `with required … $s.sla`
+    # false-negative (KNOWN FALSE-NEGATIVES above) hides — carried by
+    # name so its retirement is a reviewable BURNDOWN shrink, not a
+    # silent classifier hole. The scanner does NOT see this site
+    # (with_depth stays 0), so the stale-entry sweep below would flag
+    # it as unseen; BURNDOWN_INVISIBLE marks entries the classifier
+    # structurally cannot reach.
+    ("templates/scheduler.yaml", ".probe.deadlineSecs"),
 }
+BURNDOWN_INVISIBLE = {("templates/scheduler.yaml", ".probe.deadlineSecs")}
 
 
 def scan(path, text):
@@ -148,6 +187,12 @@ for f in sorted(pathlib.Path("templates").glob("*.yaml")):
             f"owns the single default (the chart convention); drop the template "
             f"shadow and document the knob at its values.yaml home"
         )
+# BURNDOWN_INVISIBLE entries are structurally unreachable by scan() —
+# their stale check is a literal-grep presence test (so retirement IS
+# detectable, just not via the classifier).
+for path, key in sorted(BURNDOWN_INVISIBLE):
+    if f"default 3600 {key}" in pathlib.Path(path).read_text():
+        seen_burn.add((path, key))
 for stale in sorted(BURNDOWN - seen_burn):
     fails.append(
         f"{stale[0]}: stale burn-down entry `{stale[1]}` (the site was fixed) — "
