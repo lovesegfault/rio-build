@@ -151,24 +151,27 @@ fn fetcher_hardening_ignores_spec() {
         "fetchers never want kvm even if spec.features lists it"
     );
 
-    // Unset spec → ADR-019 default Some(false). Production EKS path.
-    // KNOWN-BROKEN against mountd's UDS gid-DAC check (0660 root:990
-    // host-side gid; userns remaps 990 → connect(2) EACCES) until
-    // reconciliation W01 lands Ed25519 mountd auth.
+    // Unset spec → Some(true). Production EKS path. Deliberately NOT
+    // the ADR-019 hostUsers:false posture: mountd's setup_staging
+    // chowns the 0700 staging dir to the SO_PEERCRED uid, which under a
+    // non-init userns is the kubelet-assigned host-side remap (~3B
+    // range) — the pod sees overflow-uid → create_partial() EACCES →
+    // EIO on every FOD. hostUsers:true until W01 makes mountd
+    // userns-aware (see effective_host_users).
     pool.spec.host_users = None;
     assert_eq!(
         test_pod_spec(&pool).host_users,
-        Some(false),
-        "Fetcher defaults hostUsers:false when spec is silent \
-         (ADR-019; mountd gid-DAC known broken until W01 Ed25519)"
+        Some(true),
+        "Fetcher defaults hostUsers:true when spec is silent \
+         (mountd staging chown is userns-blind until W01)"
     );
 
     // Explicit spec override still honored in both directions.
-    pool.spec.host_users = Some(true);
+    pool.spec.host_users = Some(false);
     assert_eq!(
         test_pod_spec(&pool).host_users,
-        Some(true),
-        "explicit spec hostUsers:true honored for Fetcher (k3s escape hatch)"
+        Some(false),
+        "explicit spec hostUsers:false honored for Fetcher"
     );
     pool.spec.host_users = None;
 
@@ -191,6 +194,47 @@ fn fetcher_hardening_ignores_spec() {
     );
     let tol = &spec.tolerations.as_ref().unwrap()[0];
     assert_eq!(tol.key.as_deref(), Some(rio_common::k8s::FETCHER_TAINT_KEY));
+}
+
+/// Regression: ce964b8ab (rebased 576174d0f) carried the "default
+/// fetcher pods to hostUsers:true" message but the body hunk was
+/// inverted at c85 — the rebase took fs's `false` per the resolved
+/// hostUsers decision without noting Jörg's `true` was load-bearing
+/// for mountd's userns-blind staging chown. Fetcher at
+/// `hostUsers:false` → mountd chowns 0700 staging to the SO_PEERCRED
+/// host uid (userns-remapped, ~3B) → pod sees overflow-uid → EACCES →
+/// EIO on every FOD.
+///
+/// This test isolates the DEFAULT path (`spec.host_users = None`) for
+/// both kinds; `fetcher_hardening_ignores_spec` above covers the
+/// explicit-override arms.
+// r[verify ctrl.pool.fetcher-hardening+4]
+#[test]
+fn host_users_default_by_kind() {
+    // Fetcher: spec silent → Some(true). Production EKS path
+    // (deploy.rs fetcher entries set hostUsers:null so this
+    // reconciler default is authoritative).
+    let fetcher = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+    assert_eq!(fetcher.spec.host_users, None, "fixture precondition");
+    assert_eq!(
+        test_pod_spec(&fetcher).host_users,
+        Some(true),
+        "Fetcher default MUST be hostUsers:true until W01 — mountd \
+         setup_staging chown is userns-blind (SO_PEERCRED host uid)"
+    );
+
+    // Builder: spec silent → Some(false) via the `.or_else` fallback
+    // at the call site (ADR-012 userns isolation). Production
+    // builders override to true via helm poolDefaults; the reconciler
+    // default stays false.
+    let builder = crate::fixtures::test_pool("b", ExecutorKind::Builder);
+    assert_eq!(builder.spec.host_users, None, "fixture precondition");
+    assert_eq!(
+        test_pod_spec(&builder).host_users,
+        Some(false),
+        "Builder default stays hostUsers:false (ADR-012; production \
+         overrides via helm poolDefaults, not here)"
+    );
 }
 
 /// D3a: `app.kubernetes.io/component` label is `rio-{kind}` so the

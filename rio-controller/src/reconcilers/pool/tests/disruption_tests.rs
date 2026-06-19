@@ -325,7 +325,7 @@ async fn warn_fires_for_every_degrade_check() {
 // r[verify ctrl.crd.host-users-network-exclusive]
 /// `DEGRADE_CHECKS[0]` (`HostUsersSuppressed`) is Builder-only. The
 /// pod.rs:327 suppression it mirrors only fires on the Builder path —
-/// Fetchers always get `Some(false)` from `effective_host_users`
+/// Fetchers always get `Some(true)` from `effective_host_users`
 /// (never omitted) and `host_network=None` forced. A pre-CEL
 /// `Fetcher{hostNetwork:true}` previously emitted a factually-wrong
 /// "hostUsers omitted" + unactionable "Set privileged:true"; now only

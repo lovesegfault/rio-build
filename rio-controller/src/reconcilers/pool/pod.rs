@@ -319,33 +319,33 @@ fn effective_seccomp(pool: &Pool) -> Option<SeccompProfileKind> {
     }
 }
 
-/// Default `hostUsers: false` for fetchers (ADR-019 userns isolation),
-/// HONORING the spec override.
+/// Default `hostUsers: true` for fetchers, HONORING the spec override.
 ///
-/// KNOWN-BROKEN against rio-mountd's gid-DAC UDS admission: the
-/// fetcher's castore session connects to rio-mountd's UDS, and mountd's
-/// only access control is the socket-file DAC check (0660 root:990, see
-/// [`EXECUTOR_RUN_AS_GROUP`]) against the connecting process's
-/// HOST-side gid. Under `hostUsers: false` the kubelet assigns the pod
-/// a non-init userns, gid 990 maps to some other host gid, and
-/// `connect(2)` fails EACCES — every FOD in the fleet fails. Until
-/// reconciliation W01 lands Ed25519-based mountd access control, the
-/// gid gate MUST NOT be treated as an authorization boundary for
-/// Fetcher pods running `hostUsers: false`; no other compensating
-/// control currently closes this gap. The k3s VM tests set
-/// `hostUsers: true` explicitly.
+/// Deliberately NOT the ADR-019 `hostUsers: false` posture: rio-mountd
+/// is userns-blind in two load-bearing places, and either one breaks
+/// every FOD when the fetcher runs in a non-init userns:
 ///
-/// Compensating controls while the gid gate is non-functional under
-/// userns: the forced Localhost `rio-fetcher.json` seccomp profile
-/// ([`effective_seccomp`]) and the rio-fetchers namespace
-/// NetworkPolicy.
+/// - **UDS admission** — the socket file is 0660 root:990
+///   ([`EXECUTOR_RUN_AS_GROUP`]); `connect(2)` checks the HOST-side
+///   gid, which the kubelet remaps under userns → EACCES at connect.
+/// - **Staging chown** — `setup_staging` chowns the 0700 per-build
+///   staging dir to the SO_PEERCRED uid/gid (host-side credentials);
+///   the pod sees overflow-uid on a 0700 dir → `create_partial()`
+///   EACCES → EIO.
 ///
-/// TODO: reconciliation W01 — Ed25519-based mountd access control
-/// replaces the socket-file gid gate, restoring authz under userns.
+/// Compensating controls while fetchers lack userns isolation: the
+/// forced Localhost `rio-fetcher.json` seccomp profile
+/// ([`effective_seccomp`]), `readOnlyRootFilesystem`, never-privileged,
+/// and the rio-fetchers namespace NetworkPolicy.
+///
+/// TODO(W01): once Ed25519-based mountd admission lands AND
+/// `setup_staging` resolves the peer through `/proc/<pid>/uid_map` (or
+/// uses 0770+gid / an idmapped staging mount), flip this back to
+/// `Some(false)` and drop the k3s VM-test `hostUsers: true` overrides.
 #[inline]
 fn effective_host_users(pool: &Pool) -> Option<bool> {
     if is_fetcher(pool) {
-        pool.spec.host_users.or(Some(false))
+        pool.spec.host_users.or(Some(true))
     } else {
         pool.spec.host_users
     }

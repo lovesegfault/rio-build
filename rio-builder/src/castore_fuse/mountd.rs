@@ -861,6 +861,16 @@ async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
     // peer uid: production builders run `hostUsers: true`, so every
     // executor presents host uid 0 and a per-uid gate would serialize
     // all builds on the node (see the spec's mountd rationale).
+    //
+    // TODO(W01): SO_PEERCRED is userns-blind — it reports the HOST-side
+    // uid/gid. When fetchers return to `hostUsers: false` under W01's
+    // Ed25519 admission, `setup_staging`'s 0700+chown(peer_uid) hands
+    // the staging dir to the userns-remapped host uid (~3B range); the
+    // pod sees overflow-uid → `create_partial()` EACCES → EIO. Before
+    // re-enabling fetcher userns, this must resolve the peer through
+    // `/proc/<pid>/uid_map`, or use 0770+gid, or an idmapped staging
+    // mount. See `effective_host_users` in rio-controller for the
+    // matching default.
     let creds = getsockopt(&fd, sockopt::PeerCredentials).context("SO_PEERCRED")?;
     let async_fd = AsyncFd::new(fd)?;
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<(Reply, Option<OwnedFd>)>();
