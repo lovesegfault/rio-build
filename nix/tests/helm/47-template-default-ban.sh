@@ -35,9 +35,18 @@ import re
 import sys
 
 ALIAS_RE = re.compile(r"\{\{-?\s*\$(\w+)\s*:=\s*\.Values[\w.]*")
+# sh-043-r2: function-form `(default <lit> X)` alternation. The pipe-form
+# regex alone missed the prefix-form Sprig 0-swallow that motivated 52
+# (and the adjacent defaultLeadTimeSeed). The operand population gains
+# `with`-scoped bare `.X` (a `with .Values.…` body) — same exemption
+# rules apply (range vars, fallthrough, null guard).
 DEFAULT_RE = re.compile(
     r"(\.Values\.[\w.]+|\$(\w+)\.[\w.]+)\s*\|\s*default\s+([^|}]+)"
+    r"|\(\s*default\s+(\S+)\s+(\.Values\.[\w.]+|\$(\w+)\.[\w.]+|\.(\w[\w.]*))\s*\)"
 )
+WITH_VALUES_RE = re.compile(r"\{\{-?\s*with\s+(?:\$\.|\.)\s*Values[\w.]*")
+WITH_END_RE = re.compile(r"\{\{-?\s*end\b")
+WITH_OTHER_RE = re.compile(r"\{\{-?\s*(?:with|range)\b")
 
 BURNDOWN = {
     ("templates/store.yaml", "$s.replicas"),
@@ -52,16 +61,31 @@ BURNDOWN = {
 def scan(path, text):
     aliases = set(ALIAS_RE.findall(text))
     hits = []
+    with_depth = 0  # >0 ⇔ inside a `with .Values.…` body (bare .X is .Values-rooted)
     for i, line in enumerate(text.splitlines(), 1):
         for m in DEFAULT_RE.finditer(line):
-            if m.group(2) and m.group(2) not in aliases:
+            if m.group(1):  # pipe-form: X | default LIT
+                operand, alias, fallback = m.group(1), m.group(2), m.group(3).strip()
+            else:  # function-form: (default LIT X)
+                operand, fallback = m.group(5), m.group(4).strip()
+                alias = m.group(6)
+                if m.group(7) and with_depth <= 0:
+                    continue  # bare .X outside `with .Values` — not .Values-rooted
+            if alias and alias not in aliases:
                 continue  # $x not bound to .Values (range vars etc.)
-            fallback = m.group(3).strip()
             if fallback.startswith(".Values.") or re.match(r"\$\w*\.Values\.", fallback):
                 continue  # documented fallthrough (values -> values)
             if fallback == '""':
                 continue  # null guard, not a default value
-            hits.append((path, i, m.group(1)))
+            hits.append((path, i, operand))
+        # Scope tracking AFTER the match (a `with` line's own body is the
+        # subsequent block; an `end` closes the block it sits in).
+        if WITH_VALUES_RE.search(line):
+            with_depth += 1
+        elif with_depth > 0 and WITH_OTHER_RE.search(line):
+            with_depth += 1  # nested with/range — its `end` does not pop our scope
+        elif with_depth > 0 and WITH_END_RE.search(line):
+            with_depth -= 1
     return hits
 
 
@@ -72,17 +96,24 @@ plant = (
     "other: {{ $v.c | default 4 }}\n"
     "fall: {{ .Values.m.n | default .Values.k.c | default \"\" | quote }}\n"
     "guard: {{ .Values.p.q | default \"\" | quote }}\n"
+    "fnform: {{ int64 (default 50 .Values.f.g) }}\n"
+    "fnfall: {{ int64 (default .Values.f.h .Values.f.g) }}\n"
+    "fnbare: {{ float64 (default 30.0 .bare) }}\n"
+    "{{- with .Values.sla }}\n"
+    "scoped: {{ float64 (default 30.0 .scopedKey) }}\n"
+    "{{- end }}\n"
     "{{- range .Values.pools }}\n"
     'p: {{ .policy | default "w" }}\n'
     "q: {{ $r.s | default 1 }}\n"
     "{{- end }}\n"
 )
 got = sorted(k for _, _, k in scan("planted.yaml", plant))
-if got != ["$v.c", ".Values.a.b"]:
+if got != ["$v.c", ".Values.a.b", ".Values.f.g", ".scopedKey"]:
     print(
         f"FAIL: default-ban self-test — classifier got {got}, want exactly the "
-        f"two planted literal-default .Values-rooted refs (fallthrough, null "
-        f"guard, and range plants exempt)",
+        f"four planted literal-default .Values-rooted refs (pipe + function "
+        f"form + with-scoped bare; fallthrough, null guard, range, and "
+        f"unscoped-bare plants exempt)",
         file=sys.stderr,
     )
     sys.exit(1)

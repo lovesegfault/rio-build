@@ -29,11 +29,11 @@ lease_name = {{ $.Values.karpenter.nodeclaimPool.leaseName | default "rio-contro
        Pending, zero alerts: the alerts are gated by the same toggle). */}}
 kube_build_scheduler_enabled = {{ $.Values.buildScheduler.enabled }}
 reference_hw_class = {{ .referenceHwClass | quote }}
-default_lead_time_seed = {{ printf "%.1f" (float64 (default 30.0 .defaultLeadTimeSeed)) }}
+default_lead_time_seed = {{ printf "%.1f" (float64 .defaultLeadTimeSeed) }}
 max_fleet_cores = {{ int64 .maxFleetCores }}
 {{- /* sh-043: NO Sprig default (treats integer 0 as empty, swallowing
        the 0 mint-halt). values.yaml owns the default per the
-       47-template-default-ban single-default convention; helm/51
+       47-template-default-ban single-default convention; helm/52
        asserts 0 renders 0. */}}
 max_inflight_unlaunched = {{ int64 $.Values.karpenter.nodeclaimPool.maxInflightUnlaunched }}
 max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
