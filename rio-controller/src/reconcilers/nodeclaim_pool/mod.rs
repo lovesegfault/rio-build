@@ -43,10 +43,8 @@ mod pods;
 pub mod sketch;
 pub(crate) mod wedge;
 
-/// sh-043-r2: the 7th in-fn redeclaration was the threshold — one
-/// shared test-side `1 << 30` for the module tree.
 #[cfg(test)]
-pub(super) const GI: u64 = 1 << 30;
+pub(super) use super::GI;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

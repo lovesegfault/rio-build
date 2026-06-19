@@ -3566,6 +3566,7 @@ pub(super) fn apply_intent_resources(
 mod tests {
     use super::*;
     pub(super) use crate::fixtures::{test_pool, test_sched_addrs, test_store_addrs};
+    use crate::reconcilers::GI;
 
     pub(super) fn intent(id: &str) -> SpawnIntent {
         SpawnIntent {
@@ -4055,7 +4056,6 @@ mod tests {
     /// and the FFD side (keyed on `SpawnIntent.kind`) to agree.
     #[test]
     fn footprint_matches_stamped_requests_fetcher() {
-        const GI: u64 = 1 << 30;
         let mut pool = test_pool("p", ExecutorKind::Fetcher);
         // Pre-CEL CR sets a per-pool override. Post-r35 this is silently
         // ignored — `pod::fuse_cache_bytes` reads the global OnceLock.
@@ -4125,7 +4125,6 @@ mod tests {
     /// deliberate diff, not as a silent packing regression.
     #[test]
     fn cold_start_fetcher_ephemeral_request_is_small() {
-        const GI: u64 = 1 << 30;
         // The scheduler's cold-start solve for a preferLocalBuild FOD
         // (every nixpkgs fetcher): cores=1, mem=2Gi, disk=1Gi, flat
         // 1.5× headroom (no fit ⇒ no variance-aware curve).
@@ -4366,7 +4365,6 @@ mod tests {
     // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     #[test]
     fn build_job_with_intent_computed_resources() {
-        const GI: u64 = 1 << 30;
         let pool = test_pool("eph-pool", ExecutorKind::Builder);
         let i = SpawnIntent {
             intent_id: "i-abc".into(),
@@ -4431,7 +4429,6 @@ mod tests {
     /// decreasing in `n`, so cold/noisy keys get more cushion.
     #[test]
     fn disk_headroom_factor_widens_ephemeral_request() {
-        const GI: u64 = 1 << 30;
         let pool = test_pool("p", ExecutorKind::Builder);
         let mk = |h: Option<f64>| {
             let i = SpawnIntent {
@@ -4493,7 +4490,6 @@ mod tests {
     /// the same value so they cannot drift even within one kind.
     #[test]
     fn fuse_cache_budget_matches_sizelimit() {
-        const GI: u64 = 1 << 30;
         let cfg_fuse = *pod::BUILDER_FUSE_CACHE
             .get()
             .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
@@ -4563,7 +4559,6 @@ mod tests {
     /// §sizing computes it scheduler-side as `headroom(n_eff)`).
     #[test]
     fn disk_backed_emptydir_sizelimits_fit_ephemeral_limit() {
-        const GI: u64 = 1 << 30;
         for kind in [ExecutorKind::Builder, ExecutorKind::Fetcher] {
             let pool = test_pool("p", kind);
             let i = SpawnIntent {

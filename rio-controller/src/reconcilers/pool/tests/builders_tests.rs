@@ -475,7 +475,7 @@ fn job_pod_overlays_volume_mounted() {
 
 // ── ADR-023 §13a ship-standalone wiring ──────────────────────────────
 
-const GIB: u64 = 1 << 30;
+use crate::reconcilers::GI as GIB;
 
 /// One `(h, cap)` cell as the scheduler's `cells_to_selector_terms`
 /// would emit it: an arbitrary `[sla.hw_classes.$h].labels` conjunction
