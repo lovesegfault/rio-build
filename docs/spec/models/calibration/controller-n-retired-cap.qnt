@@ -7,9 +7,16 @@
 // (deficitFullyMinted / provisioningBudget): a burst deficit within
 // budget (demand 2, budget 2, both slots free) mints only 1 under the
 // cap, so VDeficitDeferred latches — machine-checked evidence that
-// the re-targeted model RE-FINDS the retired-cap class if any pacing
-// term creeps back into the relation, and that the new leaf is not
-// vacuous for it. Kill isolation: the falsification runs through
+// the re-targeted model RE-FINDS the retired-cap class if an
+// UNCONDITIONAL flat per-cell-per-tick velocity term creeps back
+// into the relation (distinguished from the sh-043 GLOBAL
+// throughput-matched backlog-adaptive headroom, which is the lawful
+// third term), and that the new leaf is not vacuous for it. The
+// local strict 2-term predicate at :164-171 stays untouched (the
+// relaxed base predicate would ALSO catch flat-cap=1 since
+// MAX_INFLIGHT_UNLAUNCHED=2 > 1, but the local copy keeps
+// kill-isolation explicit). Kill isolation: the falsification runs
+// through
 // deficitFullyMinted's own conjunct (the budget conjuncts
 // VBudgetGlobal/VBudgetClass stay quiet — the cap under-mints, never
 // over-mints).

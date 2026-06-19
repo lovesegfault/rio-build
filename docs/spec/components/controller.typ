@@ -1827,12 +1827,13 @@ budget brake's rotation property upstream of the mint.
   m)` chunk is hostable by some instance in `h`'s `requirements` set;
   `cover_deficit` skips the tick when the global ceiling is not yet loaded
   (fail-closed, ≤300s self-heal). NodeClaim creation is bounded by the
-  two-term law `min(n, ⌊budget/chunk(n)⌋)` — demand (`n = n_pack`, the FFD
-  bin count over real placeable-gated footprints, or the first affordable
-  larger-`n` family member when `chunk(n_pack)` exceeds the budget) and the
-  `sla.maxFleetCores` fleet-budget brake, and by nothing else (the flat
-  `sla.maxNodeClaimsPerCellPerTick` per-tick cap is RETIRED, live_049 L1 —
-  its helm row is parse-only;
+  three-term law `min(n, ⌊budget/chunk(n)⌋, inflight_headroom)` — demand
+  (`n = n_pack`, the FFD bin count over real placeable-gated footprints, or
+  the first affordable larger-`n` family member when `chunk(n_pack)` exceeds
+  the budget), the `sla.maxFleetCores` fleet-budget brake, and the sh-043
+  concurrent-unlaunched headroom (the flat
+  `sla.maxNodeClaimsPerCellPerTick` per-tick cap stays RETIRED,
+  live_049 L1 — its helm row is parse-only;
   #rref("ctrl.nodeclaim.mint-deficit-proportional")); cells
   are iterated round-robin from a rotating start so no cell starves under
   sustained pressure.
@@ -1904,18 +1905,20 @@ budget brake's rotation property upstream of the mint.
   spot+od each hit it independently → 2× \$/hr exposure). `max_fleet_cores=None`
   ⇒ global budget only. The per-tick created-core accounting (global and
   per-class) MUST count only successful creates --- a failed NodeClaim
-  create consumes no budget. The budget brake and demand are the ONLY
-  mint bounds: the per-cell sizing law is
-  `ctrl.nodeclaim.mint-deficit-proportional`'s two-term bound (one
-  formula home, stated there --- the former flat per-cell-per-tick
-  cap is retired, live_049 L1).
+  create consumes no budget. The budget brake, demand, and the sh-043
+  inflight-headroom term are the THREE mint bounds: the per-cell
+  sizing law is `ctrl.nodeclaim.mint-deficit-proportional`'s
+  three-term bound (one formula home, stated there --- the former
+  flat per-cell-per-tick cap stays retired, live_049 L1).
 ]
 
-#r("ctrl.nodeclaim.mint-deficit-proportional+2")[
-  Minting MUST be bounded by demand and by the fleet budget --- the two
-  quantities with safety meaning --- and by NOTHING else: each cell's
-  per-tick claim count is `min(n, ⌊budget/chunk(n)⌋)`, where `n` is
-  the packing-minimal FFD bin count `n_pack` over the actual
+#r("ctrl.nodeclaim.mint-deficit-proportional+3")[
+  Minting MUST be bounded by demand, by the fleet budget, AND by the
+  concurrent-unlaunched headroom `max_inflight_unlaunched − |{live:
+  Launched≠True}|` --- the three quantities with safety meaning ---
+  and by NOTHING else: each cell's per-tick claim count is `min(n,
+  ⌊budget/chunk(n)⌋, inflight_headroom)`, where `n` is the
+  packing-minimal FFD bin count `n_pack` over the actual
   placeable-gated unplaced intents (right-sizing by construction)
   when `chunk(n_pack)` is affordable, else the FIRST affordable
   member of the weakly-decreasing uniform-claim family (the upward
@@ -1924,11 +1927,18 @@ budget brake's rotation property upstream of the mint.
   the family, because a zero mint under an affordable family leaves
   demand and headroom unchanged and repeats identically every tick
   (steady-state cell starvation, not deferral). `budget` is the
-  per-class fleet-core sub-budget. A deficit of `D` placeable-gated
-  chunks within budget MUST mint fully in ONE tick. The
-  truly-unaffordable arm (budget below the largest single-intent
-  footprint, the family's floor) MUST disclose with the same
-  operator trail as the dropping siblings (warn +
+  per-class fleet-core sub-budget. The headroom term is a GLOBAL
+  ceiling: under healthy launch throughput it acts as a
+  ≈`max_inflight_unlaunched`/tick velocity cap matched to Karpenter's
+  launch rate; under backlog it tightens to zero so `Synced()=false`
+  windows stay ≪ tick. The L1 velocity-cap retirement holds because
+  L1's cap was per-CELL × arbitrary-8 × backlog-blind whereas this is
+  GLOBAL × throughput-matched × backlog-adaptive. A deficit of `D`
+  placeable-gated chunks within budget MUST mint fully within
+  `⌈D/max_inflight_unlaunched⌉` ticks given headroom replenishes
+  each tick. The truly-unaffordable arm (budget below the largest
+  single-intent footprint, the family's floor) MUST disclose with the
+  same operator trail as the dropping siblings (warn +
   #(refs.metric)("rio_controller_nodeclaim_budget_starved_total")).
 ]
 #r("ctrl.nodeclaim.one-term-decoder")[
@@ -1963,13 +1973,16 @@ witnessed by the budget-binds pin + the intra-tick `class_created`
 accumulation law above), and right-sized (the `n_pack` premise,
 witnessed by the sim_packs battery + the four-caller footprint
 census). A gate regression after retirement is bounded by the
-fleet-budget brake, with the per-tick blast radius grown from 8/cell
-to `⌊budget/chunk⌋` --- which is why the gate premise carries a PROBING
-population witness, never prose. The write-burst axis is PRICED, not
-capped: worst-case creates/tick = `⌊remaining-budget/min-chunk⌋`
-(\~157/class at the grounded anchor chunk), absorbed by the
-kube-client QPS posture and Karpenter's CreateFleet batching +
-cloud-provider backoff (sla-sizing.typ carries the same pricing). The
+fleet-budget brake AND the inflight-headroom term, with the per-tick
+blast radius grown from 8/cell to `min(⌊budget/chunk⌋,
+max_inflight_unlaunched)` --- which is why the gate premise carries a
+PROBING population witness, never prose. The L1-era write-burst axis
+WAS THE one axis the retired cap actually bounded, and L1 PRICED it
+as absorbed by the kube-client QPS posture and Karpenter's
+CreateFleet batching + cloud-provider backoff --- sh-043: this DID
+NOT account for Karpenter's cross-pool `cluster.Synced()` gate; the
+inflight-headroom term bounds the unlaunched set so `Synced()=false`
+windows stay ≪ tick (sla-sizing.typ carries the same correction). The
 per-Cell round-robin start rotation, not the cap, is what prevents
 early-cell budget capture --- re-verified unchanged.
 

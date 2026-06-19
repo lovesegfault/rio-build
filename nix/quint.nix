@@ -5597,13 +5597,16 @@ rec {
     # Healthy lifecycle, no faults: create -> register -> busy/idle ->
     # idle-reap with the FFD reservation respected, the per-class clamp
     # over the config mirror, and the placeable publish. Round-9
-    # WO-S7-2 (merged_bug_003): the mint relation is the budget-brake
-    # two-term min and deficitFullyMinted asserts the landed
-    # deficit-within-budget-mints-fully-in-ONE-tick law (the retired
-    # per-cell-per-tick cap is gone from relation AND invariant; the
-    # burst regime is non-vacuous via canReachBurstFullMint below).
+    # WO-S7-2 (merged_bug_003) + sh-043: the mint relation is the
+    # three-term min (demand × budget × inflight-headroom) and
+    # deficitFullyMinted asserts the landed deficit-within-budget-
+    # mints-fully-OR-inflight-at-cap law (the retired
+    # per-cell-per-tick cap stays gone from relation AND invariant;
+    # the burst regime is non-vacuous via canReachBurstFullMint
+    # below; the headroom term is shape-parity-only at
+    # MAX=|CLAIMS|=2, witnessed by canHitInflightCap).
     # r[verify ctrl.nodeclaim.budget.per-class+4]
-    # r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    # r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
     quint-nodeclaim-lifecycle-base = mkQuintCheck {
       name = "nodeclaim-lifecycle-base";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -5781,6 +5784,18 @@ rec {
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleBase";
       witness = "canReachBurstFullMint";
+    };
+    # sh-043: the unlaunched count reached MAX_INFLIGHT_UNLAUNCHED
+    # with surplus demand (at |CLAIMS|=MAX=2 this coincides with the
+    # slot ceiling — shape-parity witness; the headroom term is
+    # SHAPE-PARITY ONLY in this universe so this certifies the
+    # cap-hitting state is REACHABLE, NOT that headroom bound
+    # distinctly from slots).
+    quint-nodeclaim-witness-inflight-cap = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-inflight-cap";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleBase";
+      witness = "canHitInflightCap";
     };
     # The per-class budget binds while the global budget still has room.
     quint-nodeclaim-witness-class-budget = mkQuintWitnessCheck {
@@ -6040,8 +6055,11 @@ rec {
     # flat per-cell-per-tick cap into the mint relation falsifies
     # deficitFullyMinted through its OWN conjunct (kill isolation:
     # the budget letters stay quiet — a cap under-mints, never
-    # over-mints). The model re-finds the retired-cap class if any
-    # pacing term creeps back into the relation.
+    # over-mints). The model re-finds the retired-cap class if an
+    # UNCONDITIONAL flat per-cell-per-tick velocity term creeps back
+    # into the relation (distinguished from the sh-043 GLOBAL
+    # throughput-matched backlog-adaptive headroom, which is the
+    # lawful third term).
     quint-ctrl-calib-n-retired-cap = mkQuintWitnessCheck {
       name = "ctrl-calib-n-retired-cap";
       spec = "calibration/controller-n-retired-cap";

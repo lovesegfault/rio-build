@@ -76,7 +76,8 @@
 //   - Sketch contents, FFD/cover sizing arithmetic and λ accounting are
 //     out of model; PG is one abstract cell whose load may fail and
 //     whose overwrite-while-stale is the reload-latch violation.
-//     MODEL-DIVERGENCE(law=ctrl.nodeclaim.mint-deficit-proportional+2; tree=rio-controller/src/reconcilers/nodeclaim_pool/cover.rs:sizing): the model certifies the two-term STRUCTURE (n = min(deficit, budget) in claim units) — NOT the sizing arithmetic (n_pack FFD packing, the budget/chunk(n) integer granularity, the upward family search to the first affordable n, the truly-unaffordable warn+counter arm) — re-derived at the round-13 family-quantified affordability close (bug_062): in claim units the structure is INVARIANT under the family search (it only changes which chunk denominates a claim), so the certification stands; the family face is code-tier-verified (W13-AI) — retarget-by: encoding sizing arithmetic (a Stage-D item) or any change to the sizing law itself.
+//     MODEL-DIVERGENCE(law=ctrl.nodeclaim.mint-deficit-proportional+3; tree=rio-controller/src/reconcilers/nodeclaim_pool/cover.rs:sizing): the model certifies the three-term STRUCTURE (n = min(deficit, budget, inflightHeadroom) in claim units) — NOT the sizing arithmetic (n_pack FFD packing, the budget/chunk(n) integer granularity, the upward family search to the first affordable n, the truly-unaffordable warn+counter arm) — re-derived at the round-13 family-quantified affordability close (bug_062): in claim units the structure is INVARIANT under the family search (it only changes which chunk denominates a claim), so the certification stands; the family face is code-tier-verified (W13-AI) — retarget-by: encoding sizing arithmetic (a Stage-D item) or any change to the sizing law itself.
+//     MODEL-DIVERGENCE(law=karpenter.cluster-synced; tree=kubernetes-sigs/karpenter@v1.11.1:pkg/controllers/state/cluster.go::Synced): Karpenter's cross-pool provisioner gate (Synced()=false while any NodeClaim lacks providerID) is environment-owned and out of model — certified instead by the controller-side inflight-headroom structural bound (sh-043; aws/karpenter-provider-aws#7428) — retarget-by: modeling rio-general as a second consumer pool.
 //   - The per-tick mark dedup (the BTreeSet in report_unfulfillable) is
 //     by construction here (marks are a set); the soundness checks are
 //     about WHICH cells are marked, not how many times.
@@ -129,13 +130,15 @@
 //   gateProducerGuarantee the placeable gate is unarmed by the end of
 //                         any tick that observed a pending lease-loss
 //                         flag and is never re-armed by a degraded tick
-//   provisioningBudget    the budget-brake mint law (live_049 L1):
-//                         global and per-class budgets hold with
-//                         terminating claims still counted; failed
-//                         creates consume no budget; and a deficit
-//                         within budget mints FULLY in one tick
-//                         (deficitFullyMinted — the per-cell-per-tick
-//                         cap is retired from relation AND invariant)
+//   provisioningBudget    the budget-brake mint law (live_049 L1 +
+//                         sh-043): global and per-class budgets hold
+//                         with terminating claims still counted;
+//                         failed creates consume no budget; and a
+//                         deficit within budget mints FULLY in one
+//                         tick OR the inflight-unlaunched count is at
+//                         cap (deficitFullyMinted — the
+//                         per-cell-per-tick cap stays retired from
+//                         relation AND invariant)
 //   coverRespectsMask     no create lands in a cell ICE-marked this
 //                         tick or already masked
 //   degradedCoverPolarity no create without loaded ceilings; no create
@@ -250,6 +253,7 @@ module nodeclaimLifecycle {
     | EBufferedClearDelivered
     | EBindingCleared
     | EBurstFullMint
+    | EInflightCapped
     | EDeferKept
     | EReapAmbiguous
     | ETombstoneConfirmed
@@ -398,6 +402,15 @@ module nodeclaimLifecycle {
 
   pure val CLAIMS: Set[ClaimId] = Set("c1", "c2")
   pure val CELLS: Set[Cell] = Set("cellA", "cellB")
+  // sh-043: the GLOBAL concurrent-unlaunched ceiling. `pure val` (NOT
+  // `const`): `const X: int = 2` is a Quint parse error (QNT000) and
+  // a bare `const` would force binding at all 27
+  // `import nodeclaimLifecycle(...)` sites; the slot universe
+  // |CLAIMS|=2 is itself a `pure val` so no regime can usefully set
+  // it differently. MUST be ≥ 2 — `canReachBurstFullMint`
+  // (`createdB>1` in Base; CLASS_CAP_A=1 caps cellA) is unreachable
+  // at 1.
+  pure val MAX_INFLIGHT_UNLAUNCHED: int = 2
 
   pure def boolChoices(faultOn: bool): Set[bool] =
     if (faultOn) Set(false, true) else Set(false)
@@ -502,7 +515,8 @@ module nodeclaimLifecycle {
   val gateProducerGuarantee = not(violations.contains(VGateProducer))
   /// The deficit-full-mint leaf, NAMED single-proposition (P7): a
   /// deficit within budget (and the slot universe) mints fully in one
-  /// tick — the landed live_049 L1 law, satisfiable and asserted
+  /// tick OR the inflight-unlaunched count is at cap (sh-043) — the
+  /// landed live_049 L1 + sh-043 law, satisfiable and asserted
   /// (round-9 WO-S7-2; pre-retarget the model asserted the RETIRED
   /// per-cell-per-tick cap here and refuted the tree).
   val deficitFullyMinted = not(violations.contains(VDeficitDeferred))
@@ -534,6 +548,16 @@ module nodeclaimLifecycle {
   val canReachUnknownCellDrop = not(effects.contains(EUnknownCellDrop))
   val canReachCreate = not(effects.contains(ECreateOk))
   val canReachBurstFullMint = not(effects.contains(EBurstFullMint))
+  /// sh-043 non-vacuity (shape-parity witness): the unlaunched count
+  /// reached `MAX_INFLIGHT_UNLAUNCHED` with surplus demand. At
+  /// |CLAIMS|=MAX=2 this coincides with the slot ceiling — it
+  /// certifies the cap-hitting state is REACHABLE, NOT that headroom
+  /// bound distinctly from slots (a falsifiable headroom check needs
+  /// `MAX < |CLAIMS|`, deferred). The `not(...)` form is the project
+  /// convention: "violated" means the effect IS reached;
+  /// `effects.contains(...)` directly would trivially "violate" at
+  /// init where `effects=Set()`.
+  val canHitInflightCap = not(effects.contains(EInflightCapped))
   val canReachAcquireWithInflight = not(effects.contains(EAcquireWithInflight))
   val canReachDegradedReloadTick = not(effects.contains(EDegradedReloadTick))
   val canReachFreshClearAfterAcquire =
@@ -1147,6 +1171,11 @@ module nodeclaimLifecycle {
       val masked = iceMasked.union(marksThisTick)
       // ---- cover_deficit ----------------------------------------------
       val freeSlots = CLAIMS.filter(k => afterObs.get(k).phase == CAbsent)
+      // sh-043: the model has no Registered-with-Launched=Unknown
+      // state and CInFlight already excludes CTerminating, so the
+      // Rust-side `!n.registered && !n.terminating()` guards collapse
+      // to the phase test.
+      val unlaunchedBefore = CLAIMS.filter(k => afterObs.get(k).phase == CInFlight).size()
       val liveCores = CLAIMS.filter(k => afterObs.get(k).phase != CAbsent and not(stuckReaped.contains(k))).size()
         + stuckReaped.size()  // a just-deleted claim is terminating and still bills
       val globalRemaining = if (MAX_FLEET_CORES > liveCores) MAX_FLEET_CORES - liveCores else 0
@@ -1162,18 +1191,26 @@ module nodeclaimLifecycle {
         and not(masked.contains("cellB"))
       // cellA first, then cellB (the rotation is fairness only).
       pure def min2(a: int, b: int): int = if (a < b) a else b
-      // live_049 L1 / round-9 WO-S7-2 (merged_bug_003): the budget-brake
-      // two-term mint law — demand × budget, nothing else. In claim
-      // units (every claim one core, chunk = 1) the production
-      // `n = n_pack.min(budget / chunk)` (cover.rs::sizing) is
-      // n = min(deficit, remaining budget); the retired flat
-      // per-cell-per-tick cap is GONE from the relation exactly as
-      // 2e2ce1a32 removed it from the tree.
+      // sh-043 / live_049 L1 / round-9 WO-S7-2 (merged_bug_003): the
+      // three-term mint law — demand × budget × inflight-headroom. In
+      // claim units (every claim one core, chunk = 1) the production
+      // `n = n_aff.min(budget / chunk).min(cfg.inflight_headroom)`
+      // (cover.rs::sizing) is n = min(deficit, remaining budget,
+      // headroom); the retired flat per-cell-per-tick cap stays GONE
+      // from the relation exactly as 2e2ce1a32 removed it from the
+      // tree. wantB's headroom term debits `wantA` (NOT `createdA`:
+      // `createdA` is bound below, after `wantB`; the `- wantA` debit
+      // matches the existing `globalRemaining - wantA` shape on the
+      // same line). At MAX=|CLAIMS|=2 the headroom term is
+      // SHAPE-PARITY ONLY (phases partition CLAIMS ⇒ freeSlots ≤
+      // MAX − unlaunchedBefore, so freeSlots already dominates).
       val wantA = if (coverableA)
-          min2(demandA, min2(classRemainingA, globalRemaining))
+          min2(min2(demandA, min2(classRemainingA, globalRemaining)),
+               MAX_INFLIGHT_UNLAUNCHED - unlaunchedBefore)
         else 0
       val wantB = if (coverableB)
-          min2(demandB, globalRemaining - wantA)
+          min2(min2(demandB, globalRemaining - wantA),
+               MAX_INFLIGHT_UNLAUNCHED - unlaunchedBefore - wantA)
         else 0
       val createNA = min2(wantA, freeSlots.size())
       val createNB = min2(wantB, freeSlots.size() - createNA)
@@ -1341,14 +1378,31 @@ module nodeclaimLifecycle {
       // created_this_tick semantics); in this 2-slot universe a
       // slot-bound A forces slots-for-B to 0, so created-vs-want
       // debit cannot diverge on the B bound.
+      // sh-043: the headroom arg is SHAPE-PARITY ONLY at
+      // MAX=|CLAIMS|=2 (the existing freeSlots.size() arg already
+      // dominates: freeSlots ≤ MAX − unlaunchedBefore by phase
+      // partition), so this relaxation is a documented no-op exactly
+      // like `vBudgetGlobal` — the model RECORDS the law's third term
+      // without changing its reachable verdicts. Per-disjunct
+      // inside-min, NOT an outer antecedent (which would mask the
+      // disjunct at cap and gratuitously weaken the check).
       val vDeficitDeferred =
         (coverableA and not(createFails)
           and createdA < min2(min2(demandA, classRemainingA),
-                              min2(globalRemaining, freeSlots.size())))
+                              min2(min2(globalRemaining, freeSlots.size()),
+                                   MAX_INFLIGHT_UNLAUNCHED - unlaunchedBefore)))
         or
         (coverableB and not(createFails)
           and createdB < min2(min2(demandB, globalRemaining - createdA),
-                              freeSlots.size() - createdA))
+                              min2(freeSlots.size() - createdA,
+                                   MAX_INFLIGHT_UNLAUNCHED - unlaunchedBefore - createdA)))
+      // sh-043: the unlaunched count reached MAX_INFLIGHT_UNLAUNCHED
+      // with surplus demand (at |CLAIMS|=MAX=2 this coincides with
+      // the slot ceiling — shape-parity witness).
+      val eInflightCapped =
+        (createdA + createdB > 0)
+        and (unlaunchedBefore + createdA + createdB == MAX_INFLIGHT_UNLAUNCHED)
+        and (demandA + demandB > createdA + createdB)
       // The burst leaf (non-vacuity): one tick mints MORE than the
       // retired flat cap (1) ever allowed in a cell — the exact
       // population the pre-retirement model made unreachable
@@ -1390,6 +1444,7 @@ module nodeclaimLifecycle {
         effects' = Set(EPublished).union(Set(
           if (createdA + createdB > 0) Set(ECreateOk) else Set(),
           if (burstFullMint) Set(EBurstFullMint) else Set(),
+          if (eInflightCapped) Set(EInflightCapped) else Set(),
           if (deferKept) Set(EDeferKept) else Set(),
           if (createAttempted and createFails) Set(ECreateFailed) else Set(),
           if (ackOk and marksThisTick.size() > 0) Set(EIceMarkEmitted) else Set(),

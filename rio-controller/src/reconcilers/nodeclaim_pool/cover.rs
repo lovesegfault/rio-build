@@ -3,10 +3,12 @@
 //! Per `r[ctrl.nodeclaim.anchor-bulk+7]`: for each `(h,cap)` cell with
 //! unplaced demand, mint `n` uniform NodeClaims sized so the production
 //! FFD packs every fitting intent (over-cap dropped with
-//! `exceeds_cell_cap` metric — see [`sizing`]), bounded by the two-term
-//! law `min(n_pack, ⌊budget/chunk⌋)` — demand and the `sla.maxFleetCores`
-//! fleet-budget brake, nothing else (live_049 L1: the flat per-tick cap
-//! is RETIRED — `ctrl.nodeclaim.mint-deficit-proportional`). Karpenter
+//! `exceeds_cell_cap` metric — see [`sizing`]), bounded by the
+//! three-term law `min(n_pack, ⌊budget/chunk⌋, inflight_headroom)` —
+//! demand, the `sla.maxFleetCores` fleet-budget brake, and the sh-043
+//! concurrent-unlaunched headroom (live_049 L1: the flat per-tick cap
+//! stays RETIRED — `ctrl.nodeclaim.mint-deficit-proportional`).
+//! Karpenter
 //! resolves each claim's `resources.requests` against the hw-class's
 //! `requirements` (instance-type properties) to pick the actual
 //! instance type. Cells iterate round-robin from a rotating start so no
@@ -793,7 +795,7 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
     let n_pack = (n_lo..=n_hi)
         .find(|&n| super::ffd::sim_packs(cell, &fits, claim_at(n), n, cfg.fuse_cache_bytes))
         .unwrap_or(n_hi);
-    // r[impl ctrl.nodeclaim.mint-deficit-proportional+2]
+    // r[impl ctrl.nodeclaim.mint-deficit-proportional+3]
     // sh-043: the three-term mint law — demand × budget ×
     // inflight-headroom. The headroom term is a GLOBAL
     // concurrent-unlaunched ceiling: under healthy launch throughput
@@ -1264,7 +1266,7 @@ mod tests {
         Cell("h".into(), CapacityType::Spot)
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
     /// **sh-043** — *the inflight-headroom term bounds the per-tick
     /// mint count* (the `Synced()`-blocking population cap;
     /// operation-count, zero wall-clock). The mint law is
@@ -1317,7 +1319,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
     /// **R10 + W7-M** — *a deficit within budget is FULLY minted in
     /// ONE tick* (the 208-peak ramp shape killed; operation-count,
     /// zero wall-clock): the mint law is `min(n_pack, ⌊budget/chunk⌋)`
@@ -1356,7 +1358,7 @@ mod tests {
         // `budget_brake_quantifies_over_the_family` below.
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
     /// W13-AI (bug_062) — proposition: an affordability decision over
     /// a parametric family quantifies over the family; population:
     /// the [max_c, chunk(n_pack)) band, derived from the family's own
@@ -1392,7 +1394,7 @@ mod tests {
         assert_eq!(c[0].0, 16, "the packing-minimal chunk is kept");
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
     /// The re-derived budget-brake pin (bug_062, the witness half):
     /// asserts the LAW — affordable ⇒ nonzero mint — never the
     /// starved output. The pre-fix pin (`budget=10 ⇒ c.is_empty()`)
@@ -3143,8 +3145,8 @@ mod tests {
 
 #[cfg(test)]
 mod mint_law_tests {
-    //! WO-S7-1 (live_049 L1): the two-term mint law's premise
-    //! witnesses and the cap-reader census.
+    //! WO-S7-1 (live_049 L1) + sh-043: the three-term mint law's
+    //! premise witnesses and the cap-reader census.
     use std::collections::{HashMap, HashSet};
 
     use super::super::ffd::{self, LiveNode};
@@ -3182,7 +3184,7 @@ mod mint_law_tests {
         }
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
     /// **R10b + W7-K** — *the gate POPULATION premise, probed not
     /// prose*: `n_pack`'s input is exactly the placeable-gated
     /// unplaced set. A tick whose input contains (i) an intent that
@@ -3333,7 +3335,7 @@ mod mint_law_tests {
         out
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
     /// **R12 — the cap-reader census [GEN-SET], alias-closed**
     /// (merged_bug_001 / R22 upgrade). Generator, ALL alias tiers:
     ///
@@ -3365,7 +3367,8 @@ mod mint_law_tests {
                 .to_string()
         };
         // cover.rs: 1 retirement-rationale snake mention in the sizing
-        // doc; ZERO code reads (the law is two-term).
+        // doc; ZERO code reads (the law is three-term — sh-043 — and
+        // none of the three terms is `per_tick_cap`).
         assert_eq!(
             prod(cover_src).matches("per_tick_cap").count(),
             1,
@@ -3427,7 +3430,7 @@ mod mint_law_tests {
         //    fixture) — the deprecated-ignored field + serde default +
         //    HELM_RENDERED_SLA_KEYS row + test rows; PARSE-SURFACE.
         // 6. docs/spec sla-sizing.typ :794/:1112-class — the
-        //    RETIREMENT-NARRATING rows (two-term law, burst pricing,
+        //    RETIREMENT-NARRATING rows (three-term law, burst pricing,
         //    deprecated-row note; every mention qualifier-bearing
         //    after the bughunt-9 S4 sweep).
         // 7. docs/spec/models/nodeclaimLifecycle.qnt:243 — the

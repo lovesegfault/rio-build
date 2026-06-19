@@ -2501,7 +2501,19 @@ in
         # tripped its own author three times exactly that way.
         # Self-allowlist: misc-checks.nix only (this file names the
         # tokens to deny them).
-        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|\bDrainExecutor\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|prox(y|ies|ying).{0,60}(Cilium|Envoy) Gateway|\(no series\).*never fires|[Uu]ndefined means .{0,4}.whole.{0,3}build|whole.?build view \(drvPath undefined\)|no derivation filter on the log stream'
+        # sh-043: the L1 R17 ENVELOPE false premise — the create burst
+        # was PRICED as "absorbed by … (CreateFleet|Karpenter)
+        # batching", which DID NOT account for `cluster.Synced()`.
+        # Verification grep (per CLAUDE.md narrowing-record duty):
+        #   grep -rn -E 'absorbed by .{0,80}(CreateFleet|Karpenter) batching' docs/ @ 368e279cf
+        #   → docs/spec/components/sla-sizing.typ:867:… `CreateFleet` rate pressure is absorbed by Karpenter batching …
+        #   → docs/spec/components/sla-sizing.typ:1180:… absorbed by … Karpenter's CreateFleet batching …
+        # The hard-wrapped sibling at controller.typ:1970-1971
+        # ("absorbed by" / "CreateFleet batching" split across two
+        # lines) is NOT matched by this line-scoped grep; that
+        # paragraph is rewritten on its own merits in the same
+        # series for correctness, not lint. Escape: `\bwas the\b`.
+        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|\bDrainExecutor\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|prox(y|ies|ying).{0,60}(Cilium|Envoy) Gateway|\(no series\).*never fires|[Uu]ndefined means .{0,4}.whole.{0,3}build|whole.?build view \(drvPath undefined\)|no derivation filter on the log stream|absorbed by .{0,80}(CreateFleet|Karpenter) batching'
         # merged_bug_081: every escape token WORD-BOUND — the old
         # unanchored vocabulary legalized live narration via substrings
         # ("unremoved", "pre-pulling") and via unrelated matches in the

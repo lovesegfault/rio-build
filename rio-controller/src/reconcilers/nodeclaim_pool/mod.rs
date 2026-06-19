@@ -17,9 +17,9 @@
 //!    `kube-scheduler-packed` uses.
 //! 3. Cover the unplaced deficit per `(hw_class, capacity_type)` cell
 //!    with 1×anchor + N×bulk NodeClaims, bounded by demand (the FFD
-//!    bin count) and `max_fleet_cores` (live_049 L1: the flat
-//!    per-cell-per-tick cap is retired —
-//!    `ctrl.nodeclaim.mint-deficit-proportional`).
+//!    bin count), `max_fleet_cores`, and `max_inflight_unlaunched`
+//!    (live_049 L1 + sh-043: the flat per-cell-per-tick cap stays
+//!    retired — `ctrl.nodeclaim.mint-deficit-proportional`).
 //! 4. Reap idle Registered claims via windowed-rate break-even.
 //! 5. Reap unhealthy (OA2 wedge-clustered dead nodes) and ICE-stuck
 //!    claims.
