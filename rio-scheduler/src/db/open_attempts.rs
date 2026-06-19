@@ -690,7 +690,8 @@ impl SchedulerDb {
             "SELECT j.job_id, j.drv_hash, j.carried_realized_paths, \
                     EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, \
                     EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago, \
-                    a.builder_id AS claimed_by \
+                    EXTRACT(EPOCH FROM (now() - j.created_at))::float8 AS age_secs, \
+                    j.origin, a.builder_id AS claimed_by \
                FROM materialization_jobs j \
                LEFT JOIN assignments a ON a.derivation_id = j.derivation_id \
                                       AND a.status IN ('pending', 'acknowledged') \
@@ -716,7 +717,7 @@ impl SchedulerDb {
         derivation_id: Uuid,
     ) -> Result<Option<RecoveredJobRow>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT j.job_id, j.drv_hash, j.carried_realized_paths, EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago, a.builder_id AS claimed_by FROM materialization_jobs j LEFT JOIN assignments a ON a.derivation_id = j.derivation_id AND a.status IN ('pending', 'acknowledged') AND EXISTS ( SELECT 1 FROM drv_executions e WHERE e.exec_id = a.exec_id AND e.attempt_kind = 'materialization') WHERE j.state = 'pending' AND j.derivation_id = $1",
+            "SELECT j.job_id, j.drv_hash, j.carried_realized_paths, EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago, EXTRACT(EPOCH FROM (now() - j.created_at))::float8 AS age_secs, j.origin, a.builder_id AS claimed_by FROM materialization_jobs j LEFT JOIN assignments a ON a.derivation_id = j.derivation_id AND a.status IN ('pending', 'acknowledged') AND EXISTS ( SELECT 1 FROM drv_executions e WHERE e.exec_id = a.exec_id AND e.attempt_kind = 'materialization') WHERE j.state = 'pending' AND j.derivation_id = $1",
         )
         .bind(derivation_id)
         .fetch_optional(&self.pool)
@@ -738,6 +739,14 @@ pub(crate) struct RecoveredJobRow {
     /// failover-exact dwell anchor); `None` = never parked or parked
     /// pre-083 (the dwell gate treats it as unmet — conservative).
     pub park_began_secs_ago: Option<f64>,
+    /// Seconds since the job was created (migration 078 `created_at
+    /// NOT NULL`, the failover-exact age the phase-15 unclaimed
+    /// age-out arm reads in-memory).
+    pub age_secs: f64,
+    /// `materialization_jobs.origin` (migration 078, TEXT —
+    /// `db_str_enum!` emits no `sqlx::Decode`; parses to `JobOrigin`
+    /// in `entry_from_recovered_row` per the `RawJobRow` precedent).
+    pub origin: String,
     /// The open MATERIALIZATION attempt's holder identity; `None` =
     /// unclaimed (a build-kind slot holder is not a job holder).
     pub claimed_by: Option<String>,

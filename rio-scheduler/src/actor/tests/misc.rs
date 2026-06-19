@@ -1754,7 +1754,11 @@ async fn snapshot_counts_substituting() {
         actor.test_inject_ready(h, None, "x86_64-linux", false);
         actor.materialization_jobs.insert(
             crate::state::DrvHash::from(h),
-            crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+            crate::actor::materialize::JobViewEntry::new_unclaimed(
+                Uuid::new_v4(),
+                None,
+                crate::state::JobOrigin::CacheOpportunity,
+            ),
         );
     }
     actor.test_inject_ready("q1", None, "x86_64-linux", false);
@@ -2050,7 +2054,11 @@ async fn forecast_substituting_dep_contributes_typed_eta() {
     actor.test_inject_edge("warm", "dep");
     actor.materialization_jobs.insert(
         "dep".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
 
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
@@ -2097,7 +2105,11 @@ async fn forecast_substituting_claimed_dep_uses_prior_not_stale_curve() {
     actor.test_inject_edge("p1", "d1");
     actor.materialization_jobs.insert(
         "d1".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     actor
         .materialization_jobs
@@ -2112,7 +2124,11 @@ async fn forecast_substituting_claimed_dep_uses_prior_not_stale_curve() {
     actor.test_set_running_eta("d2", 600.0, 100, 4); // curve eta = 500
     actor.materialization_jobs.insert(
         "d2".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     actor
         .materialization_jobs
@@ -2161,7 +2177,11 @@ async fn forecast_substituting_unclaimed_job_never_displaces_live_build() {
     actor.test_set_running_eta("dep", 100.0, 70, 4); // curve eta = 30
     actor.materialization_jobs.insert(
         "dep".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
 
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
@@ -2201,7 +2221,11 @@ async fn forecast_substituting_pacing_dep_drops_typed() {
     actor.test_inject_edge("p-park", "d-park");
     actor.materialization_jobs.insert(
         "d-park".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     actor
         .materialization_jobs
@@ -2214,7 +2238,11 @@ async fn forecast_substituting_pacing_dep_drops_typed() {
     actor.test_inject_edge("p-defer", "d-defer");
     actor.materialization_jobs.insert(
         "d-defer".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     actor
         .materialization_jobs
@@ -2276,7 +2304,11 @@ async fn forecast_substituting_prior_respects_lead_horizon() {
     actor.test_inject_edge("warm", "dep");
     actor.materialization_jobs.insert(
         "dep".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
 
     let rec = DebuggingRecorder::new();
@@ -2308,7 +2340,11 @@ async fn forecast_substituting_prior_respects_lead_horizon() {
     actor2.test_inject_edge("warm", "dep");
     actor2.materialization_jobs.insert(
         "dep".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     let snap2 = actor2.compute_spawn_intents(&SpawnIntentsRequest::default());
     let warm = snap2
@@ -2342,7 +2378,11 @@ async fn forecast_substituting_queued_dep_job_grounded() {
     actor.test_inject_edge("pq", "dq");
     actor.materialization_jobs.insert(
         "dq".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     // dn(Queued, NO job) ← pn(Queued): the one-layer kill stands.
     actor.test_inject_at("dn", "x86_64-linux", DerivationStatus::Queued);
@@ -2383,7 +2423,11 @@ async fn forecast_substituting_terminal_dep_never_contributes() {
     actor.test_inject_edge("pf", "df");
     actor.materialization_jobs.insert(
         "df".into(),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
 
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
@@ -2484,12 +2528,20 @@ async fn subst_dep_eta_disposition_census() {
     actor.test_inject_at("j-claimable", "x86_64-linux", DerivationStatus::Ready);
     actor.materialization_jobs.insert(
         "j-claimable".into(),
-        JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     actor.test_inject_at("j-claimed", "x86_64-linux", DerivationStatus::Ready);
     actor.materialization_jobs.insert(
         "j-claimed".into(),
-        JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     actor
         .materialization_jobs
@@ -2499,7 +2551,11 @@ async fn subst_dep_eta_disposition_census() {
     actor.test_inject_at("j-parked", "x86_64-linux", DerivationStatus::Ready);
     actor.materialization_jobs.insert(
         "j-parked".into(),
-        JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     actor
         .materialization_jobs
@@ -2509,7 +2565,11 @@ async fn subst_dep_eta_disposition_census() {
     actor.test_inject_at("j-deferred", "x86_64-linux", DerivationStatus::Ready);
     actor.materialization_jobs.insert(
         "j-deferred".into(),
-        JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     actor
         .materialization_jobs
@@ -3290,7 +3350,11 @@ fn claimability_precedence_grid() {
     let future = now + std::time::Duration::from_secs(60);
     let past = now - std::time::Duration::from_secs(60);
 
-    let mut e = JobViewEntry::new_unclaimed(Uuid::new_v4(), None);
+    let mut e = JobViewEntry::new_unclaimed(
+        Uuid::new_v4(),
+        None,
+        crate::state::JobOrigin::CacheOpportunity,
+    );
     assert_eq!(e.claimability(now), Claimability::ClaimableNow);
 
     // Deferral alone.
@@ -3551,7 +3615,11 @@ async fn split_release_wedge_repairs_on_second_sweep() -> TestResult {
         .set_status_for_test(DerivationStatus::Assigned);
     actor.materialization_jobs.insert(
         DrvHash::from("wedge-drv"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     let authority = actor.dag_authority().expect("always-leader test actor");
 
@@ -3607,7 +3675,11 @@ async fn wedge_strike_does_not_survive_claim_interlude() -> TestResult {
         .set_status_for_test(DerivationStatus::Assigned);
     actor.materialization_jobs.insert(
         DrvHash::from("interlude-drv"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
     let authority = actor.dag_authority().expect("always-leader test actor");
 

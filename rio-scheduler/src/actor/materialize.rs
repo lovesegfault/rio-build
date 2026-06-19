@@ -707,6 +707,18 @@ pub(crate) struct JobViewEntry {
     /// claimable again, which is the conservative direction for an
     /// uncharged transient).
     defer_until: Option<std::time::Instant>,
+    /// Failover-exact mirror of `materialization_jobs.created_at`
+    /// (migration 078): the phase-15 unclaimed age-out arm reads this
+    /// IN-MEMORY (no per-entry PG read), so the first post-deploy tick
+    /// over a 7725-row backlog is not a serial-PG drain.
+    created_at: crate::state::RecoveredInstant,
+    /// Failover-exact mirror of `materialization_jobs.origin`
+    /// (migration 078): the phase-15 unclaimed age-out arm's
+    /// `{origin}` counter label, read IN-MEMORY for the same reason as
+    /// `created_at`. The parked-conversion arm's PG-authoritative
+    /// origin read stays as-is (the dedup may have upgraded it after
+    /// the view entry was created); out of slot to refactor.
+    origin: crate::state::JobOrigin,
 }
 
 /// The one armament classification of a job-view entry — THE
@@ -794,7 +806,11 @@ impl JobViewEntry {
     /// A fresh unclaimed, unparked, undeferred entry — the creation
     /// feed's shape (and the only construction tests get, so a
     /// fabricated pre-armed entry cannot appear outside this module).
-    pub(crate) fn new_unclaimed(job_id: Uuid, carried_realized_paths: Option<Vec<String>>) -> Self {
+    pub(crate) fn new_unclaimed(
+        job_id: Uuid,
+        carried_realized_paths: Option<Vec<String>>,
+        origin: crate::state::JobOrigin,
+    ) -> Self {
         Self {
             job_id,
             parked_until: None,
@@ -804,6 +820,8 @@ impl JobViewEntry {
             carried_realized_paths,
             parked_at: None,
             defer_until: None,
+            created_at: crate::state::RecoveredInstant::fresh_now(),
+            origin,
         }
     }
 
@@ -921,6 +939,15 @@ impl JobViewEntry {
     #[cfg(test)]
     pub(super) fn test_set_parked_until(&mut self, until: Option<std::time::Instant>) {
         self.parked_until = until;
+    }
+
+    /// Test seeding of the age-out axis ([`Self::created_at`] is set
+    /// at construction; the `DebugBackdate*` mechanism — tokio paused
+    /// time cannot mock `std::time::Instant`, and the materialize
+    /// harness's real sqlx pool `PoolTimedOut`s under `start_paused`).
+    #[cfg(test)]
+    pub(super) fn test_set_created_at(&mut self, at: crate::state::RecoveredInstant) {
+        self.created_at = at;
     }
 
     /// Test seeding of the deferral axis (the production writer is the
@@ -1655,8 +1682,14 @@ impl DagActor {
                 // parked job early. On a load failure the entry stays
                 // absent and the BACKSTOP SWEEP is the level-triggered
                 // repair (tick_backstop_materialization_jobs).
-                self.feed_job_view_entry(drv_hash, job_id, created, carried_realized_paths.clone())
-                    .await;
+                self.feed_job_view_entry(
+                    drv_hash,
+                    job_id,
+                    created,
+                    carried_realized_paths.clone(),
+                    origin,
+                )
+                .await;
                 if created {
                     metrics::counter!(
                         "rio_scheduler_materialization_jobs_created_total",
@@ -1798,7 +1831,7 @@ impl DagActor {
         {
             Ok(crate::db::materialization::FencedBatchJobCreate::Applied(results)) => {
                 for (p, r) in prep.iter().zip(results.iter()) {
-                    self.feed_job_view_entry(&p.hash, r.job_id, r.created, None)
+                    self.feed_job_view_entry(&p.hash, r.job_id, r.created, None, origin)
                         .await;
                     if r.created {
                         metrics::counter!(
@@ -1925,6 +1958,23 @@ impl DagActor {
             // View-only by design (merged_bug_178): a rebuild loses at
             // most one uncharged transient deferral window.
             defer_until: None,
+            // Failover-exact age (merged_bug_262: from_age_secs is
+            // total — +inf clamps, never panics).
+            created_at: crate::state::RecoveredInstant::from_age_secs(row.age_secs),
+            // db_str_enum! emits no sqlx::Decode — TEXT decodes as
+            // String and parses here (the RawJobRow precedent at
+            // db/materialization.rs). A drift from the 078 CHECK
+            // alphabet is a deploy bug; the unknown arm is the
+            // tripwire's conservative answer (the age-out arm uses
+            // origin only as a counter label).
+            origin: row.origin.parse().unwrap_or_else(|_| {
+                tracing::error!(
+                    raw_origin = %row.origin,
+                    "RecoveredJobRow.origin not in the JobOrigin alphabet (078 CHECK drift); \
+                     defaulting the in-memory mirror to CacheOpportunity"
+                );
+                crate::state::JobOrigin::CacheOpportunity
+            }),
         }
     }
 
@@ -1942,6 +1992,7 @@ impl DagActor {
         job_id: Uuid,
         created: bool,
         carried_realized_paths: Option<Vec<String>>,
+        origin: crate::state::JobOrigin,
     ) {
         if self.materialization_jobs.hydrated().is_none() {
             debug!(
@@ -1955,7 +2006,10 @@ impl DagActor {
             // A genuinely new job cannot have a view entry (the
             // partial-unique index); insert the fresh shape.
             if let Some(view) = self.materialization_jobs.hydrated_mut() {
-                view.entry_or_insert(drv_hash.clone(), JobViewEntry::new_unclaimed(job_id, None));
+                view.entry_or_insert(
+                    drv_hash.clone(),
+                    JobViewEntry::new_unclaimed(job_id, None, origin),
+                );
             }
         } else if !have_entry {
             // Dedup'd row, untracked entry: rehydrate from PG.
@@ -2021,7 +2075,7 @@ impl DagActor {
             // merge in-tx creation lanes never carry realized paths —
             // only the stale_reset post-tx site does; recovery and the
             // rehydration read the column.)
-            self.feed_job_view_entry(&job.drv_hash, job.job_id, job.created, None)
+            self.feed_job_view_entry(&job.drv_hash, job.job_id, job.created, None, job.origin)
                 .await;
             if job.created {
                 metrics::counter!(
@@ -4153,14 +4207,54 @@ impl DagActor {
         _authority: &super::DagAuthority,
     ) {
         let now = std::time::Instant::now();
-        let parked: Vec<(DrvHash, Uuid)> = self
-            .materialization_jobs
-            .iter()
-            .filter(|(_, e)| {
-                e.holder().is_none() && e.parked_until.is_some_and(|until| until > now)
-            })
-            .map(|(h, e)| (h.clone(), e.job_id))
-            .collect();
+        // sh-044: the unclaimed age-out threshold. With the phase-17
+        // candidate filter, a Ready node carrying an unresolved job is
+        // skipped until `remove_settled` evicts the entry; for a job
+        // NO executor ever lists/claims (Pending-unclaimed,
+        // `parked_until=None`, no open attempt row), neither phase-12
+        // nor the parked-conversion arm below reaches it. The age-out
+        // arm closes this residual: every Ready node carrying an
+        // unresolved job is re-admitted to phase-17 once `created_at`
+        // exceeds `max_attempts × attempt_deadline_secs`, on the next
+        // tick the entry is unclaimed and not currently parked —
+        // bounded above by `(max_attempts+1) × attempt_deadline_secs +
+        // park_backoff_cap_secs` (default ≈ 4h15m), unconditionally
+        // (`holder()=Some` is itself bounded by phase-12 attempt-expiry
+        // / the merged_bug_055 ghost two-strike repair;
+        // `parked_until>now` by `park_backoff_cap_secs`).
+        let age_out_after = std::time::Duration::from_secs(
+            u64::from(self.materialization_cfg.max_attempts)
+                * self.materialization_cfg.attempt_deadline_secs,
+        );
+        let mut parked: Vec<(DrvHash, Uuid)> = Vec::new();
+        let mut aged_out: Vec<(DrvHash, Uuid, crate::state::JobOrigin)> = Vec::new();
+        for (h, e) in self.materialization_jobs.iter() {
+            if e.holder().is_some() {
+                continue;
+            }
+            // The two arms PARTITION `holder()=None` on the park axis:
+            // `is_none_or(|u| u <= now)` is the exact Boolean
+            // complement of `is_some_and(|u| u > now)` — no gap, no
+            // overlap. `parked_until` is written only at
+            // `{new_unclaimed, park, entry_from_recovered_row}` and no
+            // live-process path resets `Some→None` (the four
+            // claim-lifecycle mutators write `episode`/`defer_until`
+            // only), so a once-parked-then-abandoned entry sits at
+            // `Some(past)` indefinitely; `is_none()` would miss it.
+            if e.parked_until.is_some_and(|until| until > now) {
+                parked.push((h.clone(), e.job_id));
+            } else if e.created_at.elapsed() > age_out_after {
+                // Never-parked OR park-expired, unclaimed, past the
+                // age-out threshold. A RetryLater-deferred job
+                // (`defer_until=Some`, `parked_until=None`,
+                // `holder=None` — merged_bug_178 view-only pacing)
+                // MATCHES intentionally: a job that has only ever been
+                // deferred for `max_attempts × attempt_deadline_secs`
+                // (default 3 h) without one settled close IS the
+                // never-touched case this arm targets.
+                aged_out.push((h.clone(), e.job_id, e.origin));
+            }
+        }
         let mut still_parked = parked.len();
         for (drv_hash, job_id) in parked {
             // Classify over the DURABLE relation (T-D2.2/PD-D4 — the
@@ -4320,6 +4414,69 @@ impl DagActor {
                     origin = origin_label,
                     "parked materialization job re-evaluated: from-source is viable; \
                      resolved from_source and requeued (PD-20)"
+                );
+            }
+        }
+        // sh-044: the unclaimed age-out arm. Shares the
+        // `resolve_materialization_job → remove_settled →
+        // requeue_after_attempt + counter` body with the
+        // parked-conversion arm above, but does NOT consult
+        // `from_source_viable` (`classify_durable_evidence`) or the
+        // Item-T strictness knobs (`conversion_requires_worker_charge`
+        // / `conversion_min_park_dwell_secs`): a never-touched job has
+        // zero worker charges and zero park dwell by construction, so
+        // both knobs would refuse forever, and a
+        // once-parked-then-abandoned job (establishment-only crash-loop
+        // → park → executor gone) likewise has zero worker charges and
+        // an EXPIRED dwell window the parked-conversion arm already
+        // dropped — the age-out is the executor-liveness backstop, not
+        // a budget-exhaustion conversion. The asymmetry is recorded in
+        // the SEPARATE counter (NOT a `reason` label on
+        // `…_converted_total`: `SeededSeries` is single-axis-only, so a
+        // `{origin,reason}` live series would desync from the seeded
+        // `{origin}`-only series — birth-gap protection lost).
+        //
+        // The predicate is pure in-memory AND the `{origin}` label is
+        // read in-memory from `entry.origin` — NO per-entry PG read
+        // (without threading origin into `JobViewEntry`, the 7725-row
+        // backlog would be a serial-PG drain on the first post-deploy
+        // tick — exactly the on-actor serial-await sibling shape this
+        // function's parked arm already exhibits at the
+        // `classify_durable_evidence`/`unresolved_job_for_derivation`
+        // reads above).
+        for (drv_hash, job_id, origin) in aged_out {
+            let serving_generation = self.serving_generation();
+            let d = self
+                .resolve_materialization_job(
+                    job_id,
+                    None,
+                    crate::state::JobState::ResolvedFromSource,
+                    serving_generation,
+                )
+                .await;
+            if self.materialization_jobs.remove_settled(&drv_hash, d) {
+                if d == WriteDisposition::Applied {
+                    metrics::counter!(
+                        "rio_scheduler_materialization_aged_out_total",
+                        "origin" => origin.as_str()
+                    )
+                    .increment(1);
+                }
+                self.requeue_after_attempt(
+                    std::slice::from_ref(&drv_hash),
+                    crate::state::AttemptKind::Materialization,
+                    None,
+                )
+                .await;
+                tracing::info!(
+                    drv_hash = %drv_hash,
+                    %job_id,
+                    origin = origin.as_str(),
+                    age_out_after_secs = age_out_after.as_secs(),
+                    "unclaimed materialization job aged out: resolved from_source \
+                     and requeued (no executor reached it within max_attempts × \
+                     attempt_deadline_secs; the next phase-17 probe re-creates the \
+                     job if the cache fact still holds)"
                 );
             }
         }

@@ -427,6 +427,13 @@ pub fn describe_metrics() {
         "rio_scheduler_queue_backpressure",
         "Backpressure activations (queue reached 80% capacity)"
     );
+    describe_counter!(
+        "rio_scheduler_materialization_aged_out_total",
+        "Materialization jobs resolved from-source by the phase-15 unclaimed age-out \
+         arm (no holder, not currently parked, created_at past max_attempts × \
+         attempt_deadline_secs) — the executor-liveness backstop that re-admits \
+         the node to the phase-17 dispatch probe; discriminated by origin"
+    );
     describe_gauge!(
         "rio_scheduler_open_attempts",
         "Open pull-mode BUILD attempts (active assignment + execution pair minted \

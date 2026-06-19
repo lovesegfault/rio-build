@@ -144,6 +144,7 @@
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_lease_rebound_total",
     "rio_scheduler_malformed_built_output_total",
+    "rio_scheduler_materialization_aged_out_total",
     "rio_scheduler_materialization_carrier_dropped_total",
     "rio_scheduler_materialization_claims_total",
     "rio_scheduler_materialization_converted_total",
@@ -1028,6 +1029,11 @@
         "name": "rio_scheduler_malformed_built_output_total",
         "kind": "counter",
         "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_materialization_aged_out_total",
+        "kind": "counter",
+        "help": "Materialization jobs resolved from-source by the phase-15 unclaimed age-out arm (no holder, not currently parked, created_at past max_attempts × attempt_deadline_secs) — the executor-liveness backstop that re-admits the node to the phase-17 dispatch probe; discriminated by origin"
       },
       {
         "name": "rio_scheduler_materialization_carrier_dropped_total",

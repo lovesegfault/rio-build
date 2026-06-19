@@ -143,6 +143,13 @@ pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[
         name: "rio_scheduler_materialization_converted_total",
         label: Some(("origin", MAT_ORIGINS)),
     },
+    // sh-044 unclaimed age-out counter — same {origin} axis as
+    // …_converted_total, separate name (single-axis-only seed shape;
+    // a {origin,reason} live series would desync from the seed).
+    SeededSeries {
+        name: "rio_scheduler_materialization_aged_out_total",
+        label: Some(("origin", MAT_ORIGINS)),
+    },
 ];
 
 /// Birth every [`ALERT_SEEDED_COUNTERS`] series at 0. Called from

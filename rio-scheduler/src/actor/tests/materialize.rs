@@ -9606,7 +9606,11 @@ async fn stale_retrylater_redelivery_cannot_defer_a_fresh_holders_job() -> TestR
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor(db.pool.clone());
     let drv = DrvHash::from("defer-stale-drv");
-    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None);
+    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(
+        Uuid::new_v4(),
+        None,
+        crate::state::JobOrigin::CacheOpportunity,
+    );
     entry.mint_claim(crate::state::ExecutorId::from("fresh-holder"));
     actor.materialization_jobs.insert(drv.clone(), entry);
 
@@ -9664,6 +9668,10 @@ fn recovered_row_with_infinite_park_does_not_panic() {
         carried_realized_paths: None,
         park_remaining_secs: Some(f64::INFINITY),
         park_began_secs_ago: Some(f64::INFINITY),
+        // sh-044: extends the merged_bug_262 clamp pin to the new
+        // created_at lane (RecoveredInstant::from_age_secs is total).
+        age_secs: f64::INFINITY,
+        origin: "cache_opportunity".into(),
         claimed_by: None,
     };
     // Pre-fix: panics inside Duration::from_secs_f64 (+inf).
@@ -9674,6 +9682,111 @@ fn recovered_row_with_infinite_park_does_not_panic() {
         entry.claimability(std::time::Instant::now()),
         crate::actor::materialize::Claimability::Parked
     ));
+}
+
+/// Shared body of the two sh-044 unclaimed-age-out pins (the
+/// never-parked and park-expired cases — the two arms partition
+/// `holder()=None` on the park axis, so a single helper exercises both
+/// halves of the age-out predicate's `is_none_or(|u| u <= now)`
+/// conjunct).
+async fn assert_unclaimed_ages_out(
+    hash: &str,
+    parked_until: Option<std::time::Instant>,
+) -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            materialization: crate::config::MaterializationConfig {
+                max_attempts: 3,
+                attempt_deadline_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let drv = insert_test_derivation_local(&db.pool, hash).await?;
+    let created = sdb(&db.pool)
+        .create_materialization_job_fenced(
+            drv,
+            hash,
+            None,
+            JobOrigin::CacheOpportunity,
+            None,
+            0.0,
+            actor.serving_generation(),
+        )
+        .await?;
+    let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
+        anyhow::bail!("job create must apply");
+    };
+    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(
+        job_id,
+        None,
+        JobOrigin::CacheOpportunity,
+    );
+    // > 3 × 1 s. RecoveredInstant::backdated (the DebugBackdate*
+    // mechanism) — NOT tokio::time::pause()/advance():
+    // RecoveredInstant.elapsed() reads std::time::Instant which
+    // tokio's paused clock cannot advance, AND the harness's real
+    // sqlx pool PoolTimedOut's under start_paused.
+    entry.test_set_created_at(crate::state::RecoveredInstant::backdated(4));
+    entry.test_set_parked_until(parked_until);
+    let h = crate::state::DrvHash::from(hash);
+    actor.materialization_jobs.insert(h.clone(), entry);
+
+    let authority = actor.dag_authority().expect("always-leader test actor");
+    actor
+        .tick_reevaluate_parked_materialization_jobs(&authority)
+        .await;
+
+    assert!(
+        actor.materialization_jobs.get(&h).is_none(),
+        "the age-out arm collects holder()=None && parked_until.\
+         is_none_or(|u| u <= now) && created_at.elapsed() > 3s → \
+         resolve_materialization_job(ResolvedFromSource) → \
+         remove_settled evicts the entry; pre-fix the phase-15 filter \
+         was parked_until.is_some_and(|u| u > now) only — never-parked \
+         AND park-expired entries excluded"
+    );
+    let after = sdb(&db.pool).unresolved_job_for_derivation(drv).await?;
+    assert!(
+        after.is_none(),
+        "the durable row is terminal ResolvedFromSource"
+    );
+    Ok(())
+}
+
+/// sh-044 (never-parked case): a Pending-unclaimed job with
+/// `parked_until=None` and NO open attempt is reached by NEITHER
+/// phase-12 (draws from open-attempt rows only) NOR the
+/// parked-conversion arm (filters on `parked_until.is_some_and(..)`)
+/// at 368e279cf. With the phase-17 candidate filter skipping nodes
+/// that carry an unresolved job, this is the residual that strands a
+/// Ready node forever — c4's age-out arm closes it.
+#[tokio::test]
+async fn pending_unclaimed_job_ages_out_to_from_source() -> TestResult {
+    assert_unclaimed_ages_out("ageout-never-parked", None).await
+}
+
+/// sh-044 (park-expired case): `parked_until=Some(past)` — the
+/// once-parked-then-abandoned state (establishment-only crash-loop →
+/// park → executor gone). `parked_until` is written only at
+/// `{new_unclaimed, park, entry_from_recovered_row}` and no
+/// live-process path resets `Some→None` (the four claim-lifecycle
+/// mutators write `episode`/`defer_until` only), so the entry sits at
+/// `Some(past)` indefinitely; an `is_none()` age-out predicate would
+/// miss it. The `is_none_or(|u| u <= now)` conjunct is the EXACT
+/// complement of the parked-conversion arm's `is_some_and(|u| u >
+/// now)` — the two arms partition `holder()=None`.
+#[tokio::test]
+async fn park_expired_unclaimed_job_ages_out_to_from_source() -> TestResult {
+    assert_unclaimed_ages_out(
+        "ageout-park-expired",
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -10968,7 +11081,11 @@ async fn dirty_edge_paces_through_a_failure_window() -> TestResult {
     db.pool.close().await;
     actor.materialization_jobs.insert(
         crate::state::DrvHash::from("dirty-window-drv"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            Uuid::new_v4(),
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
 
     let started = std::time::Instant::now();
@@ -11162,7 +11279,11 @@ async fn zero_interest_cancel_sweep_transaction_bound() -> TestResult {
         // so every entry is zero-interest via the node-absent arm.
         actor.materialization_jobs.insert(
             DrvHash::from(hash.as_str()),
-            crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None),
+            crate::actor::materialize::JobViewEntry::new_unclaimed(
+                job_id,
+                None,
+                crate::state::JobOrigin::CacheOpportunity,
+            ),
         );
     }
 
@@ -11241,7 +11362,11 @@ async fn backoff_lapsing_during_the_beat_query_is_served() -> TestResult {
     let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("job create must apply");
     };
-    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None);
+    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(
+        job_id,
+        None,
+        crate::state::JobOrigin::CacheOpportunity,
+    );
     entry.test_set_parked_until(Some(
         std::time::Instant::now() + std::time::Duration::from_millis(400),
     ));
@@ -11322,7 +11447,11 @@ async fn listing_excludes_in_memory_terminal_nodes() -> TestResult {
         }
         actor.materialization_jobs.insert(
             DrvHash::from(hash),
-            crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None),
+            crate::actor::materialize::JobViewEntry::new_unclaimed(
+                job_id,
+                None,
+                crate::state::JobOrigin::CacheOpportunity,
+            ),
         );
         job_ids.push((hash, job_id));
     }
@@ -11427,7 +11556,11 @@ async fn node_completed_by_other_means_resolves_obsolete() -> TestResult {
         .set_status_for_test(DerivationStatus::Completed);
     actor.materialization_jobs.insert(
         DrvHash::from("obsolete-fold"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            job_id,
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
 
     let authority = actor
@@ -11552,7 +11685,11 @@ async fn skew_detector_fires_on_terminal_node_pending_job() -> TestResult {
         .set_status_for_test(DerivationStatus::Completed);
     actor.materialization_jobs.insert(
         DrvHash::from("skew-plant"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(
+            job_id,
+            None,
+            crate::state::JobOrigin::CacheOpportunity,
+        ),
     );
 
     let authority = actor
@@ -11620,7 +11757,11 @@ async fn moot_sweep_is_bounded_per_tick() -> TestResult {
     for (hash, jc) in hashes.iter().zip(&created) {
         actor.materialization_jobs.insert(
             DrvHash::from(hash.as_str()),
-            crate::actor::materialize::JobViewEntry::new_unclaimed(jc.job_id, None),
+            crate::actor::materialize::JobViewEntry::new_unclaimed(
+                jc.job_id,
+                None,
+                crate::state::JobOrigin::CacheOpportunity,
+            ),
         );
     }
 
