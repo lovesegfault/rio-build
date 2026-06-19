@@ -80,3 +80,31 @@ macro_rules! db_str_enum {
 }
 
 pub(crate) use db_str_enum;
+
+/// "TEXT column → `db_str_enum`, log+default on alphabet drift" idiom
+/// (sh-044 r1): every recovered-row mirror field that decodes a
+/// `db_str_enum!` from a PG TEXT column hits the same fork — a CHECK
+/// drift (deploy bug) lands in the unknown arm and the in-memory
+/// mirror falls back to a conservative default. Hand-rolled copies
+/// drifted log levels and message tokens (`warn!` vs `error!`,
+/// "unknown … defaulting" vs "078 CHECK drift") so a Splunk search
+/// for CHECK-drift events couldn't anchor on a common token. One
+/// helper, one `db_str_enum_drift` token. The conservative default is
+/// caller-supplied (not `Default::default()`): each site documents
+/// which arm is conservative for its read (e.g. `JobOrigin::
+/// CacheOpportunity` for the age-out label, `PriorityClass::default()`
+/// for the recovery rebuild).
+pub(crate) fn parse_or_warn_default<T>(col: &'static str, raw: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    raw.parse().unwrap_or_else(|_| {
+        tracing::error!(
+            column = col,
+            raw,
+            "db_str_enum_drift: TEXT column not in the known alphabet \
+             (CHECK constraint drift); defaulting the in-memory mirror"
+        );
+        default
+    })
+}

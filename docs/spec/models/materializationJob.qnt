@@ -50,7 +50,7 @@
 //   Delta 3 — the park re-evaluation split (642fe9fb7, T-6.1/PD-20):
 //     `parkReevaluate` resolves Vouched/Pending-evidence parked jobs
 //     from source per tick (materialize.rs
-//     tick_reevaluate_parked_materialization_jobs); Broken-evidence
+//     tick_reevaluate_materialization_jobs); Broken-evidence
 //     jobs STAY parked (the stalled-gauge population — the
 //     `stalledJobs` derived val) until `parkBackoffExpires`. The
 //     budget counter is NOT reset at unpark (as built:
@@ -2352,12 +2352,12 @@ module materializationJob {
   }
 
   /// Delta 3 arm 1: the per-tick park RE-EVALUATION
-  /// (tick_reevaluate_parked_materialization_jobs): a parked job whose
+  /// (tick_reevaluate_materialization_jobs): a parked job whose
   /// durable evidence is Vouched/Pending resolves from_source NOW (no
   /// exec — resolutionExec stays 0), clears any stale mark, and
   /// requeues the node. Broken-evidence jobs are NOT touched (they are
   /// the stalled population; their armed action is the backoff expiry).
-  // Mirrors: rio-scheduler/src/actor/materialize.rs:tick_reevaluate_parked_materialization_jobs
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:tick_reevaluate_materialization_jobs
   action parkReevaluate(d: str): bool = all {
     match jobs.get(d) {
       | NoJob => false

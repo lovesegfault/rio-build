@@ -686,23 +686,9 @@ impl SchedulerDb {
     pub(crate) async fn load_unresolved_materialization_jobs(
         &self,
     ) -> Result<Vec<RecoveredJobRow>, sqlx::Error> {
-        sqlx::query_as(
-            "SELECT j.job_id, j.drv_hash, j.carried_realized_paths, \
-                    EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, \
-                    EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago, \
-                    EXTRACT(EPOCH FROM (now() - j.created_at))::float8 AS age_secs, \
-                    j.origin, a.builder_id AS claimed_by \
-               FROM materialization_jobs j \
-               LEFT JOIN assignments a ON a.derivation_id = j.derivation_id \
-                                      AND a.status IN ('pending', 'acknowledged') \
-                                      AND EXISTS ( \
-                                          SELECT 1 FROM drv_executions e \
-                                           WHERE e.exec_id = a.exec_id \
-                                             AND e.attempt_kind = 'materialization') \
-              WHERE j.state = 'pending'",
-        )
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_as(RECOVERED_JOB_SELECT)
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// Single-row variant of [`Self::load_unresolved_materialization_jobs`]
@@ -716,14 +702,37 @@ impl SchedulerDb {
         &self,
         derivation_id: Uuid,
     ) -> Result<Option<RecoveredJobRow>, sqlx::Error> {
-        sqlx::query_as(
-            "SELECT j.job_id, j.drv_hash, j.carried_realized_paths, EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago, EXTRACT(EPOCH FROM (now() - j.created_at))::float8 AS age_secs, j.origin, a.builder_id AS claimed_by FROM materialization_jobs j LEFT JOIN assignments a ON a.derivation_id = j.derivation_id AND a.status IN ('pending', 'acknowledged') AND EXISTS ( SELECT 1 FROM drv_executions e WHERE e.exec_id = a.exec_id AND e.attempt_kind = 'materialization') WHERE j.state = 'pending' AND j.derivation_id = $1",
-        )
-        .bind(derivation_id)
-        .fetch_optional(&self.pool)
-        .await
+        sqlx::query_as(RECOVERED_JOB_ROW_SELECT.as_str())
+            .bind(derivation_id)
+            .fetch_optional(&self.pool)
+            .await
     }
 }
+
+/// The shared SELECT projection + JOIN body for [`RecoveredJobRow`]
+/// (sh-044 r1): both queries are runtime `query_as` (not the
+/// compile-time-checked macro), so a missed sync compiles fine and
+/// fails only at runtime row-decode (`ColumnNotFound`) in whichever
+/// query was forgotten — the bulk loader (recovery boot) and the
+/// single-row loader (dedup re-feed) execute on disjoint code paths.
+/// One const, two `WHERE` tails.
+const RECOVERED_JOB_SELECT: &str = "\
+    SELECT j.job_id, j.drv_hash, j.carried_realized_paths, \
+           EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, \
+           EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago, \
+           EXTRACT(EPOCH FROM (now() - j.created_at))::float8 AS age_secs, \
+           j.origin, a.builder_id AS claimed_by \
+      FROM materialization_jobs j \
+      LEFT JOIN assignments a ON a.derivation_id = j.derivation_id \
+                             AND a.status IN ('pending', 'acknowledged') \
+                             AND EXISTS ( \
+                                 SELECT 1 FROM drv_executions e \
+                                  WHERE e.exec_id = a.exec_id \
+                                    AND e.attempt_kind = 'materialization') \
+     WHERE j.state = 'pending'";
+
+static RECOVERED_JOB_ROW_SELECT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{RECOVERED_JOB_SELECT} AND j.derivation_id = $1"));
 
 /// One unresolved job as the recovery view rebuild loads it (T-4.3).
 #[derive(Debug, sqlx::FromRow)]

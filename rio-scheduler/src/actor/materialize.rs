@@ -1981,17 +1981,16 @@ impl DagActor {
             // db_str_enum! emits no sqlx::Decode — TEXT decodes as
             // String and parses here (the RawJobRow precedent at
             // db/materialization.rs). A drift from the 078 CHECK
-            // alphabet is a deploy bug; the unknown arm is the
-            // tripwire's conservative answer (the age-out arm uses
-            // origin only as a counter label).
-            origin: row.origin.parse().unwrap_or_else(|_| {
-                tracing::error!(
-                    raw_origin = %row.origin,
-                    "RecoveredJobRow.origin not in the JobOrigin alphabet (078 CHECK drift); \
-                     defaulting the in-memory mirror to CacheOpportunity"
-                );
-                crate::state::JobOrigin::CacheOpportunity
-            }),
+            // alphabet is a deploy bug; `CacheOpportunity` is the
+            // conservative default — `from_source_viable(ChildlessLeaf,
+            // CacheOpportunity)` is `true`, so an unknown origin can
+            // never strand a leaf in the stalled gauge on the age-out
+            // arm's gate.
+            origin: crate::state::db_str::parse_or_warn_default(
+                "materialization_jobs.origin",
+                &row.origin,
+                crate::state::JobOrigin::CacheOpportunity,
+            ),
         }
     }
 
@@ -4231,6 +4230,35 @@ impl DagActor {
         );
     }
 
+    /// The phase-15 settlement core shared by both
+    /// [`Self::tick_reevaluate_materialization_jobs`] arms (sh-044 r1):
+    /// `resolve_materialization_job(.., ResolvedFromSource, ..)` →
+    /// `remove_settled` gate. Returns `Some(disposition)` iff the view
+    /// entry was evicted (the at-most-once edge each arm's counter
+    /// keys on); `None` on a Fenced or Failed resolve — the job stays
+    /// in the view and is re-evaluated next tick. Each arm keeps only
+    /// its distinct counter, log fields, and (parked arm)
+    /// `still_parked` decrement; the requeue is batched once over both
+    /// arms' settled set after the loop.
+    async fn settle_resolved_from_source(
+        &mut self,
+        drv_hash: &DrvHash,
+        job_id: Uuid,
+    ) -> Option<WriteDisposition> {
+        let serving_generation = self.serving_generation();
+        let d = self
+            .resolve_materialization_job(
+                job_id,
+                None,
+                crate::state::JobState::ResolvedFromSource,
+                serving_generation,
+            )
+            .await;
+        self.materialization_jobs
+            .remove_settled(drv_hash, d)
+            .then_some(d)
+    }
+
     // r[impl obs.metric.materialization-stalled+2]
     // r[impl sched.materialize.routing+7]
     /// PD-20 (design §2.5, Phase B T-6.1): the materialization-job
@@ -4302,6 +4330,14 @@ impl DagActor {
         );
         let mut parked: Vec<(DrvHash, Uuid)> = Vec::new();
         let mut aged_out: Vec<(DrvHash, Uuid, crate::state::JobOrigin)> = Vec::new();
+        // One `requeue_after_attempt` over the union of both arms'
+        // settled entries (sh-044 r1): per-entry calls pay a per-call
+        // leader check + fresh `affected` HashSet + per-call
+        // `emit_progress`, so cross-entry build-id dedup is lost (N
+        // settled drvs sharing one build → N progress emits); the
+        // first-post-deploy backlog scenario can age out hundreds in
+        // one pass.
+        let mut requeue: Vec<DrvHash> = Vec::new();
         for (h, e) in self.materialization_jobs.iter() {
             if e.holder().is_some() {
                 continue;
@@ -4434,15 +4470,7 @@ impl DagActor {
             // the node. The spawn-intent filter and the admission table
             // stop excluding the node the moment the job row is
             // terminal.
-            let serving_generation = self.serving_generation();
-            let d = self
-                .resolve_materialization_job(
-                    job_id,
-                    None,
-                    crate::state::JobState::ResolvedFromSource,
-                    serving_generation,
-                )
-                .await;
+            //
             // Item T (harden-store reconciliation memo §6.2): every
             // PD-20 conversion — a TIME-driven from-source disposition
             // of a job whose park budget exhausted while from-source
@@ -4457,7 +4485,7 @@ impl DagActor {
             // disposition (sched.materialize.view-settlement): a Fenced
             // or Failed resolve keeps the job parked — counted by the
             // gauge below, re-evaluated next tick.
-            if self.materialization_jobs.remove_settled(&drv_hash, d) {
+            if let Some(d) = self.settle_resolved_from_source(&drv_hash, job_id).await {
                 if d == WriteDisposition::Applied {
                     metrics::counter!(
                         "rio_scheduler_materialization_converted_total",
@@ -4465,12 +4493,7 @@ impl DagActor {
                     )
                     .increment(1);
                 }
-                self.requeue_after_attempt(
-                    std::slice::from_ref(&drv_hash),
-                    crate::state::AttemptKind::Materialization,
-                    None,
-                )
-                .await;
+                requeue.push(drv_hash.clone());
                 still_parked -= 1;
                 tracing::info!(
                     drv_hash = %drv_hash,
@@ -4536,16 +4559,7 @@ impl DagActor {
                 still_parked += 1;
                 continue;
             }
-            let serving_generation = self.serving_generation();
-            let d = self
-                .resolve_materialization_job(
-                    job_id,
-                    None,
-                    crate::state::JobState::ResolvedFromSource,
-                    serving_generation,
-                )
-                .await;
-            if self.materialization_jobs.remove_settled(&drv_hash, d) {
+            if let Some(d) = self.settle_resolved_from_source(&drv_hash, job_id).await {
                 if d == WriteDisposition::Applied {
                     metrics::counter!(
                         "rio_scheduler_materialization_aged_out_total",
@@ -4553,15 +4567,11 @@ impl DagActor {
                     )
                     .increment(1);
                 }
-                self.requeue_after_attempt(
-                    std::slice::from_ref(&drv_hash),
-                    crate::state::AttemptKind::Materialization,
-                    None,
-                )
-                .await;
+                requeue.push(drv_hash.clone());
                 tracing::info!(
                     drv_hash = %drv_hash,
                     %job_id,
+                    ?evidence,
                     origin = origin.as_str(),
                     age_out_after_secs = age_out_after.as_secs(),
                     "unclaimed materialization job aged out: resolved from_source \
@@ -4571,6 +4581,8 @@ impl DagActor {
                 );
             }
         }
+        self.requeue_after_attempt(&requeue, crate::state::AttemptKind::Materialization, None)
+            .await;
         // The stalled gauge: ground truth after the re-evaluation pass
         // — parked entries the conversion did not resolve PLUS aged-out
         // entries the `from_source_viable` gate refused (both are

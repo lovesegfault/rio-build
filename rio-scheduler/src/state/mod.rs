@@ -16,7 +16,7 @@
 //! - terminal -> non-terminal: rejected (except poisoned -> created on TTL)
 
 mod build;
-mod db_str;
+pub(crate) mod db_str;
 mod derivation;
 mod executor;
 mod newtypes;

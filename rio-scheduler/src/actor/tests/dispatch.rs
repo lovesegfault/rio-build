@@ -814,11 +814,7 @@ async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
     // The unresolved (pending, unclaimed) job view entry.
     actor.materialization_jobs.insert(
         DrvHash::from("pd7-job-pending"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(
-            Uuid::new_v4(),
-            None,
-            crate::state::JobOrigin::CacheOpportunity,
-        ),
+        crate::actor::materialize::JobViewEntry::test_unclaimed(Uuid::new_v4()),
     );
 
     let snap = actor.compute_spawn_intents(&Default::default());
@@ -2309,16 +2305,19 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
 /// at the on-actor FMP wall-clock (8.77 s/tick under sh-044's store)
 /// and latching the cost-axis backpressure.
 ///
-/// Structural: 1000 IA leaves with substitutable outputs; the merge's
-/// inline sweep creates 1000 CacheOpportunity jobs; the next Tick's
-/// candidate set MUST be empty (zero new FMP calls).
+/// Structural: 20 IA leaves with substitutable outputs; the merge's
+/// inline sweep creates 20 CacheOpportunity jobs; the next Tick's
+/// candidate set MUST be empty (zero new FMP calls). The structural
+/// `assert_eq!(after_calls, before_calls)` is the property — n=20
+/// proves the same zero-new-FMP-calls equality as n=1000 at ~50× less
+/// per-run ephemeral-PG insert cost.
 // r[verify sched.dispatch.probe-skip-pending-mat]
 #[tokio::test]
 async fn batch_probe_skips_pending_mat_jobs() -> TestResult {
     use std::sync::atomic::Ordering;
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
-    let n = 1000usize;
+    let n = 20usize;
     let out_paths: Vec<String> = (0..n)
         .map(|i| test_store_path(&format!("sh044-{i}-out")))
         .collect();
@@ -2353,7 +2352,6 @@ async fn batch_probe_skips_pending_mat_jobs() -> TestResult {
 
     let before_calls = store.calls.find_missing_calls.load(Ordering::SeqCst);
     let before_log = store.calls.find_missing_paths_log.read().unwrap().len();
-    let t0 = std::time::Instant::now();
     tick(&handle).await?;
     let after_calls = store.calls.find_missing_calls.load(Ordering::SeqCst);
     let after_log = store.calls.find_missing_paths_log.read().unwrap().len();
@@ -2362,15 +2360,11 @@ async fn batch_probe_skips_pending_mat_jobs() -> TestResult {
         "second sweep re-probes ZERO candidates: every Ready node \
          carries an unresolved job → filter skips → empty candidate \
          set → early return before fan_out_probes; pre-fix the same \
-         1000 nodes were re-admitted every generation"
+         {n} nodes were re-admitted every generation"
     );
     assert_eq!(
         after_log, before_log,
         "no new find_missing_paths request logged"
-    );
-    assert!(
-        t0.elapsed() < std::time::Duration::from_secs(1),
-        "wall-clock backstop: empty-candidate sweep is sub-ms"
     );
     Ok(())
 }

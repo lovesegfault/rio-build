@@ -9606,11 +9606,7 @@ async fn stale_retrylater_redelivery_cannot_defer_a_fresh_holders_job() -> TestR
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor(db.pool.clone());
     let drv = DrvHash::from("defer-stale-drv");
-    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(
-        Uuid::new_v4(),
-        None,
-        crate::state::JobOrigin::CacheOpportunity,
-    );
+    let mut entry = crate::actor::materialize::JobViewEntry::test_unclaimed(Uuid::new_v4());
     entry.mint_claim(crate::state::ExecutorId::from("fresh-holder"));
     actor.materialization_jobs.insert(drv.clone(), entry);
 
@@ -11148,11 +11144,7 @@ async fn dirty_edge_paces_through_a_failure_window() -> TestResult {
     db.pool.close().await;
     actor.materialization_jobs.insert(
         crate::state::DrvHash::from("dirty-window-drv"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(
-            Uuid::new_v4(),
-            None,
-            crate::state::JobOrigin::CacheOpportunity,
-        ),
+        crate::actor::materialize::JobViewEntry::test_unclaimed(Uuid::new_v4()),
     );
 
     let started = std::time::Instant::now();
@@ -11346,11 +11338,7 @@ async fn zero_interest_cancel_sweep_transaction_bound() -> TestResult {
         // so every entry is zero-interest via the node-absent arm.
         actor.materialization_jobs.insert(
             DrvHash::from(hash.as_str()),
-            crate::actor::materialize::JobViewEntry::new_unclaimed(
-                job_id,
-                None,
-                crate::state::JobOrigin::CacheOpportunity,
-            ),
+            crate::actor::materialize::JobViewEntry::test_unclaimed(job_id),
         );
     }
 
@@ -11429,11 +11417,7 @@ async fn backoff_lapsing_during_the_beat_query_is_served() -> TestResult {
     let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("job create must apply");
     };
-    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(
-        job_id,
-        None,
-        crate::state::JobOrigin::CacheOpportunity,
-    );
+    let mut entry = crate::actor::materialize::JobViewEntry::test_unclaimed(job_id);
     entry.test_set_parked_until(Some(
         std::time::Instant::now() + std::time::Duration::from_millis(400),
     ));
@@ -11514,11 +11498,7 @@ async fn listing_excludes_in_memory_terminal_nodes() -> TestResult {
         }
         actor.materialization_jobs.insert(
             DrvHash::from(hash),
-            crate::actor::materialize::JobViewEntry::new_unclaimed(
-                job_id,
-                None,
-                crate::state::JobOrigin::CacheOpportunity,
-            ),
+            crate::actor::materialize::JobViewEntry::test_unclaimed(job_id),
         );
         job_ids.push((hash, job_id));
     }
@@ -11623,11 +11603,7 @@ async fn node_completed_by_other_means_resolves_obsolete() -> TestResult {
         .set_status_for_test(DerivationStatus::Completed);
     actor.materialization_jobs.insert(
         DrvHash::from("obsolete-fold"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(
-            job_id,
-            None,
-            crate::state::JobOrigin::CacheOpportunity,
-        ),
+        crate::actor::materialize::JobViewEntry::test_unclaimed(job_id),
     );
 
     let authority = actor
@@ -11752,11 +11728,7 @@ async fn skew_detector_fires_on_terminal_node_pending_job() -> TestResult {
         .set_status_for_test(DerivationStatus::Completed);
     actor.materialization_jobs.insert(
         DrvHash::from("skew-plant"),
-        crate::actor::materialize::JobViewEntry::new_unclaimed(
-            job_id,
-            None,
-            crate::state::JobOrigin::CacheOpportunity,
-        ),
+        crate::actor::materialize::JobViewEntry::test_unclaimed(job_id),
     );
 
     let authority = actor
@@ -11824,11 +11796,7 @@ async fn moot_sweep_is_bounded_per_tick() -> TestResult {
     for (hash, jc) in hashes.iter().zip(&created) {
         actor.materialization_jobs.insert(
             DrvHash::from(hash.as_str()),
-            crate::actor::materialize::JobViewEntry::new_unclaimed(
-                jc.job_id,
-                None,
-                crate::state::JobOrigin::CacheOpportunity,
-            ),
+            crate::actor::materialize::JobViewEntry::test_unclaimed(jc.job_id),
         );
     }
 
