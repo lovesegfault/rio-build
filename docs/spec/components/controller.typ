@@ -1915,7 +1915,8 @@ budget brake's rotation property upstream of the mint.
 #r("ctrl.nodeclaim.mint-deficit-proportional+3")[
   Minting MUST be bounded by demand, by the fleet budget, AND by the
   concurrent-unlaunched headroom `max_inflight_unlaunched − |{live:
-  Launched≠True}|` --- the three quantities with safety meaning ---
+  Launched≠True ∧ ¬registered ∧ ¬terminating}| − created_this_tick`
+  --- the three quantities with safety meaning ---
   and by NOTHING else: each cell's per-tick claim count is `min(n,
   ⌊budget/chunk(n)⌋, inflight_headroom)`, where `n` is the
   packing-minimal FFD bin count `n_pack` over the actual
@@ -1927,8 +1928,13 @@ budget brake's rotation property upstream of the mint.
   the family, because a zero mint under an affordable family leaves
   demand and headroom unchanged and repeats identically every tick
   (steady-state cell starvation, not deferral). `budget` is the
-  per-class fleet-core sub-budget. The headroom term is a GLOBAL
-  ceiling: under healthy launch throughput it acts as a
+  per-class fleet-core sub-budget. `created_this_tick` is the
+  count of NodeClaims successfully created by EARLIER cells in the
+  same `cover_deficit` pass --- the same accumulate-across-cells
+  shape the budget term carries (bug_015 polarity), so the cross-cell
+  sum within one tick cannot exceed `max_inflight_unlaunched`. The
+  headroom term is a GLOBAL ceiling: under healthy launch throughput
+  it acts as a
   ≈`max_inflight_unlaunched`/tick velocity cap matched to Karpenter's
   launch rate; under backlog it tightens to zero so `Synced()=false`
   windows stay ≪ tick. The L1 velocity-cap retirement holds because

@@ -410,6 +410,21 @@ module nodeclaimLifecycle {
   // it differently. MUST be ≥ 2 — `canReachBurstFullMint`
   // (`createdB>1` in Base; CLASS_CAP_A=1 caps cellA) is unreachable
   // at 1.
+  //
+  // SHAPE-PARITY-ONLY DISCLAIMER (the one home; every other site
+  // points here): at MAX = |CLAIMS| = 2, phases partition CLAIMS ⇒
+  // freeSlots ≤ MAX − unlaunchedBefore in EVERY reachable state, so
+  // the headroom arm in `wantA`/`wantB`/`vDeficitDeferred` never
+  // binds distinctly from the slot ceiling. The model RECORDS the
+  // law's third term without changing reachable verdicts — deleting
+  // the arm is bitwise pass/fail-identical for every wired check.
+  //
+  // TODO: a non-vacuous headroom check needs MAX < |CLAIMS| (e.g.
+  // |CLAIMS|=3, MAX=2) so headroom CAN bind below freeSlots; the
+  // `canHitInflightCap` witness and the +3 rule's quint-side
+  // `r[verify]` have zero falsification power until then. The CI
+  // witness check is unwired (sh-043-r1) pending that depth — wire
+  // it back when this TODO closes.
   pure val MAX_INFLIGHT_UNLAUNCHED: int = 2
 
   pure def boolChoices(faultOn: bool): Set[bool] =
@@ -548,15 +563,11 @@ module nodeclaimLifecycle {
   val canReachUnknownCellDrop = not(effects.contains(EUnknownCellDrop))
   val canReachCreate = not(effects.contains(ECreateOk))
   val canReachBurstFullMint = not(effects.contains(EBurstFullMint))
-  /// sh-043 non-vacuity (shape-parity witness): the unlaunched count
-  /// reached `MAX_INFLIGHT_UNLAUNCHED` with surplus demand. At
-  /// |CLAIMS|=MAX=2 this coincides with the slot ceiling — it
-  /// certifies the cap-hitting state is REACHABLE, NOT that headroom
-  /// bound distinctly from slots (a falsifiable headroom check needs
-  /// `MAX < |CLAIMS|`, deferred). The `not(...)` form is the project
-  /// convention: "violated" means the effect IS reached;
-  /// `effects.contains(...)` directly would trivially "violate" at
-  /// init where `effects=Set()`.
+  /// sh-043: the unlaunched count reached `MAX_INFLIGHT_UNLAUNCHED`
+  /// with surplus demand. NOT CI-wired — shape-parity-only at
+  /// MAX=|CLAIMS|=2 (see the MAX_INFLIGHT_UNLAUNCHED note); kept for
+  /// the |CLAIMS|=3 follow-up. The `not(...)` form is the project
+  /// convention: "violated" means the effect IS reached.
   val canHitInflightCap = not(effects.contains(EInflightCapped))
   val canReachAcquireWithInflight = not(effects.contains(EAcquireWithInflight))
   val canReachDegradedReloadTick = not(effects.contains(EDegradedReloadTick))
@@ -1201,9 +1212,8 @@ module nodeclaimLifecycle {
       // tree. wantB's headroom term debits `wantA` (NOT `createdA`:
       // `createdA` is bound below, after `wantB`; the `- wantA` debit
       // matches the existing `globalRemaining - wantA` shape on the
-      // same line). At MAX=|CLAIMS|=2 the headroom term is
-      // SHAPE-PARITY ONLY (phases partition CLAIMS ⇒ freeSlots ≤
-      // MAX − unlaunchedBefore, so freeSlots already dominates).
+      // same line). Shape-parity-only at MAX=|CLAIMS|=2 — see the
+      // MAX_INFLIGHT_UNLAUNCHED note.
       val wantA = if (coverableA)
           min2(min2(demandA, min2(classRemainingA, globalRemaining)),
                MAX_INFLIGHT_UNLAUNCHED - unlaunchedBefore)
@@ -1378,12 +1388,9 @@ module nodeclaimLifecycle {
       // created_this_tick semantics); in this 2-slot universe a
       // slot-bound A forces slots-for-B to 0, so created-vs-want
       // debit cannot diverge on the B bound.
-      // sh-043: the headroom arg is SHAPE-PARITY ONLY at
-      // MAX=|CLAIMS|=2 (the existing freeSlots.size() arg already
-      // dominates: freeSlots ≤ MAX − unlaunchedBefore by phase
-      // partition), so this relaxation is a documented no-op exactly
-      // like `vBudgetGlobal` — the model RECORDS the law's third term
-      // without changing its reachable verdicts. Per-disjunct
+      // sh-043: the headroom arg is shape-parity-only at
+      // MAX=|CLAIMS|=2 (see the MAX_INFLIGHT_UNLAUNCHED note) — a
+      // documented no-op exactly like `vBudgetGlobal`. Per-disjunct
       // inside-min, NOT an outer antecedent (which would mask the
       // disjunct at cap and gratuitously weaken the check).
       val vDeficitDeferred =
@@ -1397,8 +1404,8 @@ module nodeclaimLifecycle {
                               min2(freeSlots.size() - createdA,
                                    MAX_INFLIGHT_UNLAUNCHED - unlaunchedBefore - createdA)))
       // sh-043: the unlaunched count reached MAX_INFLIGHT_UNLAUNCHED
-      // with surplus demand (at |CLAIMS|=MAX=2 this coincides with
-      // the slot ceiling — shape-parity witness).
+      // with surplus demand (shape-parity-only — see the
+      // MAX_INFLIGHT_UNLAUNCHED note).
       val eInflightCapped =
         (createdA + createdB > 0)
         and (unlaunchedBefore + createdA + createdB == MAX_INFLIGHT_UNLAUNCHED)

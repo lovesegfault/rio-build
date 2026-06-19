@@ -5604,7 +5604,8 @@ rec {
     # per-cell-per-tick cap stays gone from relation AND invariant;
     # the burst regime is non-vacuous via canReachBurstFullMint
     # below; the headroom term is shape-parity-only at
-    # MAX=|CLAIMS|=2, witnessed by canHitInflightCap).
+    # MAX=|CLAIMS|=2 — see the MAX_INFLIGHT_UNLAUNCHED note in the
+    # spec for the deferred non-vacuous depth).
     # r[verify ctrl.nodeclaim.budget.per-class+4]
     # r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
     quint-nodeclaim-lifecycle-base = mkQuintCheck {
@@ -5785,18 +5786,11 @@ rec {
       main = "nodeclaimLifecycleBase";
       witness = "canReachBurstFullMint";
     };
-    # sh-043: the unlaunched count reached MAX_INFLIGHT_UNLAUNCHED
-    # with surplus demand (at |CLAIMS|=MAX=2 this coincides with the
-    # slot ceiling — shape-parity witness; the headroom term is
-    # SHAPE-PARITY ONLY in this universe so this certifies the
-    # cap-hitting state is REACHABLE, NOT that headroom bound
-    # distinctly from slots).
-    quint-nodeclaim-witness-inflight-cap = mkQuintWitnessCheck {
-      name = "nodeclaim-witness-inflight-cap";
-      spec = "nodeclaimLifecycle";
-      main = "nodeclaimLifecycleBase";
-      witness = "canHitInflightCap";
-    };
+    # sh-043 `canHitInflightCap` is NOT wired: at MAX=|CLAIMS|=2 the
+    # headroom term is shape-parity-only (see the
+    # MAX_INFLIGHT_UNLAUNCHED note in nodeclaimLifecycle.qnt — the
+    # one disclaimer home), so the witness has zero falsification
+    # power. Re-wire when the |CLAIMS|=3 TODO there closes.
     # The per-class budget binds while the global budget still has room.
     quint-nodeclaim-witness-class-budget = mkQuintWitnessCheck {
       name = "nodeclaim-witness-class-budget";
