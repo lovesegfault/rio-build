@@ -5,10 +5,17 @@
 # (the 47-template-default-ban single-default convention). Explicit 0
 # is the meaningful kill-switch the law's own doc treats as halt.
 #
-# r3: `required` because Sprig `int64 nil`/`float64 nil` coerce to 0 —
-# `--set …=null` would otherwise silently render the dangerous 0 (the
-# value values.yaml's own comment forbids). Helm `required` checks
-# nil/"" only, so explicit 0 still passes the guard.
+# THE Sprig nil→0 lecture (single home; controller.yaml/_helpers.tpl
+# point HERE): `int64 nil`/`float64 nil` coerce to 0, so `--set …=null`
+# silently renders the dangerous 0 (a 0s lead-time seed reaps every
+# NodeClaim before boot; 0 inflight is the operator's mint-halt
+# kill-switch and MUST be explicit; a 0 maxLeadTime caps every alert
+# threshold to its floor). The chart has no values.schema.json, so
+# Helm applies no nullability guard. `rio.requiredInt`/
+# `rio.requiredFloat` (_helpers.tpl) wrap every numeric .Values leaf
+# in `required`, which checks nil/"" only — explicit 0 still passes.
+# r4: per-mechanism close — every sibling in the [nodeclaim_pool]/[sla]
+# scalar block goes through the helpers, not just the two r3 named.
 
 . "$(dirname "$0")/_lib.sh"
 
@@ -48,6 +55,18 @@ if render_karpenter --set scheduler.sla.defaultLeadTimeSeed=null >/dev/null 2>"$
 fi
 grep -q "defaultLeadTimeSeed must be set" "$err" || {
   echo "FAIL: defaultLeadTimeSeed=null refused but without naming the key:" >&2
+  sed 's/^/  /' "$err" >&2
+  exit 1
+}
+# r4: ONE more sibling proves the per-mechanism sweep (rio.requiredFloat
+# covers maxLeadTime in controller.yaml + scheduler.yaml +
+# prometheusrule.yaml — three call sites, one guard message).
+if render_karpenter --set scheduler.sla.maxLeadTime=null >/dev/null 2>"$err"; then
+  echo "FAIL: maxLeadTime=null rendered — rio.requiredFloat fail-open (nil→0.0 caps StuckPending/BootTimeoutLoop thresholds to floor)" >&2
+  exit 1
+fi
+grep -q "maxLeadTime must be set" "$err" || {
+  echo "FAIL: maxLeadTime=null refused but without naming the key:" >&2
   sed 's/^/  /' "$err" >&2
   exit 1
 }

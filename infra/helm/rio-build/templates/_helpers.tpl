@@ -276,6 +276,38 @@ provisioning halt with no alert). Bare integers are bytes.
 {{- end -}}
 {{- end -}}
 
+{{/*
+rio.requiredInt / rio.requiredFloat — sh-043: the per-mechanism close
+of the Sprig nil→0 coercion class. `int64 nil` and `float64 nil`
+silently return 0, so `--set scheduler.sla.maxLeadTime=null` (or any
+overlay nulling a leaf the chart never schema-validates) renders the
+dangerous 0 with no error — a 0 lead-time reaps every NodeClaim
+before boot, a 0 fleet-core budget halts all minting. Helm `required`
+checks nil/"" only, so explicit 0 still passes. helm/52 asserts both
+legs (0 renders 0; nil refuses naming the key). Every bare
+`int64 .X` / `float64 .X` of a .Values leaf in the controller /
+scheduler / prometheusrule TOML blocks goes through one of these.
+
+Usage:
+  {{ include "rio.requiredInt"   (list "scheduler.sla.maxFleetCores" .maxFleetCores) }}
+  {{ include "rio.requiredFloat" (list "%.1f" "scheduler.sla.maxLeadTime" .maxLeadTime) }}
+requiredFloat takes a printf format so callers keep their TOML
+float-literal shape (`%.1f` for f64-typed serde fields, `%v` where
+the Go default repr is fine).
+*/}}
+{{- define "rio.requiredInt" -}}
+{{- $key := index . 0 -}}
+{{- $val := index . 1 -}}
+{{- required (printf "%s must be set (Sprig int64 nil→0)" $key) $val | int64 -}}
+{{- end -}}
+
+{{- define "rio.requiredFloat" -}}
+{{- $fmt := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- $val := index . 2 -}}
+{{- printf $fmt (float64 (required (printf "%s must be set (Sprig float64 nil→0)" $key) $val)) -}}
+{{- end -}}
+
 {{- define "rio.optBool" -}}
 {{- $ctx := index . 0 -}}
 {{- $key := index . 1 -}}

@@ -31,17 +31,17 @@ max_cores = {{ printf "%.1f" (float64 .) }}
 {{- with .maxMem }}
 max_mem = {{ int64 . }}
 {{- end }}
-max_disk = {{ int64 .maxDisk }}
-default_disk = {{ int64 .defaultDisk }}
-hw_cost_tolerance = {{ printf "%v" (float64 .hwCostTolerance) }}
-hw_explore_epsilon = {{ printf "%v" (float64 .hwExploreEpsilon) }}
-hw_bench_mem_floor = {{ int64 .hwBenchMemFloor }}
-max_fleet_cores = {{ int64 .maxFleetCores }}
-ladder_budget = {{ printf "%.1f" (float64 .ladderBudget) }}
-max_forecast_cores_per_tenant = {{ int64 .maxForecastCoresPerTenant }}
-max_keys_per_tenant = {{ int64 .maxKeysPerTenant }}
-max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
-max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
+max_disk = {{ include "rio.requiredInt" (list "scheduler.sla.maxDisk" .maxDisk) }}
+default_disk = {{ include "rio.requiredInt" (list "scheduler.sla.defaultDisk" .defaultDisk) }}
+hw_cost_tolerance = {{ include "rio.requiredFloat" (list "%v" "scheduler.sla.hwCostTolerance" .hwCostTolerance) }}
+hw_explore_epsilon = {{ include "rio.requiredFloat" (list "%v" "scheduler.sla.hwExploreEpsilon" .hwExploreEpsilon) }}
+hw_bench_mem_floor = {{ include "rio.requiredInt" (list "scheduler.sla.hwBenchMemFloor" .hwBenchMemFloor) }}
+max_fleet_cores = {{ include "rio.requiredInt" (list "scheduler.sla.maxFleetCores" .maxFleetCores) }}
+ladder_budget = {{ include "rio.requiredFloat" (list "%.1f" "scheduler.sla.ladderBudget" .ladderBudget) }}
+max_forecast_cores_per_tenant = {{ include "rio.requiredInt" (list "scheduler.sla.maxForecastCoresPerTenant" .maxForecastCoresPerTenant) }}
+max_keys_per_tenant = {{ include "rio.requiredInt" (list "scheduler.sla.maxKeysPerTenant" .maxKeysPerTenant) }}
+max_lead_time = {{ include "rio.requiredFloat" (list "%.1f" "scheduler.sla.maxLeadTime" .maxLeadTime) }}
+max_node_claims_per_cell_per_tick = {{ include "rio.requiredInt" (list "scheduler.sla.maxNodeClaimsPerCellPerTick" .maxNodeClaimsPerCellPerTick) }}
 {{- with .maxConsolidationTime }}
 max_consolidation_time = {{ printf "%.1f" (float64 .) }}
 {{- end }}
@@ -123,9 +123,9 @@ ladder = { rungs = [{{ range $i, $r := .rungs }}{{ if $i }}, {{ end }}{ class = 
 {{- end }}
 
 [sla.probe]
-cpu = {{ printf "%.1f" (float64 .probe.cpu) }}
-mem_per_core = {{ int64 .probe.memPerCore }}
-mem_base = {{ int64 .probe.memBase }}
+cpu = {{ include "rio.requiredFloat" (list "%.1f" "scheduler.sla.probe.cpu" .probe.cpu) }}
+mem_per_core = {{ include "rio.requiredInt" (list "scheduler.sla.probe.memPerCore" .probe.memPerCore) }}
+mem_base = {{ include "rio.requiredInt" (list "scheduler.sla.probe.memBase" .probe.memBase) }}
 deadline_secs = {{ int64 (default 3600 .probe.deadlineSecs) }}
 {{- range $feat, $p := .featureProbes }}
 

@@ -31,23 +31,20 @@ kube_build_scheduler_enabled = {{ $.Values.buildScheduler.enabled }}
 reference_hw_class = {{ .referenceHwClass | quote }}
 {{- /* sh-043: NO Sprig default (treats integer 0 as empty, swallowing
        the 0 mint-halt). values.yaml owns the default per the
-       47-template-default-ban single-default convention; helm/52
-       asserts 0 renders 0. r3: `required` because Sprig
-       `int64 nil`/`float64 nil` coerce to 0 — without the guard,
-       `--set …=null` silently renders the dangerous 0 (a 0s
-       lead-time seed reaps every NodeClaim before boot; 0 inflight
-       is the operator's mint-halt kill-switch and MUST be explicit).
-       Helm `required` checks nil/"" only — explicit 0 passes. */}}
-default_lead_time_seed = {{ printf "%.1f" (float64 (required "scheduler.sla.defaultLeadTimeSeed must be set (0 reaps every NodeClaim before boot)" .defaultLeadTimeSeed)) }}
-max_fleet_cores = {{ int64 .maxFleetCores }}
-max_inflight_unlaunched = {{ int64 (required "karpenter.nodeclaimPool.maxInflightUnlaunched must be set (0 is the explicit mint-halt; nil must not silently become it)" $.Values.karpenter.nodeclaimPool.maxInflightUnlaunched) }}
-max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
-max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
+       47-template-default-ban single-default convention. Every numeric
+       .Values leaf goes through `rio.requiredInt`/`rio.requiredFloat`
+       (the per-mechanism Sprig nil→0 close — see _helpers.tpl);
+       helm/52 asserts 0 renders 0 and nil refuses. */}}
+default_lead_time_seed = {{ include "rio.requiredFloat" (list "%.1f" "scheduler.sla.defaultLeadTimeSeed" .defaultLeadTimeSeed) }}
+max_fleet_cores = {{ include "rio.requiredInt" (list "scheduler.sla.maxFleetCores" .maxFleetCores) }}
+max_inflight_unlaunched = {{ include "rio.requiredInt" (list "karpenter.nodeclaimPool.maxInflightUnlaunched" $.Values.karpenter.nodeclaimPool.maxInflightUnlaunched) }}
+max_node_claims_per_cell_per_tick = {{ include "rio.requiredInt" (list "scheduler.sla.maxNodeClaimsPerCellPerTick" .maxNodeClaimsPerCellPerTick) }}
+max_lead_time = {{ include "rio.requiredFloat" (list "%.1f" "scheduler.sla.maxLeadTime" .maxLeadTime) }}
 {{- /* `dataVolumeSize` is a k8s Quantity ("500Gi"); approximate
        allocatable as 90% (kubelet eviction threshold + image cache). */}}
 max_node_disk = {{ mulf 0.9 (include "rio.quantityBytes" $.Values.karpenter.dataVolumeSize) | int64 }}
-fuse_cache_bytes = {{ int64 $.Values.poolDefaults.fuseCacheBytes }}
-fetcher_fuse_cache_bytes = {{ int64 $.Values.poolDefaults.fetcherFuseCacheBytes }}
+fuse_cache_bytes = {{ include "rio.requiredInt" (list "poolDefaults.fuseCacheBytes" $.Values.poolDefaults.fuseCacheBytes) }}
+fetcher_fuse_cache_bytes = {{ include "rio.requiredInt" (list "poolDefaults.fetcherFuseCacheBytes" $.Values.poolDefaults.fetcherFuseCacheBytes) }}
 metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
 {{- with .maxConsolidationTime }}
 max_consolidation_time = {{ printf "%.1f" (float64 .) }}
@@ -165,7 +162,7 @@ spec:
             # `rio.build/hw-bench-needed` decision and the scheduler's
             # threat-model assumption never diverge.
             - name: RIO_HW_BENCH_MEM_FLOOR
-              value: {{ int64 .hwBenchMemFloor | quote }}
+              value: {{ include "rio.requiredInt" (list "scheduler.sla.hwBenchMemFloor" .hwBenchMemFloor) | quote }}
             {{- end }}
             # database_url stays env (Secret-sourced; never lands in the
             # ConfigMap-rendered TOML). lease_namespace via downward API

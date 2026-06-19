@@ -401,7 +401,7 @@ spec:
         - alert: RioNodeclaimPoolStuckPending
           expr: |
             rio_controller_nodeclaim_inflight_age_max_seconds
-              > clamp(2 * rio_controller_nodeclaim_ice_timeout_seconds, 90, {{ max 90 (mulf 3 (float64 .Values.scheduler.sla.maxLeadTime) | int) }})
+              > clamp(2 * rio_controller_nodeclaim_ice_timeout_seconds, 90, {{ max 90 (mulf 3 (include "rio.requiredFloat" (list "%v" "scheduler.sla.maxLeadTime" .Values.scheduler.sla.maxLeadTime)) | int) }})
           for: 30s
           labels:
             severity: warning
@@ -446,7 +446,7 @@ spec:
         - alert: RioNodeclaimPoolBootTimeoutLoop
           expr: |
             sum by (cell) (
-              increase(rio_controller_nodeclaim_reaped_total{reason="boot-timeout"}[{{ max 90 (add (mulf 4 (float64 .Values.scheduler.sla.maxLeadTime) | int) 40) }}s])
+              increase(rio_controller_nodeclaim_reaped_total{reason="boot-timeout"}[{{ max 90 (add (mulf 4 (include "rio.requiredFloat" (list "%v" "scheduler.sla.maxLeadTime" .Values.scheduler.sla.maxLeadTime)) | int) 40) }}s])
             ) >= 2
           for: 5m
           labels:
