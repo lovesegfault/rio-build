@@ -12,7 +12,8 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use super::TF_DIR;
-use crate::config::XtaskConfig;
+use super::ami::AmiArch;
+use crate::config::{DevArch, XtaskConfig};
 use crate::k8s::client as kube;
 use crate::k8s::provider::DeployOpts;
 use crate::k8s::{NS, ensure_namespaces, shared, status};
@@ -54,6 +55,30 @@ const POOLS_JSON: &str = r#"[
    "nodeSelector":null}
 ]"#;
 
+/// [`POOLS_JSON`] with the other arch's pools dropped under
+/// `RIO_DEV_ARCH` (issue #58). A pool is dropped iff its `systems[]`
+/// contains the EXCLUDED nix-system — the surviving fetcher pool
+/// still covers `"builtin"`.
+fn pools_json(cfg: &XtaskConfig) -> String {
+    let drop = match cfg.dev_arch() {
+        Some(DevArch::X86_64) => "aarch64-linux",
+        Some(DevArch::Aarch64) => "x86_64-linux",
+        None => return POOLS_JSON.to_string(),
+    };
+    let pools: Vec<serde_json::Value> = serde_json::from_str(POOLS_JSON).unwrap();
+    serde_json::to_string(
+        &pools
+            .into_iter()
+            .filter(|p| {
+                !p["systems"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v == drop))
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
 pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let log_level = opts.log_level.as_str();
     let tenant = opts.tenant.as_deref();
@@ -80,10 +105,15 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // `ami-latest` from EC2 (which can point at a prod tag after a
     // dev/prod interleave). assert_registered then confirms ALL
     // (arch,boot) tuples exist for that tag — wrong/missing → loud
-    // error, never a wedged Karpenter.
+    // error, never a wedged Karpenter. The tag itself is arch-
+    // independent (hashes ALL targets — see `ami_tag` doc) so a
+    // partial `--ami-arch x86_64` push and this deploy agree;
+    // RIO_DEV_ARCH only narrows which (arch,boot) tuples we ASSERT
+    // exist (issue #58) so a single-arch dev cluster doesn't fail
+    // closed on an aarch64 AMI it never built.
     let ami_tag = super::ami::ami_tag().await?;
     let ami_tag = ami_tag.as_str();
-    super::ami::assert_registered(ami_tag, &region).await?;
+    super::ami::assert_registered(ami_tag, &region, AmiArch::for_dev(cfg)).await?;
 
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
@@ -257,7 +287,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // The NixOS AMI's containerd cgroup_writable=true is in
             // place (nix/nixos-node/eks-node.nix) so the flip is a
             // one-line revert here when P0560 lands.
-            .set_json("pools", POOLS_JSON)
+            .set_json("pools", pools_json(cfg))
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             // I-128: store.replicas was a fixed "8" here (I-105
@@ -524,5 +554,42 @@ async fn ec2nodeclass_resolved_amis(
             );
             std::collections::HashSet::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pools_json_drops_other_arch() {
+        rio_test_support::Jail::expect_with(|jail| {
+            // Unset → multi-arch (round-trip preserves all 6 entries).
+            let all: Vec<serde_json::Value> =
+                serde_json::from_str(&pools_json(&XtaskConfig::default())).unwrap();
+            assert_eq!(all.len(), 6);
+
+            jail.set_env("RIO_DEV_ARCH", "x86_64");
+            let cfg = XtaskConfig::from_process_env()?;
+            let p: Vec<serde_json::Value> = serde_json::from_str(&pools_json(&cfg)).unwrap();
+            assert_eq!(p.len(), 3, "{p:?}");
+            for e in &p {
+                let systems = e["systems"].as_array().unwrap();
+                assert!(
+                    !systems.iter().any(|v| v == "aarch64-linux"),
+                    "aarch64-linux survived: {e}"
+                );
+            }
+            // The surviving fetcher still serves `builtin` FODs.
+            assert!(p.iter().any(|e| {
+                e["kind"] == "Fetcher"
+                    && e["systems"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|v| v == "builtin")
+            }));
+            Ok(())
+        });
     }
 }

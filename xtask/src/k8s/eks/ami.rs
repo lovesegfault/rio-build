@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use super::TF_DIR;
+use crate::config::{DevArch, XtaskConfig};
 use crate::k8s::client as kube;
 use crate::sh::{cmd, run_read, shell};
 use crate::{git, tofu, ui};
@@ -101,6 +102,18 @@ impl AmiArch {
             AmiArch::All => &[X86, ARM, X86_BIOS],
         }
     }
+
+    /// `RIO_DEV_ARCH` → `AmiArch` (issue #58). Unset/unrecognized →
+    /// `All`. Call sites that have an explicit `--ami-arch` flag
+    /// (`Option<AmiArch>`) prefer the flag over this — the env hint
+    /// never overrides an explicit choice (including explicit `all`).
+    pub fn for_dev(cfg: &XtaskConfig) -> Self {
+        match cfg.dev_arch() {
+            Some(DevArch::X86_64) => AmiArch::X86_64,
+            Some(DevArch::Aarch64) => AmiArch::Aarch64,
+            None => AmiArch::All,
+        }
+    }
 }
 
 /// #58: default to the seedless `ami-dev` flake attrs so the drvPath
@@ -141,6 +154,13 @@ struct ImageInfo {
 /// would miss. Called by `up --ami` to find/tag, and by deploy to set
 /// `karpenter.amiTag` (#58: locally-computed dev/prod tag, not the
 /// EC2 `ami-latest` lookup that mixes dev and prod).
+///
+/// Hashes the FULL [`AmiArch::All`] target set regardless of
+/// `RIO_DEV_ARCH` / `--ami-arch`: a partial `--ami-arch x86_64` push
+/// and a later full `--ami` must compute the SAME tag so
+/// `find_existing` skips the already-uploaded x86 images. Only
+/// `RIO_PROD_AMI` (dev vs prod installables, via [`pick_installable`])
+/// changes the tag.
 ///
 /// I-198: was sync `sh::read` — `nix eval` of a NixOS module is
 /// multi-second per arch (×2). `run_read` spawns via tokio::process
@@ -396,10 +416,10 @@ fn latest_ami_tag_of(images: &[Image]) -> Result<String> {
 /// NodePool NotReady, and the cluster stops provisioning until someone
 /// patches the EC2NodeClass back. Still useful post-I-182: catches a
 /// half-registered tag (only one arch uploaded before interrupt).
-pub async fn assert_registered(ami_tag: &str, region: &str) -> Result<()> {
+pub async fn assert_registered(ami_tag: &str, region: &str, arch: AmiArch) -> Result<()> {
     let conf = crate::aws::config(Some(region)).await;
     let ec2 = aws_sdk_ec2::Client::new(conf);
-    for t in AmiArch::All.targets() {
+    for t in arch.targets() {
         if find_existing(&ec2, ami_tag, t).await?.is_none() {
             anyhow::bail!(
                 "no AMI tagged rio.build/ami={ami_tag} ({}, rio.build/boot={}) — \
@@ -898,5 +918,27 @@ mod tests {
         assert_eq!(info.boot_mode, "uefi");
         assert!(info.file.ends_with("nixos.img"));
         assert!(info.label.starts_with("26.05"));
+    }
+
+    #[test]
+    fn for_dev_maps_dev_arch() {
+        rio_test_support::Jail::expect_with(|jail| {
+            assert!(matches!(
+                AmiArch::for_dev(&XtaskConfig::default()),
+                AmiArch::All
+            ));
+            jail.set_env("RIO_DEV_ARCH", "x86_64");
+            assert!(matches!(
+                AmiArch::for_dev(&XtaskConfig::from_process_env()?),
+                AmiArch::X86_64
+            ));
+            // Unrecognized → All (multi-arch), same as push/deploy.
+            jail.set_env("RIO_DEV_ARCH", "amd64");
+            assert!(matches!(
+                AmiArch::for_dev(&XtaskConfig::from_process_env()?),
+                AmiArch::All
+            ));
+            Ok(())
+        });
     }
 }

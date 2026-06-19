@@ -25,13 +25,26 @@ use crate::{git, tofu, ui};
 /// Nix system → OCI arch (what k8s nodes advertise via kubernetes.io/arch).
 const ARCHES: &[(&str, &str)] = &[("x86_64-linux", "amd64"), ("aarch64-linux", "arm64")];
 
+/// [`ARCHES`] narrowed by `RIO_DEV_ARCH` (issue #58 single-arch dev
+/// mode). Reads the parsed [`XtaskConfig::dev_arch`] enum so push,
+/// ami, and deploy all agree on which arch is dropped (unrecognized
+/// → multi-arch everywhere).
+fn arches(cfg: &XtaskConfig) -> Vec<(&'static str, &'static str)> {
+    let keep = cfg.dev_arch().map(|a| a.nix_system());
+    ARCHES
+        .iter()
+        .copied()
+        .filter(|(sys, _)| keep.is_none_or(|k| *sys == k))
+        .collect()
+}
+
 /// `manifest-tool --platforms` value derived from [`ARCHES`]. Every
 /// other arch step in this file (`build_all`, the per-arch tag suffix,
-/// `assert_in_ecr`) iterates `ARCHES`; the manifest list MUST cover the
-/// same set or new-arch nodes silently ImagePullBackOff on the
-/// manifest-list tag while the per-arch tag exists.
-fn manifest_platforms() -> String {
-    ARCHES
+/// `assert_in_ecr`) iterates the same filtered set; the manifest list
+/// MUST cover that set or new-arch nodes silently ImagePullBackOff on
+/// the manifest-list tag while the per-arch tag exists.
+fn manifest_platforms(arches: &[(&str, &str)]) -> String {
+    arches
         .iter()
         .map(|(_, a)| format!("linux/{a}"))
         .collect::<Vec<_>>()
@@ -78,12 +91,13 @@ pub async fn build(cfg: &XtaskConfig) -> Result<BuiltImages> {
 
 /// ECR login + skopeo copy + manifest lists. Needs tofu outputs
 /// (ecr_registry, region) so cannot run before provision.
-pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
+pub async fn push(images: &BuiltImages, cfg: &XtaskConfig) -> Result<()> {
     let tf = tofu::outputs(TF_DIR)?;
     let ecr = tf.get("ecr_registry")?;
     let region = tf.get("region")?;
     let tag = &images.tag;
     let out_path = images.dir.path();
+    let arches = arches(cfg);
 
     // Shared authfile. skopeo login defaults to $XDG_RUNTIME_DIR/containers/auth.json
     // but manifest-tool reads ~/.docker/config.json — they miss each
@@ -109,7 +123,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     let mut names = BTreeSet::new();
     let mut joinset = JoinSet::new();
 
-    for (_, arch) in ARCHES {
+    for (_, arch) in &arches {
         let images_dir = out_path.join(format!("images-{arch}"));
         let mut found = 0;
         for entry in std::fs::read_dir(&images_dir)? {
@@ -179,7 +193,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     for name in &names {
         let (name, tag, ecr, docker_cfg) =
             (name.clone(), tag.clone(), ecr.clone(), docker_cfg.clone());
-        let platforms = manifest_platforms();
+        let platforms = manifest_platforms(&arches);
         joinset.spawn(ui::step_owned(
             format!("manifest rio-{name}:{tag}"),
             async move {
@@ -210,20 +224,22 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     info!(
         "done — pushed {} images × {} arches + manifest lists, tag: {tag}",
         names.len(),
-        ARCHES.len()
+        arches.len()
     );
     Ok(())
 }
 
 async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
-    let attrs: Vec<String> = ARCHES
+    let arches = arches(cfg);
+    let attrs: Vec<String> = arches
         .iter()
         .map(|(sys, _)| format!(".#packages.{sys}.dockerImages"))
         .collect();
+    let n = arches.len();
 
     let store_args = match &cfg.remote_store {
         Some(remote) => {
-            info!("building images on {remote} (both arches, single eval)");
+            info!("building images on {remote} ({n} arch(es), single eval)");
             vec![
                 "--eval-store".into(),
                 "auto".into(),
@@ -232,7 +248,7 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
             ]
         }
         None => {
-            info!("building images locally (both arches; set RIO_REMOTE_STORE to offload)");
+            info!("building images locally ({n} arch(es); set RIO_REMOTE_STORE to offload)");
             vec![]
         }
     };
@@ -253,10 +269,10 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     let out_paths = ui::step("nix build (multi-arch)", || build).await?;
     let paths: Vec<&str> = out_paths.lines().collect();
     anyhow::ensure!(
-        paths.len() == ARCHES.len(),
+        paths.len() == arches.len(),
         "nix build returned {} paths for {} attrs",
         paths.len(),
-        ARCHES.len()
+        arches.len()
     );
 
     if let Some(remote) = &cfg.remote_store {
@@ -268,7 +284,7 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
         ui::step(&format!("nix copy from {remote}"), || copy).await?;
     }
 
-    for ((_, arch), path) in ARCHES.iter().zip(&paths) {
+    for ((_, arch), path) in arches.iter().zip(&paths) {
         std::os::unix::fs::symlink(path, out.join(format!("images-{arch}")))?;
     }
     Ok(())
@@ -359,10 +375,36 @@ mod tests {
 
     #[test]
     fn manifest_platforms_derives_from_arches() {
-        let p = manifest_platforms();
+        let p = manifest_platforms(ARCHES);
         assert_eq!(p.split(',').count(), ARCHES.len());
         for (_, oci) in ARCHES {
             assert!(p.contains(&format!("linux/{oci}")), "{p} missing {oci}");
         }
+    }
+
+    #[test]
+    fn arches_filters_by_dev_arch() {
+        rio_test_support::Jail::expect_with(|jail| {
+            assert_eq!(
+                arches(&XtaskConfig::default()),
+                ARCHES,
+                "unset → multi-arch"
+            );
+            jail.set_env("RIO_DEV_ARCH", "x86_64");
+            assert_eq!(
+                arches(&XtaskConfig::from_process_env()?),
+                &[("x86_64-linux", "amd64")]
+            );
+            jail.set_env("RIO_DEV_ARCH", "aarch64");
+            assert_eq!(
+                arches(&XtaskConfig::from_process_env()?),
+                &[("aarch64-linux", "arm64")]
+            );
+            // Unrecognized → multi-arch (NOT empty); the parsed enum in
+            // config.rs guarantees push/ami/deploy can never disagree.
+            jail.set_env("RIO_DEV_ARCH", "amd64");
+            assert_eq!(arches(&XtaskConfig::from_process_env()?), ARCHES);
+            Ok(())
+        });
     }
 }

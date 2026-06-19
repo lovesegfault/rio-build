@@ -115,9 +115,12 @@ pub struct UpOpts {
     // Namespaced per-phase opts. NO clap `requires` attribute —
     // validated at runtime by `validate_phase_opts()` so the
     // no-flags=all-phases path can still pass them.
-    /// AMI architecture(s) to build. EKS-only.
-    #[arg(long = "ami-arch", value_enum, default_value_t = AmiArch::All)]
-    ami_arch: AmiArch,
+    /// AMI architecture(s) to build. EKS-only. When unset, defaults
+    /// to `RIO_DEV_ARCH` (issue #58 single-arch dev mode) and falls
+    /// back to `all`. An explicit value (including `all`) always wins
+    /// over the env hint.
+    #[arg(long = "ami-arch", value_enum)]
+    ami_arch: Option<AmiArch>,
     /// Skip the post-ami stale-AMI GC. By default, after a successful
     /// `up` that built a new AMI, prior `rio-nixos-node-*` AMIs older
     /// than 2d (and not tagged `ami-latest`) are deregistered + their
@@ -254,11 +257,7 @@ impl UpOpts {
         req!(self.deploy_no_hooks, "--deploy-no-hooks", Phase::Deploy);
         req!(self.wait_drift, "--wait-drift", Phase::Deploy);
         req!(!self.public_cidr.is_empty(), "--public-cidr", Phase::Deploy);
-        req!(
-            !matches!(self.ami_arch, AmiArch::All),
-            "--ami-arch",
-            Phase::Ami
-        );
+        req!(self.ami_arch.is_some(), "--ami-arch", Phase::Ami);
         Ok(())
     }
 }
@@ -728,7 +727,10 @@ pub(super) async fn run_up(
     // doesn't see. Tests inject their own ami future directly.
     let ami_selected = selected.contains(&Phase::Ami);
     let deploy_selected = selected.contains(&Phase::Deploy);
-    let ami_arch = o.ami_arch;
+    // Issue #58: explicit --ami-arch (including `all`) wins; otherwise
+    // RIO_DEV_ARCH narrows; otherwise All. The env hint never overrides
+    // an explicit choice.
+    let ami_arch = o.ami_arch.unwrap_or_else(|| AmiArch::for_dev(&cfg));
     let skip_ami_gc = o.skip_ami_gc;
     let ami_branch = async move {
         if !ami_selected {
@@ -884,7 +886,7 @@ mod tests {
         // and namespaced opts are accepted in the all-phases path
         let mut o = opts();
         o.deploy_tenant = Some("t".into());
-        o.ami_arch = AmiArch::X86_64;
+        o.ami_arch = Some(AmiArch::X86_64);
         assert!(o.validate_phase_opts(&o.phases()).is_ok());
     }
 
@@ -957,13 +959,20 @@ mod tests {
 
     #[test]
     fn ami_arch_default_doesnt_trip_validation() {
-        // --ami-arch defaults to All; validation should only fire on
-        // a non-default value with explicit phases.
+        // --ami-arch defaults to None; validation should only fire on
+        // an explicit value with explicit phases. Ambient RIO_DEV_ARCH
+        // (which also resolves to None here) must never trip the
+        // "--ami-arch requires --ami" guard.
         let mut o = opts();
         o.push = true;
         assert!(o.validate_phase_opts(&o.phases()).is_ok());
-        o.ami_arch = AmiArch::Aarch64;
+        o.ami_arch = Some(AmiArch::Aarch64);
         assert!(o.validate_phase_opts(&o.phases()).is_err());
+        // Regression: bare `--wipe` (selected=[Kubeconfig,Push,Deploy]
+        // → explicit) without --ami-arch must NOT error on the req!.
+        let mut o = opts();
+        o.wipe = true;
+        assert!(o.validate_phase_opts(&o.phases()).is_ok());
     }
 
     /// `needs_upfront_backend_init` decides whether `run_up` re-inits

@@ -35,6 +35,17 @@ pub struct XtaskConfig {
     /// Remote nix store (ssh-ng://...) for offloading docker image builds.
     pub remote_store: Option<String>,
 
+    /// Single-arch dev mode (issue #58): when set, `up` skips the
+    /// other arch's docker images, AMI targets, and NodePools — drops
+    /// the cross-arch nix build + coldsnap upload from `--wipe`'s
+    /// critical path. Value is the nix CPU: `x86_64` or `aarch64`.
+    /// Unset/unrecognized → multi-arch (production default). Read via
+    /// [`XtaskConfig::dev_arch()`], not this field — every consumer
+    /// MUST agree on which arch is dropped, and the parsed enum is
+    /// the single point of truth. (Field stays `pub` only so struct-
+    /// update `..Default::default()` works at call sites.)
+    pub dev_arch: Option<String>,
+
     /// Source CIDRs allowed to reach the gateway NLB directly. Non-
     /// empty makes deploy emit `aws-load-balancer-scheme: internet-
     /// facing` + `loadBalancerSourceRanges`. Comma-separated in
@@ -91,6 +102,27 @@ fn default_log_level() -> String {
     RIO_DEBUG.into()
 }
 
+/// Parsed `RIO_DEV_ARCH` (issue #58). All consumers — push (docker
+/// images), ami (build/register/assert), deploy (pools[]) — match on
+/// this enum so an unrecognized env value degrades to multi-arch
+/// EVERYWHERE rather than dropping all arches in one place and none
+/// in another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevArch {
+    X86_64,
+    Aarch64,
+}
+
+impl DevArch {
+    /// Nix system tuple this arch keeps.
+    pub const fn nix_system(self) -> &'static str {
+        match self {
+            DevArch::X86_64 => "x86_64-linux",
+            DevArch::Aarch64 => "aarch64-linux",
+        }
+    }
+}
+
 impl XtaskConfig {
     pub fn load() -> Result<Self> {
         // dotenvy loads .env.local into process env; the env source then
@@ -101,8 +133,10 @@ impl XtaskConfig {
 
     /// Build from the current process environment only. Split out so the
     /// tests exercise exactly the path `load()` uses, minus the dotenvy
-    /// side effect (which a jailed test cannot sandbox).
-    fn from_process_env() -> Result<Self> {
+    /// side effect (which a jailed test cannot sandbox). `pub(crate)` so
+    /// `Jail`-ed tests in other modules can construct a config without
+    /// the repo-root `.env.local` leaking in.
+    pub(crate) fn from_process_env() -> Result<Self> {
         Ok(::config::Config::builder()
             // Flat, string-only struct: unlike rio-common's nested Configs,
             // this source deliberately skips `.separator("__")` (no nested
@@ -111,6 +145,17 @@ impl XtaskConfig {
             .add_source(::config::Environment::with_prefix("RIO").prefix_separator("_"))
             .build()?
             .try_deserialize::<Self>()?)
+    }
+
+    /// Parsed `RIO_DEV_ARCH`. Unset or unrecognized → `None` (multi-
+    /// arch, production default). Consumers MUST read this rather
+    /// than the raw string so they all agree on which arch is dropped.
+    pub fn dev_arch(&self) -> Option<DevArch> {
+        match self.dev_arch.as_deref() {
+            Some("x86_64") => Some(DevArch::X86_64),
+            Some("aarch64") => Some(DevArch::Aarch64),
+            _ => None,
+        }
     }
 }
 
@@ -145,6 +190,24 @@ mod tests {
             jail.set_env("RIO_LOG_LEVEL", "warn");
             let cfg = XtaskConfig::from_process_env()?;
             assert_eq!(cfg.log_level, "warn");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn dev_arch_parses_consistently() {
+        rio_test_support::Jail::expect_with(|jail| {
+            assert_eq!(XtaskConfig::from_process_env()?.dev_arch(), None);
+            jail.set_env("RIO_DEV_ARCH", "x86_64");
+            assert_eq!(
+                XtaskConfig::from_process_env()?.dev_arch(),
+                Some(DevArch::X86_64)
+            );
+            // Unrecognized → None (multi-arch), NOT a partial filter.
+            // Every consumer reads this method, so push/ami/deploy
+            // can never disagree on what was dropped.
+            jail.set_env("RIO_DEV_ARCH", "amd64");
+            assert_eq!(XtaskConfig::from_process_env()?.dev_arch(), None);
             Ok(())
         });
     }
