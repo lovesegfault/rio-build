@@ -635,5 +635,8 @@ let
   };
 in
 {
-  inherit fragments mkTest;
+  # `prelude` exported so scenarios/batch-a.nix (issue #57 1e) can reuse
+  # the full k3s bring-up + grpc/metric/tenant helper stanza as the
+  # shared bootstrap for its sequential subtest groups.
+  inherit prelude fragments mkTest;
 }
