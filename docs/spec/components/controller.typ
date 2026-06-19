@@ -1912,7 +1912,7 @@ budget brake's rotation property upstream of the mint.
   flat per-cell-per-tick cap stays retired, live_049 L1).
 ]
 
-#r("ctrl.nodeclaim.mint-deficit-proportional+3")[
+#r("ctrl.nodeclaim.mint-deficit-proportional+4")[
   Minting MUST be bounded by demand, by the fleet budget, AND by the
   concurrent-unlaunched headroom `max_inflight_unlaunched − |{live:
   Launched≠True ∧ ¬registered ∧ ¬terminating}| − created_this_tick`

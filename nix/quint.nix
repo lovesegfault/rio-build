@@ -5607,7 +5607,7 @@ rec {
     # MAX=|CLAIMS|=2 — see the MAX_INFLIGHT_UNLAUNCHED note in the
     # spec for the deferred non-vacuous depth).
     # r[verify ctrl.nodeclaim.budget.per-class+4]
-    # r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
+    # r[verify ctrl.nodeclaim.mint-deficit-proportional+4]
     quint-nodeclaim-lifecycle-base = mkQuintCheck {
       name = "nodeclaim-lifecycle-base";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census

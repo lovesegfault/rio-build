@@ -43,6 +43,11 @@ mod pods;
 pub mod sketch;
 pub(crate) mod wedge;
 
+/// sh-043-r2: the 7th in-fn redeclaration was the threshold — one
+/// shared test-side `1 << 30` for the module tree.
+#[cfg(test)]
+pub(super) const GI: u64 = 1 << 30;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -2196,7 +2201,11 @@ impl NodeClaimPoolReconciler {
     /// a leak here means escape (a) (creationTimestamp absent) is
     /// firing. Emitted at the ONE post-`vanish_fold` chokepoint on
     /// BOTH the main and `consolidate_only` paths so the gauge always
-    /// reads post-prune (the help text's leak signature is
+    /// reads post-prune. On the main path the `reap_unhealthy(...)?`
+    /// at the same site sits between LIST and the fold — a kube error
+    /// there freezes the gauge at its last post-prune value
+    /// (frozen-correct beats updated-wrong for a leak detector;
+    /// sh-043-r2). (The help text's leak signature is
     /// "climbing while `live{state=inflight}` flat" — pre-prune
     /// emission produced exactly that under steady-state churn with
     /// no leak; sh-043-r1).
@@ -4146,7 +4155,6 @@ mod tests {
     #[test]
     fn fallback_admission_matches_sizing_partition_no_dead_band() {
         use rio_proto::types::{HwClassLabels, NodeLabelMatch};
-        const GI: u64 = 1 << 30;
         let cm: u64 = 64 * GI; // the mirrored per-class mem ceiling
         let pad = rio_common::footprint::WORKER_MEM_OVERHEAD_BYTES;
         let cap_prime =
@@ -4246,7 +4254,6 @@ mod tests {
     #[test]
     fn fallback_and_sizing_equal_shared_law_oracle() {
         use rio_proto::types::{HwClassLabels, NodeLabelMatch};
-        const GI: u64 = 1 << 30;
         for cm in [GI, (64 * GI) / 10 * 9, 64 * GI] {
             let cfg = NodeClaimPoolConfig {
                 reference_hw_class: "probe-x86".into(),

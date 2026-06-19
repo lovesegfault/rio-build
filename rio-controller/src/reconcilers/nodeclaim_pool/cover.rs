@@ -646,7 +646,7 @@ pub struct SizingCfg {
 #[cfg(test)]
 impl Default for SizingCfg {
     fn default() -> Self {
-        const GI: u64 = 1 << 30;
+        use super::GI;
         Self {
             max_node_cores: 64,
             max_node_mem: 256 * GI,
@@ -786,13 +786,6 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
         )
         .increment(1);
     }
-    if fits.is_empty() {
-        return Sizing {
-            claims: Vec::new(),
-            min_eta: f64::MAX,
-            over_cap: over,
-        };
-    }
     // sh-043: when headroom is already exhausted (live_unlaunched ≥
     // cap, or earlier cells minted it dry) the FFD bin-search +
     // affordability walk below would clamp to 0 anyway — skip the
@@ -800,7 +793,7 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
     // simulate() calls. Runs AFTER the over-cap warn loop so
     // `reclassify_over_cap` still sees `over`; `min_eta=f64::MAX` is
     // unread (the caller `continue`s on `claims.is_empty()`).
-    if cfg.inflight_headroom == 0 {
+    if fits.is_empty() || cfg.inflight_headroom == 0 {
         return Sizing {
             claims: Vec::new(),
             min_eta: f64::MAX,
@@ -831,12 +824,12 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
     let n_pack = (n_lo..=n_hi)
         .find(|&n| super::ffd::sim_packs(cell, &fits, claim_at(n), n, cfg.fuse_cache_bytes))
         .unwrap_or(n_hi);
-    // r[impl ctrl.nodeclaim.mint-deficit-proportional+3]
+    // r[impl ctrl.nodeclaim.mint-deficit-proportional+4]
     // sh-043: the three-term mint law — demand × budget ×
     // inflight-headroom. Rationale (healthy-throughput / backlog
-    // behavior, the L1-cap comparison) lives at the [`sizing`] doc
-    // comment and the spec rule body — one home each, not restated
-    // here (sh-043-r1).
+    // behavior, the L1-cap comparison) lives at the [`Sizing`] struct
+    // doc and the spec rule body — one home each, not restated here
+    // (sh-043-r1).
     //
     // bug_062: affordability QUANTIFIES over the claim family.
     // `uniform_claim` is weakly decreasing in n down to
@@ -1206,7 +1199,7 @@ mod tests {
     use rio_common::k8s::METAL_NODE_CLASS;
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
 
-    const GI: u64 = 1 << 30;
+    use super::super::GI;
 
     fn intent(
         id: &str,
@@ -1291,7 +1284,7 @@ mod tests {
         Cell("h".into(), CapacityType::Spot)
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+4]
     /// **sh-043** — *the inflight-headroom term bounds the per-tick
     /// mint count* (the `Synced()`-blocking population cap;
     /// operation-count, zero wall-clock). The mint law is
@@ -1309,9 +1302,10 @@ mod tests {
         // max_node_cores=1 → n_aff=100 (one claim per intent);
         // budget/chunk=1000/1=1000; only headroom varies.
         let scfg = |h: u32| SizingCfg {
-            fuse_cache_bytes: 0,
+            max_node_cores: 1,
+            budget: 1000,
             inflight_headroom: h,
-            ..cfg(1, 1000)
+            ..Default::default()
         };
         let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &scfg(10));
         assert_eq!(
@@ -1342,7 +1336,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+4]
     /// **R10 + W7-M** — *a deficit within budget is FULLY minted in
     /// ONE tick* (the 208-peak ramp shape killed; operation-count,
     /// zero wall-clock): the mint law is `min(n_pack, ⌊budget/chunk⌋)`
@@ -1381,7 +1375,7 @@ mod tests {
         // `budget_brake_quantifies_over_the_family` below.
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+4]
     /// W13-AI (bug_062) — proposition: an affordability decision over
     /// a parametric family quantifies over the family; population:
     /// the [max_c, chunk(n_pack)) band, derived from the family's own
@@ -1417,7 +1411,7 @@ mod tests {
         assert_eq!(c[0].0, 16, "the packing-minimal chunk is kept");
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+4]
     /// The re-derived budget-brake pin (bug_062, the witness half):
     /// asserts the LAW — affordable ⇒ nonzero mint — never the
     /// starved output. The pre-fix pin (`budget=10 ⇒ c.is_empty()`)
@@ -3154,10 +3148,9 @@ mod mint_law_tests {
     //! premise witnesses and the cap-reader census.
     use std::collections::{HashMap, HashSet};
 
+    use super::super::GI;
     use super::super::ffd::{self, LiveNode};
     use super::*;
-
-    const GI: u64 = 1 << 30;
 
     fn intent(id: &str, cores: u32, ready: bool, eta: f64, cells: &[(&str, &str)]) -> SpawnIntent {
         SpawnIntent {
@@ -3189,7 +3182,7 @@ mod mint_law_tests {
         }
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+4]
     /// **R10b + W7-K** — *the gate POPULATION premise, probed not
     /// prose*: `n_pack`'s input is exactly the placeable-gated
     /// unplaced set. A tick whose input contains (i) an intent that
@@ -3336,7 +3329,7 @@ mod mint_law_tests {
         out
     }
 
-    // r[verify ctrl.nodeclaim.mint-deficit-proportional+3]
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+4]
     /// **R12 — the cap-reader census [GEN-SET], alias-closed**
     /// (merged_bug_001 / R22 upgrade). Generator, ALL alias tiers:
     ///

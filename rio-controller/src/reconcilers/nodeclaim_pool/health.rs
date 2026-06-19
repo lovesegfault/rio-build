@@ -392,8 +392,8 @@ pub fn classify(
 /// already operator-visible via `nodeclaim_inflight_age_max_seconds` —
 /// and the entry frees the moment the claim resolves. The gauge half
 /// the bug_020 report recommended lands as
-/// `rio_controller_nodeclaim_inflight_tracked` in `emit_live_gauges`
-/// (sh-043).
+/// `rio_controller_nodeclaim_inflight_tracked` in
+/// `emit_inflight_tracked_gauge` (sh-043).
 pub fn detect_vanished(
     inflight: &mut HashMap<String, InflightClaim>,
     tombstones: &mut DeleteTombstones,
