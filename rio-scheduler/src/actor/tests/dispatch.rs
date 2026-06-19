@@ -2296,6 +2296,80 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
     Ok(())
 }
 
+/// sh-044: phase-17's candidate filter MUST skip Ready nodes that
+/// already carry an unresolved `materialization_jobs` entry — the job
+/// row owns disposition (`ReportPullOutcome` → `remove_settled`
+/// re-admits). Without the conjunct, every Tick re-probes the SAME
+/// ~1047 substitutable paths the previous sweep already routed to
+/// jobs, pinning `tick_phase_seconds{phase="17-ready-cache-sweep"}`
+/// at the on-actor FMP wall-clock (8.77 s/tick under sh-044's store)
+/// and latching the cost-axis backpressure.
+///
+/// Structural: 1000 IA leaves with substitutable outputs; the merge's
+/// inline sweep creates 1000 CacheOpportunity jobs; the next Tick's
+/// candidate set MUST be empty (zero new FMP calls).
+#[tokio::test]
+async fn batch_probe_skips_pending_mat_jobs() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let n = 1000usize;
+    let out_paths: Vec<String> = (0..n)
+        .map(|i| test_store_path(&format!("sh044-{i}-out")))
+        .collect();
+    // Seed BEFORE the merge so the inline sweep's probe routes every
+    // node to the `to_create_job` arm (missing + substitutable).
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .extend(out_paths.iter().cloned());
+    let nodes: Vec<_> = (0..n)
+        .map(|i| {
+            let mut node = make_node(&format!("sh044-{i}"));
+            node.expected_output_paths = vec![out_paths[i].clone()];
+            node
+        })
+        .collect();
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    barrier(&handle).await;
+
+    // The inline sweep created the jobs (durable PG rows — the
+    // in-memory view is the filter's read).
+    let created: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM materialization_jobs WHERE state = 'pending'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        created, n as i64,
+        "merge's inline sweep routes every substitutable leaf to a job"
+    );
+
+    let before_calls = store.calls.find_missing_calls.load(Ordering::SeqCst);
+    let before_log = store.calls.find_missing_paths_log.read().unwrap().len();
+    let t0 = std::time::Instant::now();
+    tick(&handle).await?;
+    let after_calls = store.calls.find_missing_calls.load(Ordering::SeqCst);
+    let after_log = store.calls.find_missing_paths_log.read().unwrap().len();
+    assert_eq!(
+        after_calls, before_calls,
+        "second sweep re-probes ZERO candidates: every Ready node \
+         carries an unresolved job → filter skips → empty candidate \
+         set → early return before fan_out_probes; pre-fix the same \
+         1000 nodes were re-admitted every generation"
+    );
+    assert_eq!(
+        after_log, before_log,
+        "no new find_missing_paths request logged"
+    );
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(1),
+        "wall-clock backstop: empty-candidate sweep is sub-ms"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // W9-AF (round-9 B7): per-tick probe admission quota
 // ---------------------------------------------------------------------------

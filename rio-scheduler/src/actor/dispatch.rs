@@ -179,6 +179,16 @@ impl DagActor {
     /// head is protected via `probed_generation`, so neither hits the
     /// per-drv fallback. A quota-exhausted sweep returns the whole
     /// candidate set unprobed.
+    ///
+    /// sh-044: nodes with an unresolved materialization job are
+    /// SKIPPED — the job row owns disposition (`ReportPullOutcome` →
+    /// `JobViewState::remove_settled` re-admits the node to the next
+    /// generation's candidate set). Without this conjunct, the sweep
+    /// re-probes the SAME substitutable set every generation (1047
+    /// paths × 8.77 s/tick under sh-044's store → cost-axis
+    /// backpressure latched). The phase-15 age-out arm at
+    /// `tick_reevaluate_parked_materialization_jobs` bounds the skip
+    /// unconditionally.
     // r[impl sched.dispatch.fod-substitute+3]
     // r[impl sched.admission.work-per-turn]
     async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
@@ -193,13 +203,22 @@ impl DagActor {
         // Floating-CA (`expected_output_paths == [""]`) is excluded by
         // the `!is_empty()` + path-known check; the realisations lane
         // at merge-time handles those.
+        //
+        // Field-disjoint borrow: bind the job-view ref before the
+        // `self.dag` chain so the closure captures `jobs`, not `self`.
+        // [`JobViewState::get`] returns `None` under `Unavailable`
+        // (fail-open: an unhydrated view falls through to today's
+        // probe-everything behaviour) — `recovery_complete()` above
+        // means the view is `Hydrated` whenever this filter runs.
+        let jobs = &self.materialization_jobs;
         let mut candidates: Vec<(DrvHash, Vec<String>)> = self
             .dag
             .iter_nodes()
-            .filter(|(_, s)| {
+            .filter(|(h, s)| {
                 s.status() == DerivationStatus::Ready
                     && s.probed_generation < probe_gen
                     && s.output_paths_probeable()
+                    && jobs.get(*h).is_none()
             })
             .map(|(h, s)| (DrvHash::from(h), s.expected_output_paths.clone()))
             .collect();
