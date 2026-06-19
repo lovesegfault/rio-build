@@ -2198,6 +2198,13 @@ impl NodeClaimPoolReconciler {
     /// `RioNodeclaimPoolStuckPending` stays accurate during scheduler
     /// outages.
     fn emit_live_gauges(&mut self, live: &[ffd::LiveNode], now_secs: f64) {
+        // sh-043: the `inflight_created` map size (the deferred gauge
+        // half from `health.rs:375`). Tracks the controller's own
+        // create-ledger, which `vanish_fold` prunes ⊆ `live` each
+        // tick — a leak here means escape (a) (creationTimestamp
+        // absent) is firing.
+        metrics::gauge!("rio_controller_nodeclaim_inflight_tracked")
+            .set(self.inflight_created.len() as f64);
         // `(registered, inflight, terminating, max_inflight_age, max_term_age)`.
         // The three counts partition `live` — every NodeClaim is exactly one
         // — so `state=registered` matches FFD's placement-candidate set

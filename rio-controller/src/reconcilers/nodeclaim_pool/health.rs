@@ -268,7 +268,19 @@ pub fn classify(
             Some(("False", _)) | None => out.push((i, ReapReason::Ice)),
             // Launched=True but never Registered → boot/AMI failure.
             Some(("True", _)) => out.push((i, ReapReason::BootTimeout)),
-            Some(_) => {}
+            // Launched=Unknown past timeout — Karpenter throttle/
+            // backlog (sh-043 closes the (b) escape at :375). Masks
+            // at IceBackoff step 0 (60s); same-tick reaps ship as
+            // ONE per-cell mark (`buffer_marks`) so do NOT climb
+            // (rio-scheduler `sla/cost.rs` `next_mark_step`
+            // in-window=refresh); clears on first `registered_cells`/
+            // §13a pull-clear in the cell. ice_timeout is per-CELL
+            // `2×seed_for(cell)`: 32-42s builder, 60s fetcher,
+            // **1200s metal** — NOT a uniform 60s floor. If
+            // `nodeclaim_reaped_total{reason=ice}` rate spikes on
+            // cells with healthy capacity, split to
+            // `ReapReason::RequestLimited` (no mask) — Q1.
+            Some(_) => out.push((i, ReapReason::Ice)),
         }
     }
     out
@@ -373,17 +385,15 @@ pub fn classify(
 /// (a) `creationTimestamp` absent — `age_secs` returns `None` and
 /// `classify` `continue`s before the timeout gate; the apiserver sets
 /// it on every persisted object, near-impossible; (b) `Launched`
-/// present with status ∉ `{True, False}` past timeout — `classify`'s
-/// final match has no `Some(("Unknown", _))` arm. (b) is plausible:
-/// Karpenter's `InitializeConditions` writes `Launched=Unknown` before
-/// the launch attempt, so a Karpenter outage/backlog parks claims
-/// there. Either way the claim is itself stuck in the cluster —
+/// present with status ∉ `{True, False}` past timeout — CLOSED at
+/// sh-043: `classify`'s `Some(_)` arm now reaps `Launched=Unknown`
+/// past `ice_timeout` as `Ice` (Karpenter throttle/backlog ≡
+/// capacity-side). (a) leaves the claim itself stuck in the cluster —
 /// already operator-visible via `nodeclaim_inflight_age_max_seconds` —
-/// and the entry frees the moment the claim resolves. If r41 finds the
-/// bound insufficient, add the TTL the bug_020 report recommends
-/// (`now - created_at > 2×ice_timeout`; needs an insertion timestamp in
-/// the map value) AND a `rio_controller_nodeclaim_inflight_tracked`
-/// gauge in `emit_live_gauges` so the leak is observable.
+/// and the entry frees the moment the claim resolves. The gauge half
+/// the bug_020 report recommended lands as
+/// `rio_controller_nodeclaim_inflight_tracked` in `emit_live_gauges`
+/// (sh-043).
 pub fn detect_vanished(
     inflight: &mut HashMap<String, InflightClaim>,
     tombstones: &mut DeleteTombstones,
@@ -2085,6 +2095,39 @@ mod tests {
         bt.registered = false;
         let r = classify(&[bt], &HashSet::new(), &sk, &cfg, 1100.0);
         assert_eq!(r, vec![(0, ReapReason::BootTimeout)]);
+    }
+
+    /// **sh-043** — `Launched=Unknown` past `ice_timeout` → ICE
+    /// (Karpenter throttle/backlog parked the claim at
+    /// `InitializeConditions`'s pre-launch `Unknown` posture; the
+    /// same capacity-unproven state as `False`/absent — closes the
+    /// (b) escape at `:375`). Pre-fix RED (transcript in the commit
+    /// body): the `Some(_)` arm fell through and the claim parked
+    /// indefinitely in the `Synced()`-blocking set. Per-cell
+    /// `ice_timeout = 2×seed_for(cell)`: 32-42s builder, 60s
+    /// fetcher, **1200s metal** — NOT a uniform 60s floor.
+    #[test]
+    fn classify_reaps_launched_unknown_past_timeout() {
+        let cfg = cfg_seeded("h", 45.0);
+        let sk = CellSketches::default();
+        // created=1000, now=1100 → age=100 > 2×45=90. Launched=Unknown.
+        let mut stuck = with_conds(
+            node("stuck", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Launched", "Unknown", 1000.0)],
+        );
+        stuck.registered = false;
+        let r = classify(&[stuck.clone()], &HashSet::new(), &sk, &cfg, 1100.0);
+        assert_eq!(
+            r,
+            vec![(0, ReapReason::Ice)],
+            "sh-043: Launched=Unknown past ice_timeout reaps as Ice \
+             (the same capacity-unproven posture as False/absent; \
+             pre-fix RED: the Some(_) arm fell through — out == [])"
+        );
+        // Under timeout: now=1080 → age=80 < 90 → healthy (the age
+        // gate still applies; this is NOT a no-timeout short-circuit).
+        let r2 = classify(&[stuck], &HashSet::new(), &sk, &cfg, 1080.0);
+        assert!(r2.is_empty(), "under ice_timeout: not yet reaped");
     }
 
     /// No Launched condition at all past timeout → ICE (Karpenter

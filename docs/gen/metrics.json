@@ -57,6 +57,7 @@
     "rio_controller_nodeclaim_forecast_hit_ewma",
     "rio_controller_nodeclaim_ice_timeout_seconds",
     "rio_controller_nodeclaim_inflight_age_max_seconds",
+    "rio_controller_nodeclaim_inflight_tracked",
     "rio_controller_nodeclaim_intent_dropped_total",
     "rio_controller_nodeclaim_lead_time_q_at_cap",
     "rio_controller_nodeclaim_lead_time_seconds",
@@ -580,6 +581,11 @@
         "name": "rio_controller_nodeclaim_inflight_age_max_seconds",
         "kind": "gauge",
         "help": "Oldest in-flight NodeClaim per `cell` (now − metadata.creationTimestamp; 0 when none in-flight). The per-claim age the StuckPending alert keys on — the inflight count never touches 0 under sustained scale-up, so count-based `for: 90s` fires on healthy bursts."
+      },
+      {
+        "name": "rio_controller_nodeclaim_inflight_tracked",
+        "kind": "gauge",
+        "help": "Entries in the controller's inflight_created ledger (created by cover_deficit, not yet observed Registered/terminating/absent). vanish_fold prunes it ⊆ live each tick, so a leak (this gauge climbing while nodeclaim_live{state=inflight} is flat) means the creationTimestamp-absent escape is firing. sh-043: lands the bug_020 deferred gauge half."
       },
       {
         "name": "rio_controller_nodeclaim_intent_dropped_total",

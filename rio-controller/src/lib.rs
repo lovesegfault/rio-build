@@ -515,6 +515,15 @@ pub fn describe_metrics() {
          a queue (cover_deficit mints the replacement next tick)."
     );
     describe_gauge!(
+        "rio_controller_nodeclaim_inflight_tracked",
+        "Entries in the controller's inflight_created ledger (created by \
+         cover_deficit, not yet observed Registered/terminating/absent). \
+         vanish_fold prunes it ⊆ live each tick, so a leak (this gauge \
+         climbing while nodeclaim_live{state=inflight} is flat) means the \
+         creationTimestamp-absent escape is firing. sh-043: lands the \
+         bug_020 deferred gauge half."
+    );
+    describe_gauge!(
         "rio_controller_nodeclaim_inflight_age_max_seconds",
         "Oldest in-flight NodeClaim per `cell` (now − metadata.creationTimestamp; \
          0 when none in-flight). The per-claim age the StuckPending alert keys on \
