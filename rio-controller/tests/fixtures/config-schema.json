@@ -165,7 +165,7 @@
             "default": 10000
           },
           "max_inflight_unlaunched": {
-            "description": "sh-043: GLOBAL ceiling on the concurrent-unlaunched population\n(`Launched≠True` ⟺ `status.providerID==\"\"` — the\n`cluster.Synced()`-blocking proxy). Karpenter v1.11-v1.13's\n`provisioner.go::Reconcile` busy-spins on `Synced()` while ANY\nNodeClaim across ALL NodePools lacks a providerID\n(aws/karpenter-provider-aws#7428: not-planned), so an\nuncapped cold-start mint starves rio-general. The third law\nterm (`ctrl.nodeclaim.mint-deficit-proportional`) bounds the\n`Synced()=false` window. Default 50: Karpenter's CreateFleet\nobserved throughput is ~10-20/s (sh-043 §5a, unsourced —\nverify against iter9's `nodeclaim_created_total` rate per\nQ2), so 50 ≈ 2.5-5s of `Synced()=false` per 10s tick. Helm:\n`karpenter.nodeclaimPool.maxInflightUnlaunched`.",
+            "description": "sh-043: GLOBAL ceiling on the concurrent-unlaunched population\n(`Launched≠True` ⟺ `status.providerID==\"\"` — the\n`cluster.Synced()`-blocking proxy). Karpenter v1.11-v1.13's\n`provisioner.go::Reconcile` busy-spins on `Synced()` while any\nNodeClaim across all NodePools lacks a providerID\n(aws/karpenter-provider-aws#7428: not-planned), so an\nuncapped cold-start mint starves rio-general. The third law\nterm (`ctrl.nodeclaim.mint-deficit-proportional`) bounds the\n`Synced()=false` window. Default 50: Karpenter's CreateFleet\nobserved throughput is ~10-20/s (sh-043 §5a, unsourced —\nverify against iter9's `nodeclaim_created_total` rate per\nQ2), so 50 ≈ 2.5-5s of `Synced()=false` per 10s tick. Helm:\n`karpenter.nodeclaimPool.maxInflightUnlaunched`.",
             "type": "integer",
             "format": "uint32",
             "minimum": 0,

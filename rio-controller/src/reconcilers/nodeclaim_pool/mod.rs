@@ -442,8 +442,8 @@ pub struct NodeClaimPoolConfig {
     /// sh-043: GLOBAL ceiling on the concurrent-unlaunched population
     /// (`Launched≠True` ⟺ `status.providerID==""` — the
     /// `cluster.Synced()`-blocking proxy). Karpenter v1.11-v1.13's
-    /// `provisioner.go::Reconcile` busy-spins on `Synced()` while ANY
-    /// NodeClaim across ALL NodePools lacks a providerID
+    /// `provisioner.go::Reconcile` busy-spins on `Synced()` while any
+    /// NodeClaim across all NodePools lacks a providerID
     /// (aws/karpenter-provider-aws#7428: not-planned), so an
     /// uncapped cold-start mint starves rio-general. The third law
     /// term (`ctrl.nodeclaim.mint-deficit-proportional`) bounds the
@@ -798,11 +798,10 @@ impl Default for NodeClaimPoolConfig {
             // local ceiling (derived from `karpenter.dataVolumeSize`).
             // ≈ 500Gi `dataVolumeSize` × 90% allocatable.
             max_node_disk: 450 * (1 << 30),
-            // sh-043: GLOBAL concurrent-unlaunched ceiling. 50 ≈
-            // 2.5-5s of `Synced()=false` per tick at the observed
-            // ~10-20/s CreateFleet throughput; ⌈D/50⌉ ticks to cover
-            // a D-deficit cold start when headroom replenishes each
-            // tick.
+            // sh-043: GLOBAL concurrent-unlaunched ceiling — see the
+            // `max_inflight_unlaunched` field doc for the 50
+            // derivation (one home; the throughput figure there
+            // carries the unsourced-per-Q2 caveat).
             max_inflight_unlaunched: 50,
             metal_sizes: Vec::new(),
             fuse_cache_bytes: pool::pod::BUILDER_FUSE_CACHE_BYTES,
@@ -1913,6 +1912,7 @@ impl NodeClaimPoolReconciler {
             &mut self.delete_tombstones,
             &live,
         );
+        self.emit_inflight_tracked_gauge();
         ice_cells.extend(fold.ice_cells);
         self.pending_wedge_evictions.extend(fold.evicted_nodes);
         for (cell, gap) in fold.censored_gaps {
@@ -2164,6 +2164,7 @@ impl NodeClaimPoolReconciler {
             &mut self.delete_tombstones,
             &live,
         );
+        self.emit_inflight_tracked_gauge();
         self.pending_evidence.buffer_marks(fold.ice_cells);
         self.pending_wedge_evictions.extend(fold.evicted_nodes);
         for (cell, gap) in fold.censored_gaps {
@@ -2189,6 +2190,21 @@ impl NodeClaimPoolReconciler {
         Ok(())
     }
 
+    /// sh-043: the `inflight_created` map size (the deferred gauge
+    /// half from `health.rs:375`). Tracks the controller's own
+    /// create-ledger, which `vanish_fold` prunes ⊆ `live` each tick —
+    /// a leak here means escape (a) (creationTimestamp absent) is
+    /// firing. Emitted at the ONE post-`vanish_fold` chokepoint on
+    /// BOTH the main and `consolidate_only` paths so the gauge always
+    /// reads post-prune (the help text's leak signature is
+    /// "climbing while `live{state=inflight}` flat" — pre-prune
+    /// emission produced exactly that under steady-state churn with
+    /// no leak; sh-043-r1).
+    fn emit_inflight_tracked_gauge(&self) {
+        metrics::gauge!("rio_controller_nodeclaim_inflight_tracked")
+            .set(self.inflight_created.len() as f64);
+    }
+
     /// Per-cell gauges derived from `live` + `now` only (no scheduler
     /// intents needed). Iterates `cfg.all_cells() ∪ by_state.keys() ∪
     /// prev_extra_cells` so every (h,cap) timeseries is emitted every
@@ -2198,13 +2214,6 @@ impl NodeClaimPoolReconciler {
     /// `RioNodeclaimPoolStuckPending` stays accurate during scheduler
     /// outages.
     fn emit_live_gauges(&mut self, live: &[ffd::LiveNode], now_secs: f64) {
-        // sh-043: the `inflight_created` map size (the deferred gauge
-        // half from `health.rs:375`). Tracks the controller's own
-        // create-ledger, which `vanish_fold` prunes ⊆ `live` each
-        // tick — a leak here means escape (a) (creationTimestamp
-        // absent) is firing.
-        metrics::gauge!("rio_controller_nodeclaim_inflight_tracked")
-            .set(self.inflight_created.len() as f64);
         // `(registered, inflight, terminating, max_inflight_age, max_term_age)`.
         // The three counts partition `live` — every NodeClaim is exactly one
         // — so `state=registered` matches FFD's placement-candidate set
@@ -2501,7 +2510,10 @@ impl NodeClaimPoolReconciler {
         // tick's `health::classify`-reaped claims (still in `live`
         // with `launched()≠Some(true)` but deleted before
         // `cover_deficit` runs) — the 1-tick conservative lag is
-        // intentional and bounded by the prior tick's mint count.
+        // intentional and bounded by `max_inflight_unlaunched` (NOT
+        // the prior tick's mint count: with sh-043's `Some(_)⇒Ice`
+        // arm, `classify` can reap claims accumulated across many
+        // ticks in one pass — metal `ice_timeout`≈120 ticks).
         // NOT `self.inflight_created.len()`: at `cover_deficit`
         // entry, `vanish_fold` has pruned it ⊆ `live`
         // (`health.rs:364-365`), so the `launched()≠Some(true)`
@@ -2566,11 +2578,11 @@ impl NodeClaimPoolReconciler {
                 ),
                 fuse_cache_bytes: self.cfg.fuse_cache_bytes,
                 // sh-043: the third law term, recomputed per-cell
-                // from the SAME accumulate-across-cells shape as
+                // from the same accumulate-across-cells shape as
                 // `created_cores`/`class_created` (the `created` Vec
                 // below is the this-tick-so-far Ok-count per the
                 // bug_015 polarity). When 0 → `claims.is_empty()` →
-                // the `:2536` continue fires; round-robin keeps
+                // the early-continue below fires; round-robin keeps
                 // cross-tick fairness.
                 inflight_headroom: self
                     .cfg
@@ -2596,7 +2608,12 @@ impl NodeClaimPoolReconciler {
                 self.cfg.fuse_cache_bytes,
             );
             if claims.is_empty() {
-                debug!(%cell, budget = scfg.budget, "no claims (budget exhausted or empty)");
+                debug!(
+                    %cell,
+                    budget = scfg.budget,
+                    headroom = scfg.inflight_headroom,
+                    "no claims (budget/headroom exhausted or empty)"
+                );
                 continue;
             }
             let Some(hw_labels) = self.hw_config.labels_for(&cell.0) else {
@@ -4158,10 +4175,8 @@ mod tests {
         let scfg = cover::SizingCfg {
             max_node_cores: 128,
             max_node_mem: cm, // the same mirrored ceiling
-            max_node_disk: 450 * GI,
-            budget: u32::MAX,
             fuse_cache_bytes: 50 * GI,
-            inflight_headroom: u32::MAX,
+            ..Default::default()
         };
         let cell = Cell("hi-ebs-x86".into(), CapacityType::Spot);
         let none = HashSet::new();
@@ -4258,9 +4273,8 @@ mod tests {
                 max_node_cores: 128,
                 max_node_mem: cm,
                 max_node_disk: cfg.max_node_disk,
-                budget: u32::MAX,
                 fuse_cache_bytes: cfg.fuse_cache_bytes,
-                inflight_headroom: u32::MAX,
+                ..Default::default()
             };
             let cell = Cell("probe-x86".into(), CapacityType::Spot);
             let none = HashSet::new();

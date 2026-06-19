@@ -12,7 +12,6 @@ docs/spec/components/controller.typ	EVERY scheduler-evidence plane carried by `A
 docs/spec/components/controller.typ	MUST advertise `[fetcher]` (and ONLY `[fetcher]`) for Fetcher-kind Pools,
 docs/spec/components/controller.typ	`cells_decode_refused_total` — so a ready intent can never launder
 docs/spec/components/controller.typ	`continue` (NEVER `?`-propagate out of the loop --- tonic has no default
-docs/spec/components/controller.typ	create consumes no budget. The budget brake and demand are the ONLY
 docs/spec/components/controller.typ	decode-totality lane (refresh-not-step while masked; observed-type
 docs/spec/components/controller.typ	depends on stream TOTALITY or cross-window CONTINUITY (re-ack/re-arm
 docs/spec/components/controller.typ	forfeiture is reachable within the pod termination grace at ANY
