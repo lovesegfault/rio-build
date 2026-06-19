@@ -44,7 +44,7 @@ pub mod sketch;
 pub(crate) mod wedge;
 
 #[cfg(test)]
-pub(super) use super::GI;
+use crate::reconcilers::GI;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

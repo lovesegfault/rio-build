@@ -36,11 +36,13 @@ use crate::error::{Error, Result, error_kind};
 /// KubeErrorExt` without naming rio-crds directly.
 pub use rio_crds::KubeErrorExt;
 
-/// sh-043-r3: one shared test-side `1 << 30` for the whole reconciler
-/// tree (`nodeclaim_pool/` + `pool/`). The 7th in-fn redeclaration was
-/// the dedup threshold; r2's `pub(super)` at `nodeclaim_pool/mod.rs`
-/// left the six `pool/jobs.rs` and one `pool/tests/builders_tests.rs`
-/// copies sibling-unreachable.
+/// sh-043-r3: shared test-side `1 << 30` for the `nodeclaim_pool/` +
+/// `pool/` test modules — replaces the seven per-file `const GI/GIB`
+/// redeclarations. r4: one name (`GI`) and one import path
+/// (`crate::reconcilers::GI`); inline `N * (1 << 30)` literals survive
+/// where the constant is not already in scope (non-test consts,
+/// string literals) — this hoist deduped the redeclarations, not
+/// every `1 << 30` token.
 #[cfg(test)]
 pub(crate) const GI: u64 = 1 << 30;
 

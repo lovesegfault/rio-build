@@ -1192,8 +1192,8 @@ pub(crate) fn parse_bytes(q: &str) -> u64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::super::GI;
     use super::*;
+    use crate::reconcilers::GI;
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
 
     // --- builders ------------------------------------------------------

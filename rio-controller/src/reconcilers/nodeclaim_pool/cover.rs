@@ -646,7 +646,7 @@ pub struct SizingCfg {
 #[cfg(test)]
 impl Default for SizingCfg {
     fn default() -> Self {
-        use super::GI;
+        use crate::reconcilers::GI;
         Self {
             max_node_cores: 64,
             max_node_mem: 256 * GI,
@@ -789,8 +789,7 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
     // sh-043: when no intent fits or headroom is already exhausted
     // (live_unlaunched ≥ cap, or earlier cells minted it dry) the FFD
     // bin-search + affordability walk below would clamp to 0 anyway —
-    // skip the
-    // per-iteration intent clones, sim LiveNode allocs, and
+    // skip the per-iteration intent clones, sim LiveNode allocs, and
     // simulate() calls. Runs AFTER the over-cap warn loop so
     // `reclassify_over_cap` still sees `over`; `min_eta=f64::MAX` is
     // unread (the caller `continue`s on `claims.is_empty()`).
@@ -1200,7 +1199,7 @@ mod tests {
     use rio_common::k8s::METAL_NODE_CLASS;
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
 
-    use super::super::GI;
+    use crate::reconcilers::GI;
 
     fn intent(
         id: &str,
@@ -3149,9 +3148,9 @@ mod mint_law_tests {
     //! premise witnesses and the cap-reader census.
     use std::collections::{HashMap, HashSet};
 
-    use super::super::GI;
     use super::super::ffd::{self, LiveNode};
     use super::*;
+    use crate::reconcilers::GI;
 
     fn intent(id: &str, cores: u32, ready: bool, eta: f64, cells: &[(&str, &str)]) -> SpawnIntent {
         SpawnIntent {

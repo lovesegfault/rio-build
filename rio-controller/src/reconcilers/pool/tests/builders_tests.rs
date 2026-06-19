@@ -475,7 +475,7 @@ fn job_pod_overlays_volume_mounted() {
 
 // ── ADR-023 §13a ship-standalone wiring ──────────────────────────────
 
-use crate::reconcilers::GI as GIB;
+use crate::reconcilers::GI;
 
 /// One `(h, cap)` cell as the scheduler's `cells_to_selector_terms`
 /// would emit it: an arbitrary `[sla.hw_classes.$h].labels` conjunction
@@ -530,14 +530,14 @@ fn pod_gets_node_affinity_from_intent() {
     let intent = rio_proto::types::SpawnIntent {
         intent_id: "abc".into(),
         cores: 4,
-        mem_bytes: 8 * GIB,
+        mem_bytes: 8 * GI,
         node_affinity: vec![
             affinity_term("hi", "spot"),
             affinity_term("hi", "on-demand"),
         ],
         ..Default::default()
     };
-    let job = build_job_with(&intent, &jobs::HwSampledCache::default(), 8 * GIB);
+    let job = build_job_with(&intent, &jobs::HwSampledCache::default(), 8 * GI);
     let pod_spec = job
         .spec
         .as_ref()
@@ -568,7 +568,7 @@ fn pod_gets_node_affinity_from_intent() {
         intent_id: "abc".into(),
         ..Default::default()
     };
-    let job = build_job_with(&cold, &jobs::HwSampledCache::default(), 8 * GIB);
+    let job = build_job_with(&cold, &jobs::HwSampledCache::default(), 8 * GI);
     assert!(
         job.spec
             .as_ref()
@@ -626,7 +626,7 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
     let a_trusted = vec!["intel-7-mid".into()];
 
     // (a) mem ≥ floor ∧ any h<threshold → true.
-    let job = build_job_with(&intent(16 * GIB, a_mixed.clone()), &cache, 8 * GIB);
+    let job = build_job_with(&intent(16 * GI, a_mixed.clone()), &cache, 8 * GI);
     assert_eq!(bench_ann(&job).as_deref(), Some("true"));
     // Downward-API env wired (resolved by kubelet from the annotation).
     let env = job
@@ -649,23 +649,23 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
     );
 
     // (b) mem < floor → false (STREAM would OOM the pod).
-    let job = build_job_with(&intent(4 * GIB, a_mixed.clone()), &cache, 8 * GIB);
+    let job = build_job_with(&intent(4 * GI, a_mixed.clone()), &cache, 8 * GI);
     assert_eq!(bench_ann(&job).as_deref(), Some("false"));
 
     // (c) all h ≥ threshold → false (no need to re-bench trusted classes).
-    let job = build_job_with(&intent(16 * GIB, a_trusted), &cache, 8 * GIB);
+    let job = build_job_with(&intent(16 * GI, a_trusted), &cache, 8 * GI);
     assert_eq!(bench_ann(&job).as_deref(), Some("false"));
 
     // (d) A = ∅ → false (vacuous; actual h unknown until bind).
-    let job = build_job_with(&intent(16 * GIB, vec![]), &cache, 8 * GIB);
+    let job = build_job_with(&intent(16 * GI, vec![]), &cache, 8 * GI);
     assert_eq!(bench_ann(&job).as_deref(), Some("false"));
 
     // (e) RPC-failure path: empty cache → unknown h reads as 0 → true
     //     (over-bench, never under-bench).
     let job = build_job_with(
-        &intent(16 * GIB, a_mixed),
+        &intent(16 * GI, a_mixed),
         &jobs::HwSampledCache::default(),
-        8 * GIB,
+        8 * GI,
     );
     assert_eq!(bench_ann(&job).as_deref(), Some("true"));
 }

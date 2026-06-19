@@ -236,8 +236,8 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use k8s_openapi::jiff::Timestamp;
 
-    use super::super::GI;
     use super::*;
+    use crate::reconcilers::GI;
 
     fn pod_req(name: &str, node: Option<&str>, cpu: &str, mem: &str, disk: &str) -> Pod {
         use k8s_openapi::api::core::v1::{Container, PodSpec, ResourceRequirements};

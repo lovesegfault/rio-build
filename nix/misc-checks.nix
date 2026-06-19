@@ -390,9 +390,11 @@ in
           exit 1
         fi
 
-        # Numbered files are fragments; unnumbered .sh (the
-        # regen-key-population.sh ritual) are dev-side tools, not
-        # sandbox assertions.
+        # Numbered files are fragments. Unnumbered .sh ride the SAME
+        # fileset filter (`f.hasExt "sh"`): `_lib.sh` is a load-bearing
+        # sandbox dependency sourced by fragments via `dirname "$0"`;
+        # `regen-key-population.sh` is the dev-side ritual the runner
+        # glob skips.
         for f in ${fragments}/[0-9][0-9]-*.sh; do
           echo "▸ helm-lint: $(basename "$f" .sh)" >&2
           bash -euo pipefail "$f"
