@@ -16,7 +16,50 @@
 # registry returns for `docker pull <tag>`). pullImage follows it to
 # the arch-specific manifest via os/arch.
 { pkgs }:
-{
+let
+  # issue #57 1a: re-pack each pulled docker-archive (gzip layers,
+  # the nixpkgs pullImage default) as a single-manifest oci-archive
+  # with UNCOMPRESSED layers. k3s's airgap importer is single-core and
+  # serial — cilium-agent alone (713MB tar) was ~100-180s of gunzip on
+  # the rio-ci-kvm builders. With uncompressed layers the import is a
+  # 9p read (~200 MB/s) + tar extract; per-layer decompress drops out.
+  #
+  # Why oci-archive (not docker-archive): skopeo's `--dest-decompress`
+  # only honours layer recompression for the dir/oci transports; the
+  # docker-archive writer pins gzip. k3s wharfie auto-detects oci-
+  # archive by magic, so the format change is transparent to
+  # `services.k3s.images`.
+  #
+  # The pullImage FOD itself stays unchanged (its `hash` is the gzip-
+  # layered docker-archive). This wrapper is a separate, non-FOD
+  # runCommand on top — bumping skopeo doesn't invalidate the network
+  # fetch.
+  #
+  # passthru: k3s-full.nix reads `.imageTag` (and could read
+  # `.imageName`) off these derivations to derive helm --set values;
+  # forward both so the wrapper is a drop-in.
+  decompressed =
+    pulled:
+    (pkgs.runCommand "${pkgs.lib.removeSuffix ".tar" pulled.name}-uncompressed.oci.tar"
+      {
+        nativeBuildInputs = [
+          pkgs.skopeo
+          pkgs.gnutar
+        ];
+      }
+      ''
+        skopeo --insecure-policy --tmpdir="$TMPDIR" copy \
+          --dest-decompress --dest-oci-accept-uncompressed-layers -f oci \
+          docker-archive:${pulled} \
+          oci:$TMPDIR/oci:${pulled.imageName}:${pulled.imageTag}
+        tar -C $TMPDIR/oci -c \
+          --sort=name --mtime='@1' --owner=0 --group=0 --numeric-owner \
+          . > $out
+      ''
+    ).overrideAttrs
+      { passthru = { inherit (pulled) imageName imageTag; }; };
+in
+builtins.mapAttrs (_: decompressed) {
   # Bitnami PostgreSQL 18.3.0 for the k3s-full fixture (bitnami subchart
   # v18.6.1 via nixhelm, appVersion=18.3.0). Chart's values.yaml uses
   # tag:latest — k3s-full.nix passes `postgresql.image.tag` via extraSet
