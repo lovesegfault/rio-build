@@ -238,6 +238,13 @@ pub struct MockStoreFaults {
     pub fail_qpi_internal_paths: Arc<RwLock<HashSet<String>>>,
     /// If true, get_path returns Unavailable. For FUSE fetch error-path tests.
     pub fail_get_path: Arc<AtomicBool>,
+    /// If `Some`, `get_path` returns this `tonic::Code`. Supersedes
+    /// [`fail_get_path`](Self::fail_get_path) (the legacy
+    /// `Unavailable`-only knob). For the scheduler's
+    /// latch-on-definitive-error tests — e.g. `InvalidArgument` is the
+    /// store's "store-path didn't parse" verdict and must classify as
+    /// ENOENT-equivalent (negative-cache), NOT retry-worthy.
+    pub get_path_status: Arc<std::sync::RwLock<Option<tonic::Code>>>,
     /// If true, get_path returns garbage non-NAR bytes in the NarChunk.
     /// For NAR parse error tests (FUSE fetch → EIO on parse failure).
     pub get_path_garbage: Arc<AtomicBool>,
@@ -794,6 +801,9 @@ impl StoreService for MockStore {
         // assert "client never contacted gRPC" (== 0) vs "client did
         // and got Unavailable" (> 0).
         self.calls.get_path_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(code) = *self.faults.get_path_status.read().unwrap() {
+            return Err(Status::new(code, "mock: injected get_path status"));
+        }
         if self.faults.fail_get_path.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected get_path failure"));
         }

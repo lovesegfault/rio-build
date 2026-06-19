@@ -359,6 +359,427 @@ async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
     Ok(())
 }
 
+/// Round-3 dag-actor stall: a recovered target's `drv_content` is
+/// `Vec::new()` (`from_recovery_row` does not persist the ATerm).
+/// 94999b7d2's `attested_input_seeds` fetched the `.drv` via GetPath
+/// per dispatch but never wrote it back to the DAG node, so every
+/// retry of the same recovered target re-fetched (~30ms in-actor).
+/// 12557 retries × ~30ms ≈ 500s synchronous actor time → mailbox
+/// 4950 → builders/fetchers starved on PullAssignment/ReportOutcome.
+///
+/// `build_assignment_proto` now fetches once and writes back to
+/// `self.dag.node_mut().drv_content`; the second dispatch reads from
+/// the node.
+// r[verify sched.dispatch.input-roots+3]
+#[tokio::test]
+async fn dispatch_caches_recovered_drv_content() -> TestResult {
+    let (_db, mut actor, store, _store_task) = bare_actor_with_store().await?;
+
+    // Recovered target: drv_content empty in-memory; the ATerm lives
+    // only in the store. Leaf shape (no inputDrvs) so the test pins
+    // just the fetch+writeback, not the closure walk.
+    let drv_path = test_drv_path("dcr-recovered");
+    let src = test_store_path("dcr-src");
+    let out = test_store_path("dcr-out");
+    let aterm = format!(
+        r#"Derive([("out","{out}","","")],[],["{src}"],"x86_64-linux","/bin/sh",[],[("out","{out}")])"#
+    );
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    actor.test_inject_ready("dcr-recovered", None, "x86_64-linux", false);
+    assert!(
+        actor
+            .dag
+            .node("dcr-recovered")
+            .unwrap()
+            .drv_content
+            .is_empty(),
+        "fixture: recovered node has empty drv_content"
+    );
+
+    let before = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    // First dispatch: fetches the .drv from the store, writes it back.
+    let a1 = actor
+        .build_assignment_proto(
+            &"dcr-recovered".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("payload for an injected Ready node");
+    assert_eq!(
+        a1.drv_content,
+        aterm.as_bytes(),
+        "the FIRST dispatch's WorkAssignment.drv_content carries the \
+         fetched bytes — hoist runs before maybe_resolve_ca, not after"
+    );
+    let state = actor.dag.node("dcr-recovered").unwrap();
+    assert!(
+        !state.drv_content.is_empty(),
+        "first dispatch must write the fetched ATerm back to the DAG node"
+    );
+    assert_eq!(
+        state.input_srcs,
+        vec![src.clone()],
+        "rehydrate_from_aterm: writeback must repopulate the co-derived \
+         input_srcs (approx_input_closure / GC live-pin reads it directly)"
+    );
+
+    // Second dispatch of the same recovered target: reads from the
+    // node, no GetPath.
+    actor
+        .build_assignment_proto(
+            &"dcr-recovered".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("payload");
+
+    let after = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after - before,
+        1,
+        "two dispatches of one recovered target → exactly one GetPath \
+         (second dispatch reads the written-back drv_content)"
+    );
+    Ok(())
+}
+
+/// Dispatch-level GetPath-failure → degrade (NOT panic) + negative-
+/// cache. Store NOT seeded at the recovered target's drv_path: hoist
+/// fetches once, gets NotFound, stamps `drv_fetch_attempted`; dispatch
+/// degrades to no attestation; the second dispatch does NOT re-RPC.
+///
+/// Replaces the deleted `attested_seeds_none_when_drv_fetch_fails`
+/// (assignment.rs) which pinned the same property at the
+/// `attested_input_seeds` boundary; the fetch moved into
+/// `build_assignment_proto`, so this is the boundary that matters.
+// r[verify sched.dispatch.input-roots+3]
+#[tokio::test]
+async fn dispatch_degrades_on_drv_fetch_not_found() -> TestResult {
+    let (_db, mut actor, store, _store_task) = bare_actor_with_store().await?;
+
+    // Recovered target whose .drv is NOT in the store. Mock store
+    // returns NotFound on GetPath for unseeded paths.
+    actor.test_inject_ready("dcr-notfound", None, "x86_64-linux", false);
+    let before = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    let a1 = actor
+        .build_assignment_proto(
+            &"dcr-notfound".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("dispatch must NOT panic on GetPath NotFound");
+    assert!(
+        a1.drv_content.is_empty(),
+        "degrade: no bytes fetched → worker fetches itself"
+    );
+    let state = actor.dag.node("dcr-notfound").unwrap();
+    assert!(state.drv_content.is_empty());
+    assert!(
+        state.drv_fetch_attempted,
+        "negative-cache: stamped on failure so retries skip the RPC"
+    );
+
+    actor
+        .build_assignment_proto(
+            &"dcr-notfound".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("payload");
+
+    let after = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after - before,
+        1,
+        "two dispatches of one persistently-NotFound target → exactly \
+         one GetPath (failure is negative-cached, not re-RPCd per retry)"
+    );
+    Ok(())
+}
+
+/// Dispatch-level GetPath TRANSIENT failure → NOT negative-cached.
+/// Store returns `Unavailable` on the first dispatch, succeeds on the
+/// second: the hoist must NOT stamp `drv_fetch_attempted` on the
+/// transient error, so dispatch #2 retries and writes back. Regression
+/// guard for the iter-1 collapse of `Err(Elapsed)/Unavailable` into
+/// the same permanent latch as NotFound — a single store blip would
+/// doom a recovered node to `arm="drv_empty"` for its lifetime.
+// r[verify sched.dispatch.input-roots+3]
+#[tokio::test]
+async fn dispatch_retries_drv_fetch_on_transient() -> TestResult {
+    let (_db, mut actor, store, _store_task) = bare_actor_with_store().await?;
+
+    let drv_path = test_drv_path("dcr-transient");
+    let src = test_store_path("dcr-t-src");
+    let out = test_store_path("dcr-t-out");
+    let aterm = format!(
+        r#"Derive([("out","{out}","","")],[],["{src}"],"x86_64-linux","/bin/sh",[],[("out","{out}")])"#
+    );
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+    actor.test_inject_ready("dcr-transient", None, "x86_64-linux", false);
+
+    // Dispatch #1: store returns Unavailable. Hoist must degrade
+    // WITHOUT stamping the negative-cache.
+    *store.faults.get_path_status.write().unwrap() = Some(tonic::Code::Unavailable);
+    let a1 = actor
+        .build_assignment_proto(
+            &"dcr-transient".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("dispatch must NOT panic on transient GetPath error");
+    assert!(a1.drv_content.is_empty(), "transient error → no bytes");
+    let state = actor.dag.node("dcr-transient").unwrap();
+    assert!(
+        !state.drv_fetch_attempted,
+        "transient error must NOT stamp the negative-cache — a single \
+         store blip would otherwise permanently doom the node"
+    );
+    assert!(state.drv_content.is_empty());
+
+    // Dispatch #2: store healthy. Hoist retries, writes back.
+    *store.faults.get_path_status.write().unwrap() = None;
+    let a2 = actor
+        .build_assignment_proto(
+            &"dcr-transient".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("payload");
+    assert_eq!(
+        a2.drv_content,
+        aterm.as_bytes(),
+        "dispatch #2 after a transient blip must re-fetch and carry the bytes"
+    );
+    let state = actor.dag.node("dcr-transient").unwrap();
+    assert!(state.drv_fetch_attempted);
+    assert_eq!(state.input_srcs, vec![src]);
+    Ok(())
+}
+
+/// `DeadlineExceeded` → NOT negative-cached (iter-4 regression). The
+/// per-chunk idle bound (`collect_nar_stream` synthesizes
+/// `Status::deadline_exceeded("GetPath stream idle for {t:?}")` on a
+/// >2s gap; the store also emits server-side `deadline_exceeded` on
+/// backend stall) is excluded from `is_transient`'s allowlist by
+/// design — its rationale ("retrying with the same idle bound won't
+/// help on a FUSE-thread caller") doesn't apply here: the dispatch
+/// hoist retries on the next build attempt with backoff, not
+/// immediately. Iter-3 let it fall to the `Err(_) ⇒ Missing`
+/// catch-all and latch — re-introducing the iter-1 "single blip dooms
+/// the node" failure for a different gRPC code.
+// r[verify sched.dispatch.input-roots+3]
+#[tokio::test]
+async fn dispatch_retries_drv_fetch_on_deadline_exceeded() -> TestResult {
+    let (_db, mut actor, store, _store_task) = bare_actor_with_store().await?;
+
+    let drv_path = test_drv_path("dcr-deadline");
+    let src = test_store_path("dcr-d-src");
+    let out = test_store_path("dcr-d-out");
+    let aterm = format!(
+        r#"Derive([("out","{out}","","")],[],["{src}"],"x86_64-linux","/bin/sh",[],[("out","{out}")])"#
+    );
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+    actor.test_inject_ready("dcr-deadline", None, "x86_64-linux", false);
+
+    // Dispatch #1: store returns DeadlineExceeded. Hoist must degrade
+    // WITHOUT stamping the negative-cache.
+    *store.faults.get_path_status.write().unwrap() = Some(tonic::Code::DeadlineExceeded);
+    let a1 = actor
+        .build_assignment_proto(
+            &"dcr-deadline".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("dispatch must NOT panic on DeadlineExceeded");
+    assert!(a1.drv_content.is_empty(), "DeadlineExceeded → no bytes");
+    let state = actor.dag.node("dcr-deadline").unwrap();
+    assert!(
+        !state.drv_fetch_attempted,
+        "DeadlineExceeded is a stall, not a verdict on the drv_path — \
+         it must NOT latch (the dispatch hoist retries with backoff, \
+         not immediately, so the FUSE-thread rationale doesn't apply)"
+    );
+    assert!(state.drv_content.is_empty());
+
+    // Dispatch #2: store healthy. Hoist retries, writes back.
+    *store.faults.get_path_status.write().unwrap() = None;
+    let a2 = actor
+        .build_assignment_proto(
+            &"dcr-deadline".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("payload");
+    assert_eq!(
+        a2.drv_content,
+        aterm.as_bytes(),
+        "dispatch #2 after a deadline-exceeded blip must re-fetch"
+    );
+    assert_eq!(
+        actor.dag.node("dcr-deadline").unwrap().input_srcs,
+        vec![src]
+    );
+    Ok(())
+}
+
+/// Dispatch-level GetPath DEFINITIVE-non-NotFound failure → latched.
+/// `InvalidArgument` is the store's "store-path didn't parse" verdict
+/// (`NarCollectError::is_invalid_argument`'s doc: "treat as
+/// definitively absent (ENOENT), NOT retry-worthy"); re-fetching with
+/// the same `drv_path` produces the same verdict. Regression guard for
+/// the iter-2 `Err(e) => Transient` catch-all that latched only
+/// NotFound — InvalidArgument / SizeExceeded / Validation /
+/// PermissionDenied all re-fired the same doomed in-actor RPC every
+/// retry.
+// r[verify sched.dispatch.input-roots+3]
+#[tokio::test]
+async fn dispatch_latches_drv_fetch_on_definitive_error() -> TestResult {
+    let (_db, mut actor, store, _store_task) = bare_actor_with_store().await?;
+    actor.test_inject_ready("dcr-invalid", None, "x86_64-linux", false);
+    *store.faults.get_path_status.write().unwrap() = Some(tonic::Code::InvalidArgument);
+
+    let before = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    let a1 = actor
+        .build_assignment_proto(
+            &"dcr-invalid".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("dispatch must NOT panic on InvalidArgument");
+    assert!(a1.drv_content.is_empty());
+    let state = actor.dag.node("dcr-invalid").unwrap();
+    assert!(
+        state.drv_fetch_attempted,
+        "InvalidArgument is a per-request verdict on the SAME drv_path — \
+         re-RPCing won't change it; must latch (DrvFetch::Missing), not \
+         classify as Transient and re-fire every retry"
+    );
+
+    actor
+        .build_assignment_proto(
+            &"dcr-invalid".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("payload");
+    let after = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after - before,
+        1,
+        "two dispatches with a definitive non-NotFound error → exactly \
+         one GetPath (latched via drv_fetch_attempted)"
+    );
+    Ok(())
+}
+
+/// Store returns a valid single-file NAR whose content is NOT a
+/// parseable ATerm (store bitrot under a hash-addressed path, or a
+/// corrupted PG `drv_path` pointing at an existing single-file
+/// non-`.drv`). `extract_single_file` succeeds; the hoist must NOT
+/// write the garbage back to `drv_content` — non-empty garbage defeats
+/// the merge-backfill escape hatch (`dag/mod.rs` gates on
+/// `existing.drv_content.is_empty()`), so a fresh `SubmitBuild`'s
+/// correct inline ATerm would be silently dropped for in-flight nodes.
+/// Red-first for iter-5: pre-fix, `rehydrate_from_aterm` swallowed the
+/// parse error and wrote the garbage anyway.
+// r[verify sched.dispatch.input-roots+3]
+#[tokio::test]
+async fn dispatch_latches_drv_fetch_on_unparseable_aterm() -> TestResult {
+    let (_db, mut actor, store, _store_task) = bare_actor_with_store().await?;
+
+    let drv_path = test_drv_path("dcr-garbage");
+    store.seed_with_content(&drv_path, b"this is not an ATerm");
+    actor.test_inject_ready("dcr-garbage", None, "x86_64-linux", false);
+
+    let before = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    let a1 = actor
+        .build_assignment_proto(
+            &"dcr-garbage".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("dispatch must NOT panic on unparseable ATerm");
+    let state = actor.dag.node("dcr-garbage").unwrap();
+    assert!(
+        state.drv_content.is_empty(),
+        "unparseable ATerm must NOT be written back — non-empty garbage \
+         is sticky (defeats the merge-backfill escape hatch's \
+         `existing.drv_content.is_empty()` gate)"
+    );
+    assert!(
+        state.input_srcs.is_empty(),
+        "co-derived input_srcs stays empty"
+    );
+    assert!(
+        state.drv_fetch_attempted,
+        "unparseable bytes are a per-path verdict (re-fetching the same \
+         drv_path returns the same garbage) — latch, same as NAR-unwrap \
+         failure / SizeExceeded"
+    );
+    assert!(
+        a1.drv_content.is_empty(),
+        "WorkAssignment must NOT ship the garbage (worker would fail on \
+         it; the empty-drv_content path lets the worker fetch itself)"
+    );
+
+    actor
+        .build_assignment_proto(
+            &"dcr-garbage".into(),
+            &"w-dcr".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
+        .await
+        .expect("payload");
+    let after = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after - before,
+        1,
+        "two dispatches with unparseable ATerm → exactly one GetPath (latched)"
+    );
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // CA recovery-resolve: fetch ATerm from store when drv_content empty
 // -----------------------------------------------------------------------------

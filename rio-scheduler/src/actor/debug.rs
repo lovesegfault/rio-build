@@ -298,14 +298,17 @@ impl DagActor {
         true
     }
 
-    /// Clear `drv_content` to simulate post-recovery state (DAG
-    /// reloaded from PG, drv_content not persisted). For CA
+    /// Clear `drv_content` (and the co-derived `input_srcs` /
+    /// `drv_fetch_attempted`) to simulate post-recovery state (DAG
+    /// reloaded from PG, drv_content not persisted —
+    /// `from_recovery_row` sets all three to empty/false). For CA
     /// recovery-fetch tests.
     pub(super) fn handle_debug_clear_drv_content(&mut self, drv_hash: &str) -> bool {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return false;
         };
-        state.drv_content.clear();
+        state.clear_aterm();
+        state.drv_fetch_attempted = false;
         true
     }
 

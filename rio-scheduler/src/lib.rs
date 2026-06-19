@@ -484,16 +484,21 @@ pub fn describe_metrics() {
         "attested_input_seeds resolutions of a DAG-missed inputDrv via the \
          persisted derivations.expected_output_paths row, labeled by outcome \
          (resolved/degraded_none). resolved > 0 is normal post-restart or \
-         after reap; degraded_none means a genuinely-never-merged inputDrv \
-         or a floating-CA placeholder."
+         after reap; degraded_none — see the seeds_unknown arm label for \
+         which of {input_drv_unresolved, child_output_unknown, \
+         input_consumes_undeclared_output} it was."
     );
+    // Literal (NOT `crate::assignment::METRIC_ATTESTED_SEEDS_UNKNOWN`):
+    // the `xtask regen docs-data` / `helm-obs` source-scrapes match
+    // `describe_*!("…")` literals only.
     describe_counter!(
         "rio_scheduler_attested_seeds_unknown_total",
         "Per-arm breakdown of attested_input_seeds Ok(None) returns (label \
-         arm: no_node / drv_empty_no_store / drv_fetch_failed / \
-         drv_unparseable / child_output_unknown / input_drv_unresolved), \
-         plus drv_fetched for recovered targets whose ATerm was \
-         successfully fetched via GetPath. Compare against \
+         arm: no_node / drv_empty / drv_unparseable / child_output_unknown / \
+         input_consumes_undeclared_output / input_drv_unresolved), plus \
+         drv_fetched for recovered targets whose ATerm was successfully \
+         fetched via GetPath at the dispatch hoist and written back to the \
+         DAG node. Compare against \
          input_closure_unattested_total{reason=seeds_unknown} to attribute \
          a non-zero unattested rate to its root cause."
     );

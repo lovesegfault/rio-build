@@ -954,10 +954,16 @@ impl DagActor {
                 })
             }
             PullDecision::DeliverExisting { exec_id } => {
-                // Idempotent re-pull: read, never write. The payload is
-                // rebuilt from the same inputs (drv, identity), so the
-                // load-bearing fields — drv path, ATerm, exec_id,
-                // resources — are identical.
+                // Re-pull of an already-minted exec_id: the
+                // load-bearing identity fields (drv path, exec_id,
+                // resources) are stable. NOT byte-idempotent —
+                // `build_assignment_proto` is `&mut self` and may
+                // backfill a recovered node's `drv_content` /
+                // `pending_realisation_deps` on this call (the hoist's
+                // `Transient` → `Found` self-heal across DeliverNew →
+                // DeliverExisting takes `input_roots` from
+                // empty/degraded to populated, which the worker treats
+                // as recovery).
                 debug_assert_eq!(
                     self.dag.node(&drv_hash).and_then(|s| s.exec_id),
                     Some(exec_id)

@@ -1074,9 +1074,11 @@ mod registration_writer_census {
             ("actor/debug.rs".to_string(), 1),
             ("actor/dispatch.rs".to_string(), 1),
             // ADR-022 attested_input_seeds tests (assignment.rs §tests):
-            // 2 fixture seeds — child.output_paths populated to test the
-            // realized-paths arm of the seed derivation. Re-derives.
-            ("assignment.rs".to_string(), 2),
+            // 3 fixture seeds — child.output_paths populated to test the
+            // realized-paths arm of the seed derivation (and that the
+            // undeclared-consumed-name arm does NOT fall through to it).
+            // Re-derives.
+            ("assignment.rs".to_string(), 3),
             // sh-007c S6: 2 — `complete_materialization_for_live_interest`
             // (per-item) + `apply_batched_companion` (batched twin);
             // both gate on `output_paths.is_empty()` over identical

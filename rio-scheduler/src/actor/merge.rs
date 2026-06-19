@@ -2486,6 +2486,7 @@ impl DagActor {
             &merge_result.interest_added,
             &merge_result.traceparent_upgraded,
             &merge_result.contributions_recorded,
+            &merge_result.drv_content_backfilled,
             build_id,
             merge_result.removed_retriable,
             merge_result.floors_consumed,

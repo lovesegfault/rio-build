@@ -744,8 +744,9 @@ pub async fn filter_and_inline_drv(
         // dispatches: can't cache-hit by path, and the scheduler's
         // `maybe_resolve_ca` REQUIRES drv_content to rewrite
         // placeholder paths. The scheduler's store-fetch fallback
-        // (`fetch_drv_content_from_store`) depends on its
-        // startup-time store connection succeeding — a race we must
+        // (`build_assignment_proto`'s hoisted `fetch_drv_aterm`)
+        // depends on its startup-time store connection succeeding —
+        // a race we must
         // not rely on (layer-9 ca-cutoff failure: scheduler boots
         // before store ready → store_client=None → fallback dead).
         // All outputs present → cache hit → never dispatches → skip.

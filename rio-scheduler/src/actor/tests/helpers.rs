@@ -241,6 +241,34 @@ pub(crate) fn bare_actor_cfg(pool: sqlx::PgPool, cfg: DagActorConfig) -> DagActo
     DagActor::new(SchedulerDb::new(pool), cfg, DagActorPlumbing::default())
 }
 
+/// Bootstrap an ephemeral PG + bare (unspawned) actor wired with a
+/// [`MockStore`](rio_test_support::grpc::MockStore) client. For tests
+/// that exercise `&mut self` methods (`build_assignment_proto`,
+/// `maybe_resolve_ca`) directly — same shape as [`bare_actor`] but
+/// with `store_client` populated. Absorbs the `TestDb::new` →
+/// `seed_default_tenant` → `spawn_mock_store_with_client` →
+/// `DagActor::new` preamble repeated across the dispatch-hoist tests.
+pub(crate) async fn bare_actor_with_store() -> anyhow::Result<(
+    TestDb,
+    DagActor,
+    rio_test_support::grpc::MockStore,
+    tokio::task::JoinHandle<()>,
+)> {
+    let db = TestDb::new(&MIGRATOR).await;
+    seed_default_tenant(&db.pool).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            store_client: Some(store_client),
+            ..Default::default()
+        },
+    );
+    Ok((db, actor, store, store_task))
+}
+
 /// Bootstrap an ephemeral PG + actor. The returned `TestDb` MUST be held
 /// for the test duration — `TestDb::Drop` tears down the database.
 /// Most callers: `let (_db, handle, _task) = setup().await;`

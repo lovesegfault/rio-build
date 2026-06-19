@@ -2472,6 +2472,155 @@ fn test_cyclic_merge_reverts_traceparent_upgrade() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Existing-node merge backfills empty `drv_content` from the incoming
+/// proto. The dispatch hoist's negative-cache promises "a fresh
+/// `SubmitBuild` re-merges with inline `drv_content`, bypassing the
+/// gate" — but `mints_epoch_on_resubmit` is false for in-flight
+/// (`Assigned`/`Running`) and non-root `Created`/`Queued`/`Ready`
+/// nodes, so without an explicit backfill in the existing-node branch
+/// the escape hatch never fires for them.
+#[test]
+fn test_merge_backfills_empty_drv_content_on_existing_node() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let src = rio_test_support::fixtures::test_store_path("backfill-src");
+    let out = rio_test_support::fixtures::test_store_path("backfill-out");
+    let aterm = format!(
+        r#"Derive([("out","{out}","","")],[],["{src}"],"x86_64-linux","/bin/sh",[],[("out","{out}")])"#
+    );
+
+    // B1: node X merges with NO inline drv_content (gateway skipped
+    // it / recovered). Dispatch hoist tried, got NotFound, latched.
+    dag.merge(Uuid::new_v4(), &[make_node("X", "x86_64-linux")], &[], "")?;
+    let x = dag.node_mut("X").unwrap();
+    assert!(x.drv_content.is_empty(), "fixture: no inline bytes");
+    x.set_status_for_test(DerivationStatus::Running);
+    x.drv_fetch_attempted = true;
+
+    // B2: another build re-merges X (as a non-root dep of P) WITH
+    // inline drv_content. X is Running → mints_epoch_on_resubmit=false
+    // → existing-node branch.
+    let mut x_with_bytes = make_node("X", "x86_64-linux");
+    x_with_bytes.drv_content = aterm.clone().into_bytes();
+    let r2 = dag.merge(
+        Uuid::new_v4(),
+        &[make_node("P", "x86_64-linux"), x_with_bytes],
+        &[make_edge("P", "X")],
+        "",
+    )?;
+    assert_eq!(
+        r2.drv_content_backfilled,
+        vec![("X".into(), true)],
+        "backfill recorded with prior drv_fetch_attempted for rollback"
+    );
+    let x = dag.node("X").unwrap();
+    assert_eq!(x.drv_content, aterm.as_bytes());
+    assert_eq!(
+        x.input_srcs,
+        vec![src.clone()],
+        "co-derived input_srcs backfilled"
+    );
+    assert!(
+        !x.drv_fetch_attempted,
+        "negative-cache cleared: drv_content now non-empty so the hoist \
+         gate is moot, but a future clear-then-dispatch must re-fetch"
+    );
+
+    // B3: same shape but the merge fails (cycle) → rollback restores
+    // empty drv_content + prior drv_fetch_attempted. Y is pinned
+    // Running and listed as a child of A so it reaches the
+    // existing-node branch (NOT resubmit-reset) — the rollback's
+    // drv_content_backfilled loop is the only path that clears Y's
+    // backfilled bytes; without the pin Y is Created+root →
+    // mints_epoch_on_resubmit → wholesale-restored, and the loop under
+    // test iterates an empty slice (the iter-5 review caught B3
+    // passing for the wrong reason).
+    let mut dag2 = DerivationDag::new();
+    dag2.merge(Uuid::new_v4(), &[make_node("Y", "x86_64-linux")], &[], "")?;
+    let y = dag2.node_mut("Y").unwrap();
+    y.set_status_for_test(DerivationStatus::Running);
+    y.drv_fetch_attempted = true;
+    let mut y_with_bytes = make_node("Y", "x86_64-linux");
+    y_with_bytes.drv_content = aterm.clone().into_bytes();
+    let result = dag2.merge(
+        Uuid::new_v4(),
+        &[
+            y_with_bytes,
+            make_node("A", "x86_64-linux"),
+            make_node("B", "x86_64-linux"),
+        ],
+        &[
+            make_edge("A", "Y"),
+            make_edge("A", "B"),
+            make_edge("B", "A"),
+        ],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::CycleDetected)));
+    let y = dag2.node("Y").unwrap();
+    assert!(
+        y.drv_content.is_empty() && y.input_srcs.is_empty(),
+        "rollback must clear the backfilled drv_content/input_srcs"
+    );
+    assert!(
+        y.drv_fetch_attempted,
+        "rollback must restore the prior drv_fetch_attempted"
+    );
+    assert_eq!(
+        y.status(),
+        DerivationStatus::Running,
+        "Y was never resubmit-reset — restore is via the per-field loop"
+    );
+
+    // B4 (red-first for the `restoring.contains` guard in
+    // rollback_merge's drv_content_backfilled loop): a duplicate-hash
+    // submission — first occurrence empty, second non-empty — where
+    // pre-merge Z is mints_epoch_on_resubmit (Created+root). The first
+    // occurrence resubmit-resets OLD Z into removed_retriable and
+    // fresh-inserts Z (empty); the second hits the existing-branch on
+    // FRESH Z and backfills, pushing Z into drv_content_backfilled. On
+    // rollback, the wholesale removed_retriable restore puts OLD Z
+    // back with its real bytes — the per-field loop must SKIP Z, not
+    // clear_aterm() the just-restored node. The sibling
+    // `contributions_recorded` loop already carries this guard;
+    // `drv_content` is per-occurrence (unlike interest/traceparent) so
+    // this loop is uniquely vulnerable to the duplicate-hash class.
+    let mut dag3 = DerivationDag::new();
+    let mut z_seed = make_node("Z", "x86_64-linux");
+    z_seed.drv_content = aterm.clone().into_bytes();
+    dag3.merge(Uuid::new_v4(), &[z_seed], &[], "")?;
+    assert_eq!(
+        dag3.node("Z").unwrap().drv_content,
+        aterm.as_bytes(),
+        "fixture: OLD Z carries real bytes"
+    );
+    let z_empty = make_node("Z", "x86_64-linux");
+    let mut z_with_bytes = make_node("Z", "x86_64-linux");
+    z_with_bytes.drv_content = aterm.clone().into_bytes();
+    let result = dag3.merge(
+        Uuid::new_v4(),
+        &[
+            z_empty,
+            z_with_bytes,
+            make_node("A4", "x86_64-linux"),
+            make_node("B4", "x86_64-linux"),
+        ],
+        &[make_edge("A4", "B4"), make_edge("B4", "A4")],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::CycleDetected)));
+    let z = dag3.node("Z").unwrap();
+    assert_eq!(
+        z.drv_content,
+        aterm.as_bytes(),
+        "rollback's drv_content_backfilled loop must skip resubmit-reset \
+         hashes — the wholesale removed_retriable restore already carries \
+         OLD Z's exact pre-merge bytes; clear_aterm() on it corrupts the \
+         restore (the iter-5 missing-guard bug)"
+    );
+    assert_eq!(z.input_srcs, vec![src]);
+    Ok(())
+}
+
 // r[verify sched.merge.dep-failed-transitive]
 /// bug_051: `compute_initial_states` decided every node against the
 /// pre-call snapshot. For chain A→B→X with X already Poisoned

@@ -1288,6 +1288,17 @@ pub struct DerivationState {
     /// path, still works). Forwarded verbatim into WorkAssignment.
     /// ≤256 KB bound enforced at gRPC ingress.
     pub drv_content: Vec<u8>,
+    /// Dispatch's hoisted store-side `GetPath` for `drv_content` has run
+    /// to a DEFINITIVE outcome (Found or NotFound). Negative-cache so a
+    /// recovered node whose `.drv` is persistently NotFound doesn't
+    /// re-RPC on every retry — `drv_content.is_empty()` alone can't
+    /// distinguish never-fetched from failed-fetch (or a NAR-framed
+    /// 0-byte file). NOT stamped on transient errors (Unavailable /
+    /// timeout): a single store blip self-heals on the next dispatch.
+    /// Cleared by `dag.merge`'s existing-node backfill when a fresh
+    /// `SubmitBuild` re-merges with inline `drv_content` (the escape
+    /// hatch for in-flight nodes the hoist already gave up on).
+    pub drv_fetch_attempted: bool,
     /// `inputSrcs` from the derivation ATerm — already-built store
     /// paths this derivation reads (NOT in the DAG as child nodes).
     /// Parsed once at merge time so `approx_input_closure` can
@@ -1451,6 +1462,20 @@ pub enum ResubmitDisposition {
     BoundedRefusal,
 }
 
+/// Parse `inputSrcs` from raw ATerm bytes — the `try_from_node` /
+/// `rehydrate_from_aterm` shared chain. `None` on parse failure
+/// (including empty `bytes`): `try_from_node` swallows it (`bytes` is
+/// empty for store-hit nodes the gateway didn't inline and for
+/// recovered nodes — both fall back to DAG-children-only prefetch);
+/// `rehydrate_from_aterm` propagates it (the dispatch hoist must NOT
+/// cache valid-NAR-wrapped non-ATerm garbage).
+fn parse_input_srcs(bytes: &[u8]) -> Option<Vec<String>> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok())
+        .map(|d| d.input_srcs().iter().cloned().collect())
+}
+
 impl DerivationState {
     /// THE stale-reset destruction site (merged_bug_257): clear
     /// `output_paths`, returning the non-empty, still-wanted realized
@@ -1487,11 +1512,7 @@ impl DerivationState {
         // errors — `drv_content` is empty for store-hit nodes the
         // gateway didn't inline, and recovered nodes; both fall
         // back to DAG-children-only prefetch.
-        let input_srcs: Vec<String> = std::str::from_utf8(&node.drv_content)
-            .ok()
-            .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok())
-            .map(|d| d.input_srcs().iter().cloned().collect())
-            .unwrap_or_default();
+        let input_srcs = parse_input_srcs(&node.drv_content).unwrap_or_default();
         Ok(Self {
             drv_hash: node.drv_hash.as_str().into(),
             drv_path,
@@ -1539,6 +1560,7 @@ impl DerivationState {
             // visible "not yet set" marker.
             sched: SchedHint::default(),
             drv_content: node.drv_content.clone(),
+            drv_fetch_attempted: false,
             input_srcs,
             retry: RetryState::default(),
             attempt_history: Vec::new(),
@@ -1649,7 +1671,8 @@ impl DerivationState {
                 ..Default::default()
             },
             drv_content: Vec::new(), // worker fetches from store
-            input_srcs: Vec::new(),  // unparsed (no drv_content); DAG-children-only prefetch
+            drv_fetch_attempted: false,
+            input_srcs: Vec::new(), // unparsed (no drv_content); DAG-children-only prefetch
             // Construction-time placeholder: recovery re-derives the
             // retry view from the attempt-ledger fold via
             // `rebuild_retry_view_from_ledger` once the suffix is
@@ -1687,6 +1710,55 @@ impl DerivationState {
             traceparent: String::new(), // recovered: no user trace
             probed_generation: 0,
         })
+    }
+
+    /// Backfill `drv_content` AND its co-derived `input_srcs` from
+    /// freshly-obtained ATerm bytes — the inverse of
+    /// `from_recovery_row`'s "no drv_content persisted" gap. Single-
+    /// sourced with `try_from_node` via `parse_input_srcs` so the two
+    /// stay in lockstep (the iter-3 review's "did rehydrate mirror
+    /// try_from_node": yes, structurally — not by copy-paste).
+    ///
+    /// Two callers, both filling a recovered/empty node:
+    /// `dispatch.rs::build_assignment_proto`'s hoisted GetPath fetch,
+    /// and `dag.merge`'s existing-node branch when a `SubmitBuild`
+    /// re-merges an in-flight node with inline `drv_content`. Writing
+    /// `drv_content` alone would leave `approx_input_closure` (the GC
+    /// live-pin set, called BEFORE the hoist) reading a stale-empty
+    /// `input_srcs` on every retry after the first.
+    ///
+    /// Returns `false` (and writes NOTHING) if `bytes` is not a
+    /// parseable ATerm. The dispatch hoist treats `false` as
+    /// `DrvFetch::Missing` (latches `drv_fetch_attempted`, leaves
+    /// `drv_content` empty): non-empty garbage would be sticky —
+    /// `attested_input_seeds` returns `arm="drv_unparseable"` AND the
+    /// merge-backfill escape hatch (`existing.drv_content.is_empty()`)
+    /// stays shut, so a fresh `SubmitBuild`'s correct inline ATerm
+    /// would be silently dropped for in-flight nodes. The merge caller
+    /// gets gateway-validated bytes so `false` there indicates a
+    /// gateway bug; it skips the backfill-ledger push so rollback has
+    /// no phantom entry.
+    pub fn rehydrate_from_aterm(&mut self, bytes: Vec<u8>) -> bool {
+        let Some(input_srcs) = parse_input_srcs(&bytes) else {
+            return false;
+        };
+        self.input_srcs = input_srcs;
+        self.drv_content = bytes;
+        true
+    }
+
+    /// Inverse of [`rehydrate_from_aterm`](Self::rehydrate_from_aterm):
+    /// clear exactly the `{drv_content, input_srcs}` co-derived pair.
+    /// Single-sourced so a future rehydrate widening (e.g. caching
+    /// parsed `input_drvs` to skip the re-parse in
+    /// `attested_input_seeds`) gets one matching clear-site instead of
+    /// N open-coded ones to keep in sync. Does NOT touch
+    /// `drv_fetch_attempted` — both callers (rollback_merge,
+    /// `handle_debug_clear_drv_content`) restore/stamp that
+    /// independently.
+    pub fn clear_aterm(&mut self) {
+        self.drv_content.clear();
+        self.input_srcs.clear();
     }
 
     /// Construct from a `PoisonedDerivationRow` during recovery.
@@ -1737,6 +1809,7 @@ impl DerivationState {
             claim_nonce: None,
             sched: SchedHint::default(),
             drv_content: Vec::new(),
+            drv_fetch_attempted: false,
             input_srcs: Vec::new(),
             // Construction-time placeholder carrying only the row-owned
             // `poisoned_at`; the recovery load re-derives the counters

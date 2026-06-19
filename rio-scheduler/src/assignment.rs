@@ -14,8 +14,15 @@ use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
 use crate::state::DrvHash;
 use rio_proto::StoreServiceClient;
-use std::borrow::Cow;
 use tonic::transport::Channel;
+
+/// Per-arm `Ok(None)` accounting for [`attested_input_seeds`] (and the
+/// dispatch hoist's `arm="drv_fetched"` success counter). Single-sourced
+/// here so the in-fn `seeds_unknown!` macro and the dispatch hoist
+/// can't drift on the literal. `lib.rs::register_metrics` keeps a
+/// literal — the `xtask regen docs-data` / `helm-obs` source-scrapes
+/// match `describe_*!("…")` literals only.
+pub(crate) const METRIC_ATTESTED_SEEDS_UNKNOWN: &str = "rio_scheduler_attested_seeds_unknown_total";
 
 /// Approximate input closure: the derivation's DAG children's
 /// expected output paths PLUS its own `inputSrcs` (already-built
@@ -116,15 +123,14 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 ///     placeholder; the consumed output is unknowable pre-build).
 ///
 /// A recovered node ([`crate::state::DerivationState::from_recovery_row`]
-/// sets `drv_content = Vec::new()`) reaches the inputDrvs loop via a
-/// store-side `GetPath` of its own `.drv` — the same ATerm bytes the
-/// gateway originally inlined, so the parsed `inputDrvs` set is
-/// identical and the never-narrower invariant holds by construction.
-/// The fetch is bounded by the dispatch callsite's `grpc_timeout`
-/// wrapper (and `fetch_drv_aterm`'s own per-chunk idle bound). On
-/// fetch failure (`store=None`, GetPath error/NotFound/timeout, NAR
-/// unwrap failure) → `Ok(None)` with the per-arm metric, same as the
-/// other unresolvable arms.
+/// sets `drv_content = Vec::new()`) is repopulated by the dispatch
+/// callsite's hoisted `GetPath` fetch (written back to
+/// `dag.node_mut().drv_content`) before this function is called, so
+/// the parsed `inputDrvs` set is identical to what the gateway
+/// originally inlined and the never-narrower invariant holds by
+/// construction. If that fetch failed (store unconfigured, NotFound,
+/// timeout) the node still has empty `drv_content` → `Ok(None)` with
+/// `arm="drv_empty"`.
 ///
 /// `None` → the dispatch site sends an empty closure/digest. Under
 /// ADR-022 closure-scoped castore-FUSE this is NOT a safe degrade —
@@ -132,8 +138,8 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 /// empty-scoped mount, so the assignment infra-retries instead of
 /// silently widening. `None` is therefore reserved for cases the
 /// scheduler genuinely cannot resolve (an `inputDrvs` entry never
-/// merged on this cluster, a floating-CA placeholder, or the GetPath
-/// fetch itself failing). This keeps the invariant structural: state
+/// merged on this cluster, a floating-CA placeholder, or the dispatch
+/// hoist's GetPath fetch failing). This keeps the invariant structural: state
 /// the scheduler cannot prove complete degrades to "no attestation",
 /// never to a silently narrower attestation — no recovery-path
 /// bookkeeping to keep in sync.
@@ -149,15 +155,13 @@ pub(crate) async fn attested_input_seeds(
     dag: &DerivationDag,
     drv_hash: &DrvHash,
     db: &SchedulerDb,
-    store: Option<&StoreServiceClient<Channel>>,
 ) -> Result<Option<Vec<String>>, sqlx::Error> {
     /// Per-arm `Ok(None)` accounting. Macro so each arm is one line at
     /// the return site (and so the literal label is the metric label —
     /// no enum/match indirection to keep in sync).
     macro_rules! seeds_unknown {
         ($arm:literal) => {{
-            metrics::counter!("rio_scheduler_attested_seeds_unknown_total", "arm" => $arm)
-                .increment(1);
+            metrics::counter!(METRIC_ATTESTED_SEEDS_UNKNOWN, "arm" => $arm).increment(1);
             return Ok(None);
         }};
     }
@@ -166,38 +170,15 @@ pub(crate) async fn attested_input_seeds(
         seeds_unknown!("no_node");
     };
     // Recovered nodes have `drv_content = Vec::new()`
-    // (`from_recovery_row` does not persist the ATerm). Fetch from the
-    // store — the same path a worker takes when
-    // `WorkAssignment.drv_content` is empty — so the inputDrvs loop
-    // below (and its `derivations`-table fallback) runs. Without this,
-    // every recovered target degraded to no-attestation BEFORE reaching
-    // the per-inputDrv resolver, regardless of how complete the
-    // persisted state was.
-    //
-    // The fetched bytes are NOT written back to `dag.node_mut()` (dag
-    // is `&` here); a follow-up may hoist the fetch to the dispatch
-    // callsite where `&mut self.dag` is in scope so retries and
-    // `maybe_resolve_ca` share one fetch. ~10-50ms once per recovered
-    // dispatch is acceptable meanwhile.
-    let drv_content: Cow<'_, [u8]> = if node.drv_content.is_empty() {
-        let Some(client) = store else {
-            seeds_unknown!("drv_empty_no_store");
-        };
-        match fetch_drv_aterm(&mut client.clone(), node.drv_path().as_ref()).await {
-            Some(bytes) => {
-                metrics::counter!(
-                    "rio_scheduler_attested_seeds_unknown_total",
-                    "arm" => "drv_fetched"
-                )
-                .increment(1);
-                Cow::Owned(bytes)
-            }
-            None => seeds_unknown!("drv_fetch_failed"),
-        }
-    } else {
-        Cow::Borrowed(node.drv_content.as_slice())
-    };
-    let Some(drv) = std::str::from_utf8(&drv_content)
+    // (`from_recovery_row` does not persist the ATerm). The dispatch
+    // callsite's hoisted GetPath fetch repopulates the node BEFORE
+    // calling this function (writing back to `dag.node_mut()` so
+    // retries don't re-fetch); empty here means the hoist failed or
+    // never ran (store unconfigured / Materialization kind).
+    if node.drv_content.is_empty() {
+        seeds_unknown!("drv_empty");
+    }
+    let Some(drv) = std::str::from_utf8(&node.drv_content)
         .ok()
         .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok())
     else {
@@ -212,13 +193,13 @@ pub(crate) async fn attested_input_seeds(
     // `derivations.(output_names, expected_output_paths)` lookup after
     // the loop. Each entry carries its consumed-output-name set so the
     // PG fallback applies the same name filter as the DAG arm.
-    let mut dag_missed: Vec<(String, &std::collections::BTreeSet<String>)> = Vec::new();
+    let mut dag_missed: Vec<(&String, &std::collections::BTreeSet<String>)> = Vec::new();
     for (input_drv_path, consumed) in drv.input_drvs() {
         // Seed the inputDrv's .drv path unconditionally (W03
         // forward-compat: nix-daemon reads it through FUSE).
         seeds.push(input_drv_path.clone());
         let Some(child) = dag.hash_for_path(input_drv_path).and_then(|h| dag.node(h)) else {
-            dag_missed.push((input_drv_path.clone(), consumed));
+            dag_missed.push((input_drv_path, consumed));
             continue;
         };
         // Seed only the outputs the parent's `inputDrvs` declares it
@@ -232,32 +213,37 @@ pub(crate) async fn attested_input_seeds(
         //
         // `output_names` ↔ `expected_output_paths` are positional
         // (both populated from the proto at merge time, and both
-        // persisted by `batch_upsert_derivations`). When the child
-        // completed locally (`output_paths` non-empty) every output
-        // was uploaded and has a narinfo, so the name-keyed expected
-        // path is resolvable there too; the realized list covers
-        // floating-CA (expected `""`) and is seeded wholesale below.
-        match seed_consumed(
-            &mut seeds,
-            &child.output_names,
-            &child.expected_output_paths,
-            consumed,
-        ) {
-            Ok(()) => {}
-            Err(_) if !child.output_paths.is_empty() => {
-                // Floating-CA child: expected path is the placeholder
-                // `""` but the realized paths are known. The realized
-                // list isn't name-keyed, so seed all of it — every
-                // entry has a narinfo (the worker uploaded them), so
-                // this cannot degrade `compute_input_roots`.
-                seeds.extend(child.output_paths.iter().cloned());
-            }
-            Err(_) => seeds_unknown!("child_output_unknown"),
+        // persisted by `batch_upsert_derivations`).
+        match seed_consumed(&child.output_names, &child.expected_output_paths, consumed) {
+            SeedConsumed::Resolved(paths) => seeds.extend(paths),
+            // Floating-CA placeholder: degrade. The realized
+            // `output_paths` list is NOT name-keyed (worker-reported
+            // `buffer_unordered` order, may be shorter than
+            // `output_names` per completion.rs's `built_outputs.len()
+            // ≤ output_names.len()`) so seeding it wholesale cannot be
+            // proven never-narrower — four review rounds found a new
+            // edge case each time (filter-inverts; `[""]`-passes-len;
+            // short-but-clean; iteration-order masking). The proper
+            // fix is the name-keyed `realisations` table:
+            //
+            // TODO: a locally-built floating-CA child degrades here
+            // even though `realisations` (002_store.sql:134) persists
+            // the (modular_hash, output_name) → output_path mapping —
+            // a `derivations.drv_path → modular_hash → realisations`
+            // join would resolve the consumed name exactly. Same join
+            // covers the PG-fallback arm below.
+            SeedConsumed::Placeholder => seeds_unknown!("child_output_unknown"),
+            // Consumed name not in `child.output_names` (malformed
+            // graph — Nix's evaluator would reject, but the scheduler
+            // path doesn't cross-validate `inputDrvs` against
+            // `output_names`). Degrade per the never-narrower
+            // contract.
+            SeedConsumed::Unresolvable => seeds_unknown!("input_consumes_undeclared_output"),
         }
     }
 
     if !dag_missed.is_empty() {
-        let missed_paths: Vec<String> = dag_missed.iter().map(|(p, _)| p.clone()).collect();
+        let missed_paths: Vec<String> = dag_missed.iter().map(|(p, _)| (*p).clone()).collect();
         let by_drv = db.expected_outputs_by_drv_path(&missed_paths).await?;
         for (drv_path, consumed) in &dag_missed {
             // The `derivations` row carries the same
@@ -265,61 +251,144 @@ pub(crate) async fn attested_input_seeds(
             // would — written from the gateway-parsed ATerm at merge
             // time and surviving reap. No name-blind reverse lookup,
             // no count heuristic: never-narrower by construction. A
-            // floating-CA `""` for a consumed name is the same
-            // unknowable-output gate as the DAG arm above; an absent
-            // row means genuinely never merged.
-            match by_drv
-                .get(drv_path)
-                .map(|(names, paths)| seed_consumed(&mut seeds, names, paths, consumed))
+            // floating-CA `""` for a consumed name degrades (same
+            // `realisations`-join TODO as the DAG arm above); an
+            // absent row means genuinely never merged.
+            let arm = match by_drv
+                .get(*drv_path)
+                .map(|(names, paths)| seed_consumed(names, paths, consumed))
             {
-                Some(Ok(())) => {}
-                found => {
-                    tracing::debug!(
-                        input_drv = %drv_path,
-                        row_present = found.is_some(),
-                        "inputDrv not in DAG and derivations-table fallback \
-                         cannot establish its consumed outputs; degrading to unattested"
-                    );
+                Some(SeedConsumed::Resolved(paths)) => {
+                    seeds.extend(paths);
                     metrics::counter!(
                         "rio_scheduler_attested_seeds_pg_fallback_total",
-                        "outcome" => "degraded_none"
+                        "outcome" => "resolved"
                     )
                     .increment(1);
-                    seeds_unknown!("input_drv_unresolved");
+                    continue;
                 }
-            }
+                // Same arm labels as the DAG path so a triage doesn't
+                // mis-bucket on which lookup hit.
+                Some(SeedConsumed::Placeholder) => "child_output_unknown",
+                Some(SeedConsumed::Unresolvable) => "input_consumes_undeclared_output",
+                None => "input_drv_unresolved",
+            };
+            tracing::debug!(
+                input_drv = %drv_path,
+                arm,
+                "inputDrv not in DAG and derivations-table fallback \
+                 cannot establish its consumed outputs; degrading to unattested"
+            );
+            metrics::counter!(
+                "rio_scheduler_attested_seeds_pg_fallback_total",
+                "outcome" => "degraded_none"
+            )
+            .increment(1);
+            metrics::counter!(METRIC_ATTESTED_SEEDS_UNKNOWN, "arm" => arm).increment(1);
+            return Ok(None);
         }
-        metrics::counter!(
-            "rio_scheduler_attested_seeds_pg_fallback_total",
-            "outcome" => "resolved"
-        )
-        .increment(dag_missed.len() as u64);
     }
 
     Ok(Some(seeds))
 }
 
-/// Push the path of every `consumed` output name onto `seeds`, looking
-/// each up via the positional `names` ↔ `paths` zip. `Err(())` if any
-/// consumed name is undeclared (not in `names`) or its path is the
-/// floating-CA placeholder `""` — the never-narrower gate: a consumed
-/// output the seed set cannot cover means no attestation.
+/// [`seed_consumed`] outcome — 3-state so callers emit distinct
+/// `seeds_unknown` arm labels (`child_output_unknown` vs
+/// `input_consumes_undeclared_output`) for the two degrade paths.
+/// Both degrade; only `Resolved` seeds.
+enum SeedConsumed {
+    /// Every consumed name resolved to a non-empty path.
+    Resolved(Vec<String>),
+    /// At least one consumed name's path is the floating-CA `""`
+    /// placeholder. Degrade — the `realisations`-table join (TODO at
+    /// the DAG-arm callsite) is the only never-narrower-safe escape
+    /// hatch.
+    Placeholder,
+    /// At least one consumed name is not in `names`, or `names`/`paths`
+    /// length skew. The seed set CANNOT cover this input — degrade.
+    /// Dominates `Placeholder` when both co-occur.
+    Unresolvable,
+}
+
+/// Resolve the path of every `consumed` output name via the positional
+/// `names` ↔ `paths` zip. The never-narrower gate: a consumed output
+/// the seed set cannot cover means no attestation. Returns owned paths
+/// on `Resolved` (no partial mutation of caller state otherwise).
+///
+/// Kin of [`rio_common::wanted_outputs::verifiable_wanted_paths`] (the
+/// demand-driven completeness predicate's zip-filter): same
+/// `names ↔ paths` positional invariant, same degrade-on-unverifiable
+/// contract; differs in that `consumed` is an explicit name set (no
+/// empty-means-all sentinel — `inputDrvs` always names outputs) and
+/// `Placeholder` is distinguished from `Unresolvable` for the metric
+/// arm labels (both degrade). The merged_bug_026
+/// length-skew guard is a release-mode check (matching
+/// `verifiable_wanted_paths`); the producer invariant (`translate.rs`
+/// `unzip`, `batch_upsert_derivations` writing both columns in one
+/// statement) keeps it unreachable.
 fn seed_consumed(
-    seeds: &mut Vec<String>,
     names: &[String],
     paths: &[String],
     consumed: &std::collections::BTreeSet<String>,
-) -> Result<(), ()> {
-    for name in consumed {
-        let path = names
-            .iter()
-            .position(|n| n == name)
-            .and_then(|i| paths.get(i))
-            .filter(|p| !p.is_empty())
-            .ok_or(())?;
-        seeds.push(path.clone());
+) -> SeedConsumed {
+    if names.len() != paths.len() {
+        debug_assert_eq!(
+            names.len(),
+            paths.len(),
+            "output_names ↔ expected_output_paths positional invariant (merged_bug_026)"
+        );
+        return SeedConsumed::Unresolvable;
     }
-    Ok(())
+    // Scan every consumed name: `Unresolvable` dominates `Placeholder`
+    // (an undeclared name means the seed set CANNOT cover this input
+    // regardless of what the other names resolve to), so a first-hit
+    // early-return would let BTreeSet iteration order decide which
+    // wins — the lexicographically-smallest name's outcome would mask
+    // the rest. The metric arm distinction (`child_output_unknown` vs
+    // `input_consumes_undeclared_output`) is the load-bearing reason
+    // to keep the 3-state split.
+    let mut resolved = Vec::with_capacity(consumed.len());
+    let mut saw_placeholder = false;
+    for name in consumed {
+        let Some(i) = names.iter().position(|n| n == name) else {
+            return SeedConsumed::Unresolvable;
+        };
+        // Safe: len-checked above.
+        if paths[i].is_empty() {
+            saw_placeholder = true;
+        } else {
+            resolved.push(paths[i].clone());
+        }
+    }
+    if saw_placeholder {
+        SeedConsumed::Placeholder
+    } else {
+        SeedConsumed::Resolved(resolved)
+    }
+}
+
+/// Outcome of [`fetch_drv_aterm`]: distinguishes a definitive miss
+/// (store says NotFound / InvalidArgument, or it returned bytes that
+/// don't unwrap to a `.drv`, or any non-transient gRPC code) from a
+/// transient failure ([`NarCollectError::is_transient`](rio_proto::client::NarCollectError::is_transient): Unavailable /
+/// Unknown / ResourceExhausted / Aborted; plus `DeadlineExceeded` —
+/// the dispatch hoist retries with backoff so the FUSE-thread
+/// "compounds the wait" exclusion doesn't apply). The dispatch hoist
+/// negative-caches the former (re-RPCing the same `drv_path` won't
+/// change the answer) but NOT the latter (a blip self-heals on the
+/// next dispatch).
+#[derive(Debug)]
+pub(crate) enum DrvFetch {
+    /// ATerm bytes successfully fetched and NAR-unwrapped.
+    Found(Vec<u8>),
+    /// Store reachable, definitively says the `.drv` is absent (or
+    /// present-but-unusable: NAR-unwrap failed). Negative-cache.
+    Missing,
+    /// [`NarCollectError::is_transient`](rio_proto::client::NarCollectError::is_transient) (Unavailable / Unknown /
+    /// ResourceExhausted / Aborted), `DeadlineExceeded` /
+    /// `Cancelled`, or the dispatch callsite's outer `grpc_timeout`.
+    /// NOT negative-cached — retry on next dispatch.
+    Transient,
 }
 
 /// Fetch a `.drv`'s ATerm bytes from the store via `GetPath`.
@@ -330,20 +399,25 @@ fn seed_consumed(
 /// `WorkAssignment.drv_content` is empty
 /// (`rio-builder/src/executor/inputs.rs::fetch_drv_from_store`).
 ///
-/// `None` on any failure: `GetPath` error/timeout/NotFound, NAR-unwrap
-/// failure, or NAR > 1 MiB (a `.drv` is ~1-50 KB ASCII; 1 MiB is ~20×
-/// any real `.drv` — bail rather than pull a multi-GB closure if the
-/// path was mis-resolved). The 2s per-chunk idle bound covers a slow
-/// store without blocking dispatch (the call is also under the
-/// dispatch site's `grpc_timeout` wrapper).
+/// `Transient` only on [`NarCollectError::is_transient`](rio_proto::client::NarCollectError::is_transient) (the
+/// `rio_common::grpc::is_transient` allowlist). Everything else —
+/// NotFound, InvalidArgument, NAR-unwrap failure, NAR > 1 MiB (a
+/// `.drv` is ~1-50 KB ASCII; 1 MiB is ~20× any real `.drv`),
+/// Validation, Io, non-allowlist gRPC codes — is `Missing`
+/// (definitive: re-fetching the same `drv_path` won't change the
+/// answer). The 2s per-chunk idle bound covers a slow store without
+/// blocking dispatch (the dispatch callsite also wraps the whole call
+/// in `grpc_timeout`).
 ///
-/// Shared by [`attested_input_seeds`] (recovered dispatch target) and
-/// `dispatch.rs::fetch_drv_content_from_store` (recovered CA-resolve
-/// target).
+/// Sole caller: `dispatch.rs::build_assignment_proto`'s hoisted
+/// recovered-target fetch, which writes a `Found` result back to
+/// `dag.node_mut()` via `rehydrate_from_aterm` and stamps
+/// `drv_fetch_attempted` on `Found`/`Missing` (not `Transient`) so
+/// retries (and `maybe_resolve_ca`) read from memory.
 pub(crate) async fn fetch_drv_aterm(
     client: &mut StoreServiceClient<Channel>,
     drv_path: &str,
-) -> Option<Vec<u8>> {
+) -> DrvFetch {
     const MAX_DRV_NAR_SIZE: u64 = 1024 * 1024;
     const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -359,21 +433,71 @@ pub(crate) async fn fetch_drv_aterm(
         Ok(Some((_info, nar))) => nar,
         Ok(None) => {
             tracing::debug!(%drv_path, "drv_content fetch: .drv not found in store");
-            return None;
+            return DrvFetch::Missing;
+        }
+        Err(e) if e.is_not_found() => {
+            tracing::debug!(%drv_path, error = %e, "drv_content fetch: GetPath NotFound");
+            return DrvFetch::Missing;
+        }
+        Err(e) if e.is_transient() => {
+            tracing::debug!(%drv_path, error = %e, "drv_content fetch: GetPath transient error");
+            return DrvFetch::Transient;
+        }
+        // refusal-census: allow(per-callsite override of is_transient's
+        // DeadlineExceeded/Cancelled exclusion — backoff-retried, not
+        // tight-loop; centralizing as is_transient_with_backoff is the
+        // R7 follow-up named in the iter-5 review)
+        Err(e)
+            if matches!(
+                e.grpc_code(),
+                Some(tonic::Code::DeadlineExceeded | tonic::Code::Cancelled)
+            ) =>
+        {
+            // `is_transient` excludes DeadlineExceeded by design (its
+            // rationale: "retrying with the same idle bound won't help
+            // on a FUSE-thread caller"). That doesn't apply here — the
+            // dispatch hoist retries on the next build attempt with
+            // backoff, not immediately. The 2s per-chunk idle bound
+            // (`collect_nar_stream` synthesizes this status on a >2s
+            // gap) and store-side `deadline_exceeded` on backend stall
+            // are blips, not a verdict on `drv_path`. `Cancelled` is
+            // the same class: a rolling-restart RST_STREAM /
+            // SIGTERM-on-the-store maps to Cancelled depending on
+            // tonic/h2/envoy mapping (`rio-proto`'s
+            // `RefusalKind::Undecided` groups it with the transport
+            // codes, not per-request verdicts) — also a blip.
+            tracing::debug!(%drv_path, error = %e, "drv_content fetch: GetPath deadline/cancelled (transient)");
+            return DrvFetch::Transient;
         }
         Err(e) => {
-            tracing::debug!(%drv_path, error = %e, "drv_content fetch: GetPath failed");
-            return None;
+            // Definitive: InvalidArgument (store-path didn't parse —
+            // `NarCollectError::is_invalid_argument`'s "treat as
+            // ENOENT, NOT retry-worthy"), SizeExceeded / Validation
+            // (the bytes won't change on retry), Io (local disk), and
+            // any non-allowlist gRPC code (PermissionDenied / Internal
+            // / FailedPrecondition — re-RPCing the same path won't
+            // resolve auth/config). Catch-all is `Missing` (latch) so
+            // future `rio_common::grpc::is_transient` allowlist
+            // changes propagate without a matching edit here; the
+            // iter-2 `Err(_) => Transient` re-fired a doomed in-actor
+            // RPC every retry (up to ~1 MiB for SizeExceeded).
+            tracing::debug!(
+                %drv_path, error = %e,
+                "drv_content fetch: definitive non-NotFound error (latching)"
+            );
+            return DrvFetch::Missing;
         }
     };
     match rio_nix::nar::extract_single_file(&nar) {
-        Ok(bytes) => Some(bytes),
+        Ok(bytes) => DrvFetch::Found(bytes),
         Err(e) => {
             tracing::debug!(
                 %drv_path, error = %e,
                 "drv_content fetch: NAR unwrap failed (not a single regular file)"
             );
-            None
+            // The store has SOMETHING at this path that isn't a
+            // single-file `.drv`. Re-fetching won't change that.
+            DrvFetch::Missing
         }
     }
 }
@@ -521,33 +645,41 @@ mod tests {
             &make_derivation_node("attest-child", "x86_64-linux").into(),
         )
         .unwrap();
-        child.output_paths = vec![child_out.clone()];
+        // IA happy-path shape: `output_names ↔ expected_output_paths`
+        // positional (the merged_bug_026 producer invariant
+        // `seed_consumed` debug-asserts).
+        child.expected_output_paths = vec![child_out.clone()];
         dag.insert_recovered_node(child);
 
         let src = rio_test_support::fixtures::test_store_path("attest-src");
         dag.insert_recovered_node(make_attest_parent(&child_drv_path, &src));
         dag.insert_recovered_edge("attest-parent".into(), "attest-child".into());
 
-        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db)
             .await
             .unwrap()
             .expect("parsed drv with resolvable inputs is attestable");
         assert!(got.contains(&src), "inputSrcs entry missing: {got:?}");
         assert!(
             got.contains(&child_out),
-            "inputDrv child's realized output missing: {got:?}"
+            "inputDrv child's consumed output missing: {got:?}"
         );
     }
 
-    /// Recovery shape with no store client: `from_recovery_row` clears
-    /// `drv_content`, the GetPath fetch is unavailable, so the exact
-    /// direct-input set cannot be established → no attestation, even
-    /// though a DAG child with a known output exists (the approximation
-    /// would have produced a non-empty — and possibly narrower-than-
-    /// true — seed set).
+    /// `drv_content = Vec::new()` (the `from_recovery_row` shape, or
+    /// the gateway didn't inline) → the exact direct-input set cannot
+    /// be established → no attestation, even though a DAG child with a
+    /// known output exists (the approximation would have produced a
+    /// non-empty — and possibly narrower-than-true — seed set).
+    ///
+    /// The dispatch callsite's hoisted GetPath fetch repopulates
+    /// `drv_content` before this function is called; this test pins
+    /// the `drv_empty` arm for when that hoist failed (store
+    /// unconfigured / NotFound / timeout). The hoist+writeback itself
+    /// is pinned by `dispatch_caches_recovered_drv_content`.
     // r[verify sched.dispatch.input-roots+3]
     #[tokio::test]
-    async fn attested_seeds_none_when_drv_empty_and_no_store() {
+    async fn attested_seeds_none_when_drv_content_empty() {
         let (_t, db) = test_db().await;
         let mut dag = DerivationDag::new();
         let mut child = DerivationState::try_from_node(
@@ -559,7 +691,6 @@ mod tests {
         )];
         dag.insert_recovered_node(child);
 
-        // No drv_content (recovered / not inlined). No store client.
         let parent = DerivationState::try_from_node(
             &make_derivation_node("attest-parent", "x86_64-linux").into(),
         )
@@ -568,112 +699,11 @@ mod tests {
         dag.insert_recovered_edge("attest-parent".into(), "attest-child".into());
 
         assert!(
-            attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
                 .await
                 .unwrap()
                 .is_none(),
-            "no parsed .drv and no store to fetch from → must not attest"
-        );
-    }
-
-    /// Recovered target: `drv_content = Vec::new()` (the
-    /// `from_recovery_row` shape), but the store has the `.drv` ATerm
-    /// at `drv_path` and the inputDrv has a persisted `derivations`
-    /// row. The GetPath fetch supplies the bytes the gateway originally
-    /// inlined → `inputDrvs` parses → the `derivations`-table fallback
-    /// resolves the inputDrv's outputs → `Some(seeds)`.
-    ///
-    /// Regression test for the live-cluster shape where 28% of
-    /// dispatches degraded to `seeds_unknown` at the parse step BEFORE
-    /// reaching the per-inputDrv resolver, simply because the dispatch
-    /// target was recovery-loaded.
-    // r[verify sched.dispatch.input-roots+3]
-    // r[verify sched.dispatch.never-narrower]
-    #[tokio::test]
-    async fn attested_seeds_recovered_target_fetches_drv_content() {
-        let (t, db) = test_db().await;
-        let (store, store_client) = rio_test_support::grpc::spawn_mock_store_inproc()
-            .await
-            .unwrap();
-        let mut dag = DerivationDag::new();
-
-        let sub_drv = rio_test_support::fixtures::test_drv_path("attest-substituted");
-        let sub_out = rio_test_support::fixtures::test_store_path("attest-substituted-out");
-        let src = rio_test_support::fixtures::test_store_path("attest-src");
-        let parent_drv = rio_test_support::fixtures::test_drv_path("attest-parent");
-
-        // The inputDrv is NOT a DAG node, but its persisted
-        // `derivations` row carries expected_output_paths — the same
-        // C1-hardened shape as `_fall_back_to_pg_for_substituted_…`.
-        put_derivation_row(&t.pool, &sub_drv, &["out"], &[&sub_out]).await;
-
-        // Parent's ATerm lives only in the store (recovered node:
-        // `drv_content` empty in-memory). Same ATerm
-        // `make_attest_parent` would have inlined; the fetched bytes
-        // are byte-identical to what the gateway sent → never-narrower
-        // by construction.
-        let parent_out = rio_test_support::fixtures::test_store_path("attest-parent-out");
-        let aterm = format!(
-            r#"Derive([("out","{parent_out}","","")],[("{sub_drv}",["out"])],["{src}"],"x86_64-linux","/bin/sh",[],[("out","{parent_out}")])"#
-        );
-        store.seed_with_content(&parent_drv, aterm.as_bytes());
-
-        let parent = DerivationState::try_from_node(
-            &make_derivation_node("attest-parent", "x86_64-linux").into(),
-        )
-        .unwrap();
-        assert!(parent.drv_content.is_empty(), "fixture sanity");
-        dag.insert_recovered_node(parent);
-
-        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, Some(&store_client))
-            .await
-            .unwrap()
-            .expect(
-                "recovered target with store-side .drv + persisted inputDrv row \
-                 attests via GetPath → derivations-table fallback",
-            );
-        assert!(got.contains(&src), "inputSrcs entry missing: {got:?}");
-        assert!(
-            got.contains(&sub_out),
-            "inputDrv output (from derivations.expected_output_paths via \
-             store-fetched ATerm) missing: {got:?}"
-        );
-        assert!(
-            got.contains(&parent_drv),
-            "own .drv path must be seeded (W03): {got:?}"
-        );
-        assert!(
-            got.contains(&sub_drv),
-            "inputDrv .drv path must be seeded (W03): {got:?}"
-        );
-    }
-
-    /// Recovered target whose `.drv` is not in the store either
-    /// (GetPath → NotFound) → no attestation. Covers the
-    /// `drv_fetch_failed` arm.
-    // r[verify sched.dispatch.input-roots+3]
-    #[tokio::test]
-    async fn attested_seeds_none_when_drv_fetch_fails() {
-        let (_t, db) = test_db().await;
-        let (_store, store_client) = rio_test_support::grpc::spawn_mock_store_inproc()
-            .await
-            .unwrap();
-        let mut dag = DerivationDag::new();
-
-        // Parent has empty drv_content; store has nothing seeded at
-        // its drv_path → GetPath returns NotFound.
-        let parent = DerivationState::try_from_node(
-            &make_derivation_node("attest-parent", "x86_64-linux").into(),
-        )
-        .unwrap();
-        dag.insert_recovered_node(parent);
-
-        assert!(
-            attested_input_seeds(&dag, &"attest-parent".into(), &db, Some(&store_client))
-                .await
-                .unwrap()
-                .is_none(),
-            "drv_content empty + GetPath NotFound → must not attest"
+            "no parsed .drv → must not attest"
         );
     }
 
@@ -703,7 +733,7 @@ mod tests {
         put_derivation_row(&t.pool, &sub_drv, &["out"], &[&sub_out]).await;
         dag.insert_recovered_node(make_attest_parent(&sub_drv, &src));
 
-        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db)
             .await
             .unwrap()
             .expect("DAG-missed inputDrv with a derivations row attests via PG fallback");
@@ -765,7 +795,7 @@ mod tests {
         dag.insert_recovered_node(make_attest_parent(&child_drv, &src));
         dag.insert_recovered_edge("attest-parent".into(), "attest-split".into());
 
-        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db)
             .await
             .unwrap()
             .expect("split-output inputDrv with the consumed output known is attestable");
@@ -798,7 +828,7 @@ mod tests {
         put_derivation_row(&t.pool, &child_drv, &["out", "man"], &[&p_out, &p_man]).await;
         dag.insert_recovered_node(make_attest_parent(&child_drv, &src));
 
-        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db)
             .await
             .unwrap()
             .expect("PG fallback resolves the consumed output");
@@ -815,8 +845,8 @@ mod tests {
     /// reverse-lookup with a `len() >= consumed` count-check would
     /// pass (2 ≥ 1) and seed `[dev, man]` — silently dropping `out`,
     /// the one output the build actually references. The
-    /// `derivations`-table resolver returns the full
-    /// `expected_output_paths` instead, so `out` is seeded regardless
+    /// `derivations`-table resolver name-keys the consumed output
+    /// instead, so `out` is seeded (and `dev`/`man` are NOT) regardless
     /// of narinfo's deriver state.
     // r[verify sched.dispatch.input-roots+3]
     // r[verify sched.dispatch.never-narrower]
@@ -831,7 +861,9 @@ mod tests {
         let src = rio_test_support::fixtures::test_store_path("attest-src");
 
         // narinfo state that would fool a deriver-count heuristic:
-        // dev+man have deriver set, out has deriver NULL.
+        // dev+man have deriver set, out has deriver NULL. Unread by
+        // `seed_consumed` itself — that's the point: this fixture
+        // catches a regression to a deriver-based resolver.
         put_narinfo_with_deriver(&t.pool, &dev, Some(&multi_drv)).await;
         put_narinfo_with_deriver(&t.pool, &man, Some(&multi_drv)).await;
         put_narinfo_with_deriver(&t.pool, &out, None).await;
@@ -848,14 +880,19 @@ mod tests {
         // builds inputDrvs=[(child,["out"])]).
         dag.insert_recovered_node(make_attest_parent(&multi_drv, &src));
 
-        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db)
             .await
             .unwrap()
-            .expect("derivations-table resolver attests the full output set");
+            .expect("derivations-table resolver name-keys the consumed output");
         assert!(
             got.contains(&out),
             "the consumed output `out` MUST be seeded even though its \
              narinfo.deriver is NULL — never-narrower: {got:?}"
+        );
+        assert!(
+            !got.contains(&dev) && !got.contains(&man),
+            "unconsumed `dev`/`man` must NOT be seeded even though their \
+             narinfo.deriver IS set: {got:?}"
         );
     }
 
@@ -871,7 +908,7 @@ mod tests {
         dag.insert_recovered_node(make_attest_parent(&missing_child, &src));
 
         assert!(
-            attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
                 .await
                 .unwrap()
                 .is_none(),
@@ -893,11 +930,128 @@ mod tests {
         dag.insert_recovered_node(make_attest_parent(&ca_drv, &src));
 
         assert!(
-            attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
                 .await
                 .unwrap()
                 .is_none(),
             "floating-CA placeholder in derivations row → must not attest"
+        );
+    }
+
+    /// Never-narrower: an inputDrv child with
+    /// `expected_output_paths = [""]` (floating-CA placeholder) AND
+    /// `output_paths = [""]` (`complete_ready_from_store_batch` cloned
+    /// expected into realized for an IA that turned out floating-CA).
+    /// `Placeholder` degrades unconditionally — the wholesale
+    /// `output_paths` fallback was DROPPED (the realized list is not
+    /// name-keyed and `built_outputs.len() ≤ output_names.len()`, so
+    /// it cannot be proven never-narrower; see the `realisations`-join
+    /// TODO at the DAG-arm callsite). This test pins that a non-empty
+    /// realized list does NOT resurrect the fallback.
+    // r[verify sched.dispatch.never-narrower]
+    #[tokio::test]
+    async fn attested_seeds_never_narrower_placeholder_in_realized() {
+        let (_t, db) = test_db().await;
+        let mut dag = DerivationDag::new();
+        let child_drv_path = rio_test_support::fixtures::test_drv_path("attest-ca-clone");
+        let mut child = DerivationState::try_from_node(
+            &make_derivation_node("attest-ca-clone", "x86_64-linux").into(),
+        )
+        .unwrap();
+        child.output_names = vec!["out".into()];
+        child.expected_output_paths = vec![String::new()];
+        // The bug shape: realized list non-empty (passes the len guard)
+        // but every entry the placeholder `""` (filter drops them all).
+        child.output_paths = vec![String::new()];
+        dag.insert_recovered_node(child);
+
+        let src = rio_test_support::fixtures::test_store_path("attest-src");
+        dag.insert_recovered_node(make_attest_parent(&child_drv_path, &src));
+        dag.insert_recovered_edge("attest-parent".into(), "attest-ca-clone".into());
+
+        assert!(
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
+                .await
+                .unwrap()
+                .is_none(),
+            "Placeholder degrades unconditionally; a non-empty realized \
+             list must NOT resurrect the dropped wholesale fallback"
+        );
+    }
+
+    /// `seed_consumed`: `Unresolvable` dominates `Placeholder` when
+    /// both co-occur, regardless of BTreeSet iteration order. Iter-3's
+    /// first-hit early-return let the lexicographically-smallest
+    /// consumed name's outcome mask the rest — `{"lib","zzz"}` with
+    /// `lib→""` and `zzz` undeclared returned `Placeholder` (lib sorts
+    /// first), but `{"aaa","lib"}` returned `Unresolvable`.
+    // r[verify sched.dispatch.never-narrower]
+    #[test]
+    fn seed_consumed_unresolvable_dominates_placeholder() {
+        use std::collections::BTreeSet;
+        let names = vec!["lib".to_string(), "out".to_string()];
+        let paths = vec![String::new(), "/nix/store/x-out".to_string()];
+        // Placeholder ("lib"→"") sorts before undeclared ("zzz").
+        let consumed: BTreeSet<String> = ["lib".into(), "zzz".into()].into();
+        assert!(
+            matches!(
+                seed_consumed(&names, &paths, &consumed),
+                SeedConsumed::Unresolvable
+            ),
+            "undeclared name must dominate placeholder regardless of iteration order"
+        );
+        // Reverse: undeclared sorts first — same outcome.
+        let consumed: BTreeSet<String> = ["aaa".into(), "lib".into()].into();
+        assert!(matches!(
+            seed_consumed(&names, &paths, &consumed),
+            SeedConsumed::Unresolvable
+        ));
+    }
+
+    /// Never-narrower: parent's `inputDrvs` declares `["dev"]` but the
+    /// child only declares `["out"]` — malformed graph (Nix's evaluator
+    /// would reject it), but nothing in the scheduler path
+    /// cross-validates `inputDrvs` against `child.output_names`. The
+    /// 3-state `SeedConsumed` keeps undeclared-name distinct from the
+    /// floating-CA placeholder for the metric arm label; both degrade.
+    // r[verify sched.dispatch.never-narrower]
+    #[tokio::test]
+    async fn attested_seeds_degrade_on_undeclared_consumed_name() {
+        let (_t, db) = test_db().await;
+        let mut dag = DerivationDag::new();
+        let child_drv = rio_test_support::fixtures::test_drv_path("attest-undecl");
+        let child_out = rio_test_support::fixtures::test_store_path("attest-undecl-out");
+        let mut child = DerivationState::try_from_node(
+            &make_derivation_node("attest-undecl", "x86_64-linux").into(),
+        )
+        .unwrap();
+        child.output_names = vec!["out".into()];
+        child.expected_output_paths = vec![child_out.clone()];
+        // Non-empty realized list — pins that the dropped wholesale
+        // `output_paths` fallback stays dropped (it would have seeded
+        // `[out]` for a parent that consumes `dev`).
+        child.output_paths = vec![child_out.clone()];
+        dag.insert_recovered_node(child);
+
+        // Parent inputDrvs=[(child, ["dev"])] — `dev` is NOT in the
+        // child's output_names.
+        let parent_out = rio_test_support::fixtures::test_store_path("attest-undecl-parent-out");
+        let src = rio_test_support::fixtures::test_store_path("attest-src");
+        let aterm = format!(
+            r#"Derive([("out","{parent_out}","","")],[("{child_drv}",["dev"])],["{src}"],"x86_64-linux","/bin/sh",[],[("out","{parent_out}")])"#
+        );
+        let mut parent_node = make_derivation_node("attest-parent", "x86_64-linux");
+        parent_node.drv_content = aterm.into_bytes();
+        dag.insert_recovered_node(DerivationState::try_from_node(&parent_node.into()).unwrap());
+        dag.insert_recovered_edge("attest-parent".into(), "attest-undecl".into());
+
+        assert!(
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
+                .await
+                .unwrap()
+                .is_none(),
+            "consumed name `dev` not in child.output_names → the seed set \
+             CANNOT cover this input; must degrade to None (never-narrower)"
         );
     }
 
@@ -921,7 +1075,7 @@ mod tests {
         dag.insert_recovered_edge("attest-parent".into(), "attest-child".into());
 
         assert!(
-            attested_input_seeds(&dag, &"attest-parent".into(), &db, None)
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
                 .await
                 .unwrap()
                 .is_none(),

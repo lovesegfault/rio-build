@@ -80,6 +80,19 @@ impl NarCollectError {
     pub fn is_invalid_argument(&self) -> bool {
         matches!(self, NarCollectError::Stream(s) if s.code() == tonic::Code::InvalidArgument)
     }
+
+    /// The underlying gRPC code, if this is a [`Stream`](Self::Stream)
+    /// error. Callers whose retry semantics differ from
+    /// [`is_transient`](Self::is_transient)'s allowlist (e.g. the
+    /// scheduler's dispatch hoist treats `DeadlineExceeded` as
+    /// retry-with-backoff, not the FUSE-thread "compounds the wait"
+    /// case) can match on this directly.
+    pub fn grpc_code(&self) -> Option<tonic::Code> {
+        match self {
+            NarCollectError::Stream(s) => Some(s.code()),
+            _ => None,
+        }
+    }
 }
 
 /// Drain a `GetPath` response stream into `(Option<PathInfo>, nar_bytes)`.

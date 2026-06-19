@@ -1148,6 +1148,87 @@ impl DagActor {
                 .map(|entry| entry.job_id),
             rio_evidence_kernel::pull::PullKind::Build => None,
         };
+
+        // Round-3 dag-actor stall: a recovered node has
+        // `drv_content = Vec::new()` (`from_recovery_row` does not
+        // persist the ATerm). Fetch from the store ONCE here — where
+        // `&mut self.dag` is in scope — and write back to the node so
+        // both `maybe_resolve_ca` (immediately below) and
+        // `attested_input_seeds` (further down) read from memory, and
+        // so the WorkAssignment payload carries the bytes on dispatch
+        // #1 instead of #2. The 94999b7d2 in-function fetch was correct
+        // but uncached: every retry of a recovered target re-fetched
+        // (~30ms in-actor; 12557× under load → ~500s synchronous actor
+        // time).
+        //
+        // Gated to the union of its consumers:
+        // `attested_input_seeds` is reached only on `PullKind::Build`;
+        // `maybe_resolve_ca` early-returns unless `needs_resolve` AND
+        // also short-circuits on `ca_inputs.is_empty() &&
+        // ia_inputs.is_empty()` (a floating-CA leaf — `needs_resolve`
+        // is set from `has_ca_floating_outputs()` independent of
+        // inputs) BEFORE reading `drv_content`. Both early-returns are
+        // mirrored here so a recovered IA Materialization with
+        // `needs_resolve=false`, OR a recovered floating-CA leaf
+        // Materialization with no DAG inputs, doesn't pay one in-actor
+        // RPC neither consumer reads.
+        //
+        // Bounded by `grpc_timeout` (and `fetch_drv_aterm`'s own
+        // per-chunk idle bound + 1 MiB cap). `Found`/`Missing` stamp
+        // `drv_fetch_attempted` so a persistently-NotFound `.drv`
+        // doesn't re-RPC on every retry; `Transient` (Unavailable /
+        // timeout) does NOT stamp — a single store blip self-heals on
+        // the next dispatch instead of dooming the node to
+        // `arm="drv_empty"` for its lifetime. `Missing`/`Transient` →
+        // `drv_content` stays empty → `attested_input_seeds` returns
+        // `Ok(None)` with `arm="drv_empty"` and dispatch degrades to no
+        // attestation.
+        if let Some(state) = self.dag.node(drv_hash)
+            && state.drv_content.is_empty()
+            && !state.drv_fetch_attempted
+            && (matches!(attempt_kind, rio_evidence_kernel::pull::PullKind::Build)
+                || (state.ca.needs_resolve && !self.dag.get_children(drv_hash).is_empty()))
+            && let Some(client) = self.store_client.as_ref()
+        {
+            use crate::assignment::{DrvFetch, METRIC_ATTESTED_SEEDS_UNKNOWN};
+            let drv_path = state.drv_path().to_string();
+            let fetched = tokio::time::timeout(
+                self.grpc_timeout,
+                crate::assignment::fetch_drv_aterm(&mut client.clone(), &drv_path),
+            )
+            .await
+            .unwrap_or(DrvFetch::Transient);
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                match fetched {
+                    DrvFetch::Found(bytes) => {
+                        state.drv_fetch_attempted = true;
+                        // `false` = bytes are not a parseable ATerm
+                        // (valid-NAR-wrapped garbage). Treat as
+                        // `Missing`: latch (already stamped above),
+                        // do NOT write back — non-empty garbage is
+                        // sticky and defeats the merge-backfill
+                        // escape hatch. The metric is gated on
+                        // `Build` so `arm="drv_fetched"` stays
+                        // comparable to
+                        // `input_closure_unattested_total{reason=seeds_unknown}`
+                        // (the documented denominator at
+                        // `lib.rs::METRIC_ATTESTED_SEEDS_UNKNOWN` —
+                        // `attested_input_seeds` is Build-only).
+                        if state.rehydrate_from_aterm(bytes)
+                            && matches!(attempt_kind, rio_evidence_kernel::pull::PullKind::Build)
+                        {
+                            metrics::counter!(METRIC_ATTESTED_SEEDS_UNKNOWN, "arm" => "drv_fetched")
+                                .increment(1);
+                        }
+                    }
+                    DrvFetch::Missing => {
+                        state.drv_fetch_attempted = true;
+                    }
+                    DrvFetch::Transient => {}
+                }
+            }
+        }
+
         // CA input resolution: rewrite placeholder paths in
         // env/args/builder to realized output paths before
         // dispatch. Fires when gateway set needs_resolve (ADR-018
@@ -1214,11 +1295,13 @@ impl DagActor {
         // the empty-scoped mount and may EIO, so the assignment
         // infra-retries instead of silently widening. The recovered-
         // node arm (`from_recovery_row` clears `drv_content`) is
-        // resolved via a store-side `GetPath` inside
-        // `attested_input_seeds`; the residual `Ok(None)` arms
-        // (floating-CA placeholder, GetPath itself failing, an
-        // inputDrv genuinely never merged) are rare and labelled per
-        // arm in `rio_scheduler_attested_seeds_unknown_total`.
+        // resolved via the hoisted store-side `GetPath` above (written
+        // back to `dag.node_mut().drv_content` so retries — and
+        // `maybe_resolve_ca` — read from memory); the residual
+        // `Ok(None)` arms (floating-CA placeholder, the hoist's GetPath
+        // failing, an inputDrv genuinely never merged) are rare and
+        // labelled per arm in
+        // `rio_scheduler_attested_seeds_unknown_total`.
         //
         // Build-only: a Materialization pull has no .drv to refscan
         // (the worker materialises an already-built closure), so the
@@ -1232,15 +1315,10 @@ impl DagActor {
                 // `derivations.expected_output_paths` lookup for
                 // DAG-missed inputDrvs — bound it under the same
                 // timeout as the closure walk.
-                let input_root_rows = match tokio::time::timeout(self.grpc_timeout, async {
-                    crate::assignment::attested_input_seeds(
-                        &self.dag,
-                        drv_hash,
-                        &self.db,
-                        self.store_client.as_ref(),
-                    )
-                    .await
-                })
+                let input_root_rows = match tokio::time::timeout(
+                    self.grpc_timeout,
+                    crate::assignment::attested_input_seeds(&self.dag, drv_hash, &self.db),
+                )
                 .await
                 {
                     Ok(Ok(None)) => {
@@ -1567,21 +1645,12 @@ impl DagActor {
             return (state.drv_content.clone(), Vec::new(), Vec::new());
         }
 
-        // No drv_content → recovered derivation (scheduler restart,
-        // DAG reloaded from PG, drv_content not persisted). The store
-        // has the ATerm — fetch it. Workers do the same when the
-        // inline is empty (build_types.proto:231: "Empty = fallback;
-        // worker fetches via GetPath"). ~10-50ms round-trip, once
-        // per recovered floating-CA dispatch.
-        //
-        // Checked AFTER the both-empty short-circuit: a recovered
-        // floating-CA with no DAG inputs doesn't need resolve and
-        // doesn't need the fetch — worker fetches the unresolved
-        // `.drv` from the store itself (same path it always does
-        // when `drv_content` is empty). Any floating-CA WITH inputs
-        // (CA or IA) needs the scheduler-side fetch so
-        // `resolve_ca_inputs` can parse `inputDrvs` and serialize
-        // the resolved `BasicDerivation` form.
+        // No drv_content → recovered derivation whose hoisted
+        // store-side `GetPath` (above, in `build_assignment_proto`)
+        // already failed or never ran (store unconfigured). Dispatch
+        // unresolved — worker fails on placeholder, self-heals via
+        // retry after a fresh SubmitBuild re-merges with inline
+        // `drv_content`. Same degrade as before P0408.
         //
         // The same lossy-on-recovery pattern still applies to
         // `ca_modular_hash` (see `collect_ca_inputs`'s skip-on-None)
@@ -1589,26 +1658,15 @@ impl DagActor {
         // reconstituted here on each resolve).
         //
         // r[impl sched.ca.resolve+3]
-        let drv_content = if state.drv_content.is_empty() {
-            match self.fetch_drv_content_from_store(drv_hash, state).await {
-                Some(bytes) => bytes,
-                None => {
-                    // Store unreachable or .drv not found — dispatch
-                    // unresolved (worker fails on placeholder,
-                    // self-heals via retry after a fresh SubmitBuild
-                    // re-merges with inline drv_content). Same
-                    // degrade as before P0408.
-                    warn!(
-                        drv_hash = %drv_hash,
-                        "recovered CA-on-CA dispatch: drv_content empty + store fetch failed; \
-                         dispatching unresolved (worker will fail on placeholder)"
-                    );
-                    return (state.drv_content.clone(), Vec::new(), Vec::new());
-                }
-            }
-        } else {
-            state.drv_content.clone()
-        };
+        let drv_content = state.drv_content.clone();
+        if drv_content.is_empty() {
+            warn!(
+                drv_hash = %drv_hash,
+                "recovered CA-on-CA dispatch: drv_content empty + store fetch failed; \
+                 dispatching unresolved (worker will fail on placeholder)"
+            );
+            return (drv_content, Vec::new(), Vec::new());
+        }
 
         match crate::ca::resolve_ca_inputs(&drv_content, &ca_inputs, &ia_inputs, self.db.pool())
             .await
@@ -1656,32 +1714,6 @@ impl DagActor {
                 (drv_content, Vec::new(), Vec::new())
             }
         }
-    }
-
-    /// Fetch a derivation's ATerm bytes from the store via `GetPath`.
-    ///
-    /// Thin actor-method wrapper over
-    /// [`crate::assignment::fetch_drv_aterm`] that supplies
-    /// `self.store_client` and `state.drv_path()`; see that helper for
-    /// the timeout/size-cap/NAR-unwrap contract.
-    ///
-    /// Returns `None` on any failure: store unconfigured
-    /// (`store_client = None`, test mode), `GetPath` error, timeout,
-    /// not-found, or NAR unwrap failure. Callers treat `None` as
-    /// "degrade to the pre-P0408 behavior" — dispatch unresolved,
-    /// worker fails on placeholder, retry-with-backoff self-heals.
-    async fn fetch_drv_content_from_store(
-        &self,
-        drv_hash: &DrvHash,
-        state: &crate::state::DerivationState,
-    ) -> Option<Vec<u8>> {
-        let mut client = self.store_client.as_ref()?.clone();
-        let drv_path = state.drv_path().to_string();
-        let bytes = crate::assignment::fetch_drv_aterm(&mut client, &drv_path).await;
-        if bytes.is_none() {
-            debug!(drv_hash = %drv_hash, %drv_path, "recovered CA resolve: drv_content fetch failed");
-        }
-        bytes
     }
 
     /// Collect CA inputs for resolve. Walks the DAG children (deps)

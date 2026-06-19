@@ -85,6 +85,16 @@ pub struct MergeResult {
     /// inserts consumed (hash, floor). Rollback re-parks them so a
     /// failed merge does not eat the post-clear bump.
     pub floors_consumed: Vec<(String, u32)>,
+    /// Pre-existing nodes whose empty `drv_content` (recovered /
+    /// gateway-skipped) was backfilled from this submission's inline
+    /// bytes via `rehydrate_from_aterm`, with the prior
+    /// `drv_fetch_attempted` value. The dispatch hoist's
+    /// negative-cache promises "a fresh `SubmitBuild` re-merges with
+    /// inline `drv_content`, bypassing the gate" — that escape hatch
+    /// fires HERE for in-flight nodes (`mints_epoch_on_resubmit ==
+    /// false`). Rollback clears the backfill and restores the prior
+    /// flag.
+    pub drv_content_backfilled: Vec<(DrvHash, bool)>,
 }
 
 /// Result of [`DerivationDag::remove_build_interest_and_reap`].
@@ -353,6 +363,7 @@ impl DerivationDag {
         let mut removed_retriable: Vec<(DrvHash, DerivationState)> = Vec::new();
         // Pre-existing nodes whose empty traceparent was upgraded below.
         let mut traceparent_upgraded: Vec<DrvHash> = Vec::new();
+        let mut drv_content_backfilled: Vec<(DrvHash, bool)> = Vec::new();
         // bug_058: `ClearPoison` floors consumed by fresh inserts below,
         // with the consumed value — restored by `rollback_merge` so a
         // failed merge leaves the floor parked for the next attempt.
@@ -447,13 +458,41 @@ impl DerivationDag {
             // `rollback_merge` — a failed merge restores the exact
             // pre-merge DAG. Currently: `interested_builds` (via
             // `interest_added`), `traceparent` (via
-            // `traceparent_upgraded`), and `wanted_by_build` (via
-            // `contributions_recorded`).
+            // `traceparent_upgraded`), `wanted_by_build` (via
+            // `contributions_recorded`), and the
+            // `drv_content`/`input_srcs`/`drv_fetch_attempted`
+            // backfill (via `drv_content_backfilled`).
             if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
                 // `insert` returns true iff build_id was not already present.
                 if existing.interested_builds.insert(build_id) {
                     interest_added.push(drv_hash.clone());
+                }
+                // Recovered / gateway-skipped node has
+                // `drv_content = ""`; this submission carries the
+                // inline ATerm. Backfill so the dispatch hoist's
+                // negative-cache escape hatch ("a fresh SubmitBuild
+                // re-merges with inline drv_content") works for
+                // in-flight nodes too — `mints_epoch_on_resubmit`
+                // returns false for Assigned/Running and for non-root
+                // Created/Queued/Ready, so the new-node branch never
+                // sees them.
+                if existing.drv_content.is_empty() && !node.drv_content.is_empty() {
+                    // The rollback's `clear_aterm()` hard-codes
+                    // input_srcs prior == empty (the co-derived
+                    // invariant); pin it where it's relied on, not just
+                    // in a comment — the debug.rs co-clear was MISSING
+                    // until iter-2.
+                    debug_assert!(
+                        existing.input_srcs.is_empty(),
+                        "drv_content empty ⟹ input_srcs empty (co-derived); \
+                         rollback_merge's clear_aterm() relies on this"
+                    );
+                    let prior_attempted = existing.drv_fetch_attempted;
+                    if existing.rehydrate_from_aterm(node.drv_content.clone()) {
+                        drv_content_backfilled.push((drv_hash.clone(), prior_attempted));
+                        existing.drv_fetch_attempted = false;
+                    }
                 }
                 // Per-build contribution: remember WHAT this submission
                 // wanted so the effective-wanted computation can stop
@@ -500,6 +539,7 @@ impl DerivationDag {
                             &interest_added,
                             &traceparent_upgraded,
                             &contributions_recorded,
+                            &drv_content_backfilled,
                             build_id,
                             removed_retriable,
                             floors_consumed,
@@ -639,6 +679,7 @@ impl DerivationDag {
                     &interest_added,
                     &traceparent_upgraded,
                     &contributions_recorded,
+                    &drv_content_backfilled,
                     build_id,
                     removed_retriable,
                     floors_consumed,
@@ -656,6 +697,7 @@ impl DerivationDag {
             traceparent_upgraded,
             contributions_recorded,
             floors_consumed,
+            drv_content_backfilled,
         })
     }
 
@@ -745,6 +787,7 @@ impl DerivationDag {
         interest_added: &[DrvHash],
         traceparent_upgraded: &[DrvHash],
         contributions_recorded: &[(DrvHash, Option<Vec<String>>)],
+        drv_content_backfilled: &[(DrvHash, bool)],
         build_id: Uuid,
         removed_retriable: Vec<(DrvHash, DerivationState)>,
         floors_consumed: Vec<(String, u32)>,
@@ -820,6 +863,31 @@ impl DerivationDag {
         for hash in traceparent_upgraded {
             if let Some(state) = self.nodes.get_mut(hash) {
                 state.traceparent.clear();
+            }
+        }
+
+        // Revert drv_content backfills on pre-existing nodes. The
+        // prior `drv_content`/`input_srcs` were always empty (the
+        // backfill only fires on `drv_content.is_empty()`, and
+        // `input_srcs` is co-derived — `debug_assert!`-pinned at the
+        // backfill gate); only `drv_fetch_attempted` needs its captured
+        // prior restored.
+        for (hash, prior_attempted) in drv_content_backfilled {
+            // Entries for resubmit-reset hashes describe the discarded
+            // fresh replacement; the wholesale restore above already
+            // carries the exact pre-merge state. Unlike the
+            // interest/traceparent loops (whose fields are merge-scoped
+            // so a duplicate-hash submission can't differ across
+            // occurrences), `drv_content` is per-occurrence — a
+            // first-empty/second-non-empty duplicate fires the backfill
+            // on the FRESH replacement, and clear_aterm() here would
+            // wipe the just-restored OLD node's real bytes.
+            if restoring.contains(hash) {
+                continue;
+            }
+            if let Some(state) = self.nodes.get_mut(hash) {
+                state.clear_aterm();
+                state.drv_fetch_attempted = *prior_attempted;
             }
         }
 
