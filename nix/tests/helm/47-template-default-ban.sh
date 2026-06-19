@@ -39,14 +39,21 @@ ALIAS_RE = re.compile(r"\{\{-?\s*\$(\w+)\s*:=\s*\.Values[\w.]*")
 # regex alone missed the prefix-form Sprig 0-swallow that motivated 52
 # (and the adjacent defaultLeadTimeSeed). The operand population gains
 # `with`-scoped bare `.X` (a `with .Values.…` body) — same exemption
-# rules apply (range vars, fallthrough, null guard).
+# rules apply (range vars, fallthrough, null guard). r3: factored ONE
+# operand class consumed by BOTH syntactic arms — the pipe arm alone
+# left `{{ .key | default LIT }}` inside `with .Values` invisible.
+OPERAND = r"\.Values\.[\w.]+|\$(\w+)\.[\w.]+|\.(\w[\w.]*)"
 DEFAULT_RE = re.compile(
-    r"(\.Values\.[\w.]+|\$(\w+)\.[\w.]+)\s*\|\s*default\s+([^|}]+)"
-    r"|\(\s*default\s+(\S+)\s+(\.Values\.[\w.]+|\$(\w+)\.[\w.]+|\.(\w[\w.]*))\s*\)"
+    r"(" + OPERAND + r")\s*\|\s*default\s+([^|}]+)"
+    r"|\(\s*default\s+(\S+)\s+(" + OPERAND + r")\s*\)"
 )
 WITH_VALUES_RE = re.compile(r"\{\{-?\s*with\s+(?:\$\.|\.)\s*Values[\w.]*")
 WITH_END_RE = re.compile(r"\{\{-?\s*end\b")
-WITH_OTHER_RE = re.compile(r"\{\{-?\s*(?:with|range)\b")
+# r3: every end-paired keyword balances. `if`/`define`/`block` were
+# uncounted, so a nested `{{ if }}` inside `{{ with .Values }}` popped
+# the scope to 0 at the if's `end` — exempting the very class the r2
+# widening was added to catch.
+WITH_OTHER_RE = re.compile(r"\{\{-?\s*(?:if|with|range|define|block)\b")
 
 BURNDOWN = {
     ("templates/store.yaml", "$s.replicas"),
@@ -65,12 +72,13 @@ def scan(path, text):
     for i, line in enumerate(text.splitlines(), 1):
         for m in DEFAULT_RE.finditer(line):
             if m.group(1):  # pipe-form: X | default LIT
-                operand, alias, fallback = m.group(1), m.group(2), m.group(3).strip()
+                operand, alias, bare = m.group(1), m.group(2), m.group(3)
+                fallback = m.group(4).strip()
             else:  # function-form: (default LIT X)
-                operand, fallback = m.group(5), m.group(4).strip()
-                alias = m.group(6)
-                if m.group(7) and with_depth <= 0:
-                    continue  # bare .X outside `with .Values` — not .Values-rooted
+                operand, alias, bare = m.group(6), m.group(7), m.group(8)
+                fallback = m.group(5).strip()
+            if bare and with_depth <= 0:
+                continue  # bare .X outside `with .Values` — not .Values-rooted
             if alias and alias not in aliases:
                 continue  # $x not bound to .Values (range vars etc.)
             if fallback.startswith(".Values.") or re.match(r"\$\w*\.Values\.", fallback):
@@ -100,7 +108,14 @@ plant = (
     "fnfall: {{ int64 (default .Values.f.h .Values.f.g) }}\n"
     "fnbare: {{ float64 (default 30.0 .bare) }}\n"
     "{{- with .Values.sla }}\n"
+    # r3: nested `if` — its `end` MUST NOT pop the with-scope to 0.
+    "{{- if .enabled }}\n"
+    "x: 1\n"
+    "{{- end }}\n"
     "scoped: {{ float64 (default 30.0 .scopedKey) }}\n"
+    # r3: pipe-form bare `.X` inside `with .Values` — the chart's
+    # dominant idiom; both syntactic arms consume the one operand class.
+    "pscoped: {{ .pipeScoped | default 30.0 }}\n"
     "{{- end }}\n"
     "{{- range .Values.pools }}\n"
     'p: {{ .policy | default "w" }}\n'
@@ -108,12 +123,12 @@ plant = (
     "{{- end }}\n"
 )
 got = sorted(k for _, _, k in scan("planted.yaml", plant))
-if got != ["$v.c", ".Values.a.b", ".Values.f.g", ".scopedKey"]:
+if got != ["$v.c", ".Values.a.b", ".Values.f.g", ".pipeScoped", ".scopedKey"]:
     print(
         f"FAIL: default-ban self-test — classifier got {got}, want exactly the "
-        f"four planted literal-default .Values-rooted refs (pipe + function "
-        f"form + with-scoped bare; fallthrough, null guard, range, and "
-        f"unscoped-bare plants exempt)",
+        f"five planted literal-default .Values-rooted refs (pipe + function "
+        f"form, both with-scoped bare past a nested if; fallthrough, null "
+        f"guard, range, and unscoped-bare plants exempt)",
         file=sys.stderr,
     )
     sys.exit(1)
