@@ -1995,7 +1995,7 @@ impl DagActor {
             // CacheOpportunity)` is `true`, so an unknown origin can
             // never strand a leaf in the stalled gauge on the age-out
             // arm's gate.
-            origin: crate::state::db_str::parse_or_warn_default(
+            origin: crate::state::db_str::parse_or_error_default(
                 "materialization_jobs.origin",
                 &row.origin,
                 crate::state::JobOrigin::CacheOpportunity,

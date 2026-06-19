@@ -89,19 +89,24 @@ pub(crate) use db_str_enum;
 /// drifted log levels and message tokens (`warn!` vs `error!`,
 /// "unknown … defaulting" vs "078 CHECK drift") so a Splunk search
 /// for CHECK-drift events couldn't anchor on a common token. One
-/// helper, one `db_str_enum_drift` token. The conservative default is
+/// helper, one `db_str_enum_drift` token, one level (`error!` — a
+/// CHECK drift is a deploy bug). The conservative default is
 /// caller-supplied (not `Default::default()`): each site documents
 /// which arm is conservative for its read (e.g. `JobOrigin::
 /// CacheOpportunity` for the age-out label, `PriorityClass::default()`
-/// for the recovery rebuild).
-pub(crate) fn parse_or_warn_default<T>(col: &'static str, raw: &str, default: T) -> T
+/// for the recovery rebuild). `T: Debug` so the operator sees which
+/// arm the mirror is operating on; per-call row identity (e.g.
+/// `build_id`, `drv_hash`) goes into a caller-side `#[instrument]`
+/// span — the span fields are the row-locality context.
+pub(crate) fn parse_or_error_default<T>(col: &'static str, raw: &str, default: T) -> T
 where
-    T: std::str::FromStr,
+    T: std::str::FromStr + std::fmt::Debug,
 {
     raw.parse().unwrap_or_else(|_| {
         tracing::error!(
             column = col,
             raw,
+            default = ?default,
             "db_str_enum_drift: TEXT column not in the known alphabet \
              (CHECK constraint drift); defaulting the in-memory mirror"
         );

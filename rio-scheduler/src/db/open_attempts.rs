@@ -702,10 +702,17 @@ impl SchedulerDb {
         &self,
         derivation_id: Uuid,
     ) -> Result<Option<RecoveredJobRow>, sqlx::Error> {
-        sqlx::query_as(RECOVERED_JOB_ROW_SELECT.as_str())
-            .bind(derivation_id)
-            .fetch_optional(&self.pool)
-            .await
+        // The drift guard is the base [`RECOVERED_JOB_SELECT`] const
+        // alone — the single-call-site one-line `WHERE` tail does not
+        // need a `LazyLock<String>`; one ~400B alloc dwarfed by the
+        // PG round-trip it precedes.
+        // AssertSqlSafe: const-fragment composition, no runtime data.
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "{RECOVERED_JOB_SELECT} AND j.derivation_id = $1"
+        )))
+        .bind(derivation_id)
+        .fetch_optional(&self.pool)
+        .await
     }
 }
 
@@ -730,9 +737,6 @@ const RECOVERED_JOB_SELECT: &str = "\
                                   WHERE e.exec_id = a.exec_id \
                                     AND e.attempt_kind = 'materialization') \
      WHERE j.state = 'pending'";
-
-static RECOVERED_JOB_ROW_SELECT: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("{RECOVERED_JOB_SELECT} AND j.derivation_id = $1"));
 
 /// One unresolved job as the recovery view rebuild loads it (T-4.3).
 #[derive(Debug, sqlx::FromRow)]
