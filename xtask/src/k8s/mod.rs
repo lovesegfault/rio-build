@@ -94,12 +94,12 @@ pub struct UpOpts {
     #[arg(long)]
     pub(super) deploy: bool,
     /// Wipe the data plane (S3 chunks, PG schema, tenants/builds, builder
-    /// Jobs, gateway authorized_keys) BEFORE running the full `up`
-    /// pipeline. Infra shape (RDS instance, bucket, AMI, NodePools,
-    /// tofu-managed helm releases) is preserved. ~2min wipe vs
-    /// `destroy`+`up`'s ~20min. Incompatible with phase flags — `--wipe`
-    /// always runs the full pipeline so the redeployed cluster is
-    /// consistent with current HEAD (push + deploy in particular).
+    /// Jobs, gateway authorized_keys) BEFORE redeploying. Infra shape
+    /// (RDS instance, bucket, AMI, NodePools, tofu-managed helm releases)
+    /// is preserved, so the post-wipe `up` runs only `kubeconfig + push +
+    /// deploy` — ~5min total vs `destroy`+`up`'s ~20min. Phase flags ADD
+    /// to that base: `--wipe --provision` re-runs tofu apply when infra
+    /// drift is also expected; `--wipe --ami` rebuilds the node image.
     #[arg(long)]
     wipe: bool,
 
@@ -163,9 +163,21 @@ impl UpOpts {
         }
     }
 
-    /// No phase flags → full canonical sequence. Any phase flag →
-    /// only the flagged ones, still in canonical order.
+    /// No phase flags → full canonical sequence. Any phase flag → only
+    /// the flagged ones, still in canonical order. `--wipe` overrides the
+    /// default to the redeploy subset (kubeconfig+push+deploy); phase
+    /// flags then ADD to that base rather than replace it.
     fn phases(&self) -> Vec<Phase> {
+        if self.wipe {
+            // Infra shape survives wipe → bootstrap/provision/ami are
+            // no-ops on a clean tree. Skip them by default (issue #58);
+            // explicit flags union back in as an escape hatch.
+            const WIPE_BASE: [Phase; 3] = [Phase::Kubeconfig, Phase::Push, Phase::Deploy];
+            return Phase::ALL
+                .into_iter()
+                .filter(|p| WIPE_BASE.contains(p) || self.has(*p))
+                .collect();
+        }
         let any = Phase::ALL.iter().any(|&p| self.has(p));
         if !any {
             return Phase::ALL.to_vec();
@@ -180,18 +192,6 @@ impl UpOpts {
     /// explicit and `--deploy` isn't among them.
     fn validate_phase_opts(&self, selected: &[Phase]) -> Result<()> {
         let explicit = selected.len() != Phase::ALL.len();
-        // --wipe must run the full pipeline: a partial up after wipe
-        // leaves the cluster half-reset (e.g. no ECR tag for HEAD if
-        // push is skipped, no chart if deploy is skipped). Reject any
-        // phase-flag combination rather than guess which subset is
-        // safe.
-        if self.wipe && explicit {
-            let flags: Vec<_> = selected.iter().map(|p| format!("--{}", p.name())).collect();
-            bail!(
-                "--wipe requires the full pipeline; drop {} or drop --wipe",
-                flags.join(" ")
-            );
-        }
         if !explicit {
             return Ok(());
         }
@@ -628,9 +628,10 @@ async fn pg_exec(sql: &str) -> Result<()> {
 /// The one exception is fresh-account bootstrap: the state bucket
 /// doesn't exist until `bootstrap` creates it, so `tofu init` against
 /// it would fail; `provision` runs `init_backend` immediately after.
-/// `--wipe` is excluded from that exception — it always init's — even
-/// though it forces the full pipeline (so `Bootstrap` is in the
-/// selected set), because wiping a fresh account is a no-op.
+/// `--wipe` is excluded from that exception — it always init's: its
+/// default selection omits `Bootstrap`, and even under `--wipe
+/// --bootstrap` the target is an existing cluster (wiping a fresh
+/// account is a no-op).
 fn needs_upfront_backend_init(kind: ProviderKind, wipe: bool, selected: &[Phase]) -> bool {
     matches!(kind, ProviderKind::Eks) && (wipe || !selected.contains(&Phase::Bootstrap))
 }
@@ -876,18 +877,27 @@ mod tests {
     }
 
     #[test]
-    fn wipe_rejects_phase_flags() {
+    fn wipe_selects_redeploy_subset() {
         let mut o = opts();
         o.wipe = true;
-        // bare --wipe → full pipeline, OK
-        assert!(o.validate_phase_opts(&o.phases()).is_ok());
-        // --wipe --push → error naming the offending flag
-        o.push = true;
-        let e = o.validate_phase_opts(&o.phases()).unwrap_err().to_string();
-        assert!(
-            e.contains("--wipe requires the full pipeline") && e.contains("--push"),
-            "{e}"
+        // bare --wipe → kubeconfig+push+deploy only (issue #58)
+        assert_eq!(
+            o.phases(),
+            vec![Phase::Kubeconfig, Phase::Push, Phase::Deploy]
         );
+        assert!(o.validate_phase_opts(&o.phases()).is_ok());
+        // escape hatch: --wipe --provision unions provision into the base
+        o.provision = true;
+        assert_eq!(
+            o.phases(),
+            vec![
+                Phase::Provision,
+                Phase::Kubeconfig,
+                Phase::Push,
+                Phase::Deploy
+            ]
+        );
+        assert!(o.validate_phase_opts(&o.phases()).is_ok());
     }
 
     #[test]
@@ -908,8 +918,8 @@ mod tests {
     /// exception is fresh-account bootstrap (no bucket exists yet —
     /// running `tofu init` against it would fail, and provision will
     /// init right after bootstrap creates it). `--wipe` always init's:
-    /// it forces the full pipeline (so `Bootstrap` is in the selected
-    /// set) but a wipe can never target a fresh account.
+    /// its default selection omits `Bootstrap`, and a wipe can never
+    /// target a fresh account anyway.
     #[test]
     fn upfront_backend_init_matrix() {
         use Phase::*;
@@ -934,8 +944,14 @@ mod tests {
             );
         }
 
-        // --wipe forces the full pipeline (Bootstrap included), but
-        // wipe targets an existing cluster so the bucket exists.
+        // --wipe selects the redeploy subset (no Bootstrap) → init via
+        // the no-bootstrap arm. The wipe=true arg additionally covers
+        // the --wipe --bootstrap escape hatch.
+        assert!(needs_upfront_backend_init(
+            eks,
+            true,
+            &[Kubeconfig, Push, Deploy]
+        ));
         assert!(needs_upfront_backend_init(eks, true, &Phase::ALL));
 
         // Fresh-account bootstrap: bucket may not exist; provision
