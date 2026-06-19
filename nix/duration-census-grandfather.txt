@@ -123,7 +123,7 @@ rio-proto/src/client/retry.rs	CONNECT_BACKOFF
 rio-scheduler/src/actor/breaker.rs	OPEN_DURATION
 rio-scheduler/src/actor/completion.rs	CA_CUTOFF_LOOKUP_TIMEOUT
 rio-scheduler/src/actor/completion.rs	STORE_DEGRADED_CORROBORATION_WINDOW
-rio-scheduler/src/actor/dispatch.rs	FETCH_TIMEOUT
+rio-scheduler/src/assignment.rs	FETCH_TIMEOUT
 rio-scheduler/src/actor/event.rs	PROGRESS_DEBOUNCE
 rio-scheduler/src/actor/floor.rs	DEADLINE_CAP_SECS
 rio-scheduler/src/actor/housekeeping.rs	ORPHAN_BUILD_GRACE

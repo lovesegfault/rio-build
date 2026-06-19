@@ -117,6 +117,7 @@
     "rio_scheduler_attempt_requeue_seconds",
     "rio_scheduler_attempts_gc_deleted_total",
     "rio_scheduler_attested_seeds_pg_fallback_total",
+    "rio_scheduler_attested_seeds_unknown_total",
     "rio_scheduler_backpressure_projected_drain_seconds",
     "rio_scheduler_broadcast_lagged_total",
     "rio_scheduler_build_duration_seconds",
@@ -916,6 +917,11 @@
         "name": "rio_scheduler_attested_seeds_pg_fallback_total",
         "kind": "counter",
         "help": "attested_input_seeds resolutions of a DAG-missed inputDrv via the persisted derivations.expected_output_paths row, labeled by outcome (resolved/degraded_none). resolved > 0 is normal post-restart or after reap; degraded_none means a genuinely-never-merged inputDrv or a floating-CA placeholder."
+      },
+      {
+        "name": "rio_scheduler_attested_seeds_unknown_total",
+        "kind": "counter",
+        "help": "Per-arm breakdown of attested_input_seeds Ok(None) returns (label arm: no_node / drv_empty_no_store / drv_fetch_failed / drv_unparseable / child_output_unknown / input_drv_unresolved), plus drv_fetched for recovered targets whose ATerm was successfully fetched via GetPath. Compare against input_closure_unattested_total{reason=seeds_unknown} to attribute a non-zero unattested rate to its root cause."
       },
       {
         "name": "rio_scheduler_backpressure_projected_drain_seconds",

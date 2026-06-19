@@ -488,6 +488,16 @@ pub fn describe_metrics() {
          or a floating-CA placeholder."
     );
     describe_counter!(
+        "rio_scheduler_attested_seeds_unknown_total",
+        "Per-arm breakdown of attested_input_seeds Ok(None) returns (label \
+         arm: no_node / drv_empty_no_store / drv_fetch_failed / \
+         drv_unparseable / child_output_unknown / input_drv_unresolved), \
+         plus drv_fetched for recovered targets whose ATerm was \
+         successfully fetched via GetPath. Compare against \
+         input_closure_unattested_total{reason=seeds_unknown} to attribute \
+         a non-zero unattested rate to its root cause."
+    );
+    describe_counter!(
         "rio_scheduler_cleanup_dropped_total",
         "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
     );

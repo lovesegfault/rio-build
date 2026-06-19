@@ -1212,12 +1212,13 @@ impl DagActor {
         // Under ADR-022 closure-scoped FUSE these are NOT safe
         // degrades — the builder's own drv-parsed BFS reads through
         // the empty-scoped mount and may EIO, so the assignment
-        // infra-retries instead of silently widening.
-        // TODO: defer-with-backoff (or `drv_content` reload via store
-        // gRPC GetPath at dispatch) for the residual `Ok(None)` arms
-        // instead of dispatching with empty input_roots — they are
-        // rare post-C1-hardened (recovered node with no drv_content,
-        // floating-CA placeholder) but still infra-retry loops.
+        // infra-retries instead of silently widening. The recovered-
+        // node arm (`from_recovery_row` clears `drv_content`) is
+        // resolved via a store-side `GetPath` inside
+        // `attested_input_seeds`; the residual `Ok(None)` arms
+        // (floating-CA placeholder, GetPath itself failing, an
+        // inputDrv genuinely never merged) are rare and labelled per
+        // arm in `rio_scheduler_attested_seeds_unknown_total`.
         //
         // Build-only: a Materialization pull has no .drv to refscan
         // (the worker materialises an already-built closure), so the
@@ -1232,7 +1233,13 @@ impl DagActor {
                 // DAG-missed inputDrvs — bound it under the same
                 // timeout as the closure walk.
                 let input_root_rows = match tokio::time::timeout(self.grpc_timeout, async {
-                    crate::assignment::attested_input_seeds(&self.dag, drv_hash, &self.db).await
+                    crate::assignment::attested_input_seeds(
+                        &self.dag,
+                        drv_hash,
+                        &self.db,
+                        self.store_client.as_ref(),
+                    )
+                    .await
                 })
                 .await
                 {
@@ -1653,84 +1660,28 @@ impl DagActor {
 
     /// Fetch a derivation's ATerm bytes from the store via `GetPath`.
     ///
-    /// The store returns NAR-framed bytes; a `.drv` is a single
-    /// regular file, so [`rio_nix::nar::extract_single_file`] unwraps
-    /// it to the raw ATerm. This is the same path the worker takes
-    /// when `WorkAssignment.drv_content` is empty
-    /// (`rio-builder/src/executor/inputs.rs::fetch_drv_from_store`).
+    /// Thin actor-method wrapper over
+    /// [`crate::assignment::fetch_drv_aterm`] that supplies
+    /// `self.store_client` and `state.drv_path()`; see that helper for
+    /// the timeout/size-cap/NAR-unwrap contract.
     ///
     /// Returns `None` on any failure: store unconfigured
     /// (`store_client = None`, test mode), `GetPath` error, timeout,
     /// not-found, or NAR unwrap failure. Callers treat `None` as
     /// "degrade to the pre-P0408 behavior" — dispatch unresolved,
     /// worker fails on placeholder, retry-with-backoff self-heals.
-    ///
-    /// Hard 2s timeout + 1 MiB NAR cap: a `.drv` is ~1-50 KB ASCII.
-    /// A larger-than-1-MiB blob means something is badly wrong (the
-    /// path isn't a `.drv`, or the store returned a closure NAR).
-    /// Either way, bail — resolve can't parse a non-ATerm.
     async fn fetch_drv_content_from_store(
         &self,
         drv_hash: &DrvHash,
         state: &crate::state::DerivationState,
     ) -> Option<Vec<u8>> {
-        /// `.drv` NAR cap. ~1-50 KB typical; 1 MiB is ~20× any
-        /// real-world `.drv`. Avoids pulling a multi-GB closure if
-        /// the store path was mis-resolved.
-        const MAX_DRV_NAR_SIZE: u64 = 1024 * 1024;
-        /// Per-chunk idle bound for `GetPath` (initial RPC + each
-        /// stream.message() — I-211, not whole-call). ~10-50 ms
-        /// typical; 2 s covers a slow store without blocking
-        /// dispatch for long. On timeout we degrade to unresolved
-        /// dispatch (same as store-unconfigured).
-        const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
         let mut client = self.store_client.as_ref()?.clone();
         let drv_path = state.drv_path().to_string();
-
-        let result = rio_proto::client::get_path_nar(
-            &mut client,
-            &drv_path,
-            FETCH_TIMEOUT,
-            MAX_DRV_NAR_SIZE,
-            &[],
-        )
-        .await;
-
-        let nar = match result {
-            Ok(Some((_info, nar))) => nar,
-            Ok(None) => {
-                debug!(
-                    drv_hash = %drv_hash,
-                    drv_path = %drv_path,
-                    "recovered CA resolve: .drv not found in store"
-                );
-                return None;
-            }
-            Err(e) => {
-                debug!(
-                    drv_hash = %drv_hash,
-                    drv_path = %drv_path,
-                    error = %e,
-                    "recovered CA resolve: GetPath failed"
-                );
-                return None;
-            }
-        };
-
-        // NAR unwrap: .drv is a single regular file. Anything else
-        // (directory, symlink, corrupt NAR) → None.
-        match rio_nix::nar::extract_single_file(&nar) {
-            Ok(bytes) => Some(bytes),
-            Err(e) => {
-                debug!(
-                    drv_hash = %drv_hash,
-                    error = %e,
-                    "recovered CA resolve: NAR unwrap failed (not a single regular file)"
-                );
-                None
-            }
+        let bytes = crate::assignment::fetch_drv_aterm(&mut client, &drv_path).await;
+        if bytes.is_none() {
+            debug!(drv_hash = %drv_hash, %drv_path, "recovered CA resolve: drv_content fetch failed");
         }
+        bytes
     }
 
     /// Collect CA inputs for resolve. Walks the DAG children (deps)
