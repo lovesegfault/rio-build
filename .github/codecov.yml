@@ -23,7 +23,7 @@ codecov:
     # crates whose unit lcov is deterministically empty — derived in
     # nix/crate2nix.nix instrumentationExemptCrates) + vm-* coverage
     # scenarios (minus the known-empty exclusions in flake.nix).
-    after_n_builds: 40
+    after_n_builds: 44
     # Keep wait_for_ci as a floor: if a coverage job is skipped/cancelled
     # we still want to hold until CI is done rather than wait forever.
     wait_for_ci: true
