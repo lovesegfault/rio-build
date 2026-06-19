@@ -307,8 +307,7 @@ impl DagActor {
         self.tick_cancel_zero_interest_materialization(&authority)
             .await;
         phase!("14-zero-interest-cancel");
-        self.tick_reevaluate_parked_materialization_jobs(&authority)
-            .await;
+        self.tick_reevaluate_materialization_jobs(&authority).await;
         phase!("15-parked-reevaluation");
         self.tick_retry_pending_carriers(&authority).await;
         phase!("16-pending-carriers");

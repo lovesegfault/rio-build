@@ -188,7 +188,7 @@ impl DagActor {
     /// re-probes the same substitutable set every generation (1047
     /// paths × 8.77 s/tick under sh-044's store → cost-axis
     /// backpressure latched). The phase-15 age-out arm at
-    /// `tick_reevaluate_parked_materialization_jobs` bounds the skip
+    /// `tick_reevaluate_materialization_jobs` bounds the skip
     /// unconditionally.
     // r[impl sched.dispatch.fod-substitute+3]
     // r[impl sched.admission.work-per-turn]

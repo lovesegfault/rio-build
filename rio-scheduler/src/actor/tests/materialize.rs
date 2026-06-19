@@ -9684,15 +9684,20 @@ fn recovered_row_with_infinite_park_does_not_panic() {
     ));
 }
 
-/// Shared body of the two sh-044 unclaimed-age-out pins (the
-/// never-parked and park-expired cases — the two arms partition
-/// `holder()=None` on the park axis, so a single helper exercises both
-/// halves of the age-out predicate's `is_none_or(|u| u <= now)`
-/// conjunct).
-async fn assert_unclaimed_ages_out(
+/// Shared body of the sh-044 unclaimed-age-out predicate grid. Seeds
+/// one entry under a 3×1s threshold, varies the three predicate
+/// conjuncts (holder, parked_until, created_at backdate), runs
+/// phase-15, and returns whether the entry SURVIVED (still in the
+/// view + durable row still pending). The age-out arm's
+/// `from_source_viable` gate sees `ChildlessLeaf` (the test
+/// derivation has zero children) × `CacheOpportunity` → viable, so
+/// the predicate alone is the variable under test.
+async fn run_age_out_predicate(
     hash: &str,
+    backdate_secs: u64,
     parked_until: Option<std::time::Instant>,
-) -> TestResult {
+    holder: Option<crate::state::ExecutorId>,
+) -> anyhow::Result<bool> {
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_cfg(
@@ -9707,6 +9712,11 @@ async fn assert_unclaimed_ages_out(
         },
     );
     let drv = insert_test_derivation_local(&db.pool, hash).await?;
+    // The age-out arm's `from_source_viable` gate reads
+    // `dag.node(..).db_id` → `classify_durable_evidence` (zero
+    // children → `ChildlessLeaf`) → viable for `CacheOpportunity`.
+    actor.test_inject_ready(hash, None, "x86_64-linux", false);
+    actor.dag.node_mut(hash).expect("just injected").db_id = Some(drv);
     let created = sdb(&db.pool)
         .create_materialization_job_fenced(
             drv,
@@ -9721,39 +9731,50 @@ async fn assert_unclaimed_ages_out(
     let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("job create must apply");
     };
-    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(
-        job_id,
-        None,
-        JobOrigin::CacheOpportunity,
-    );
-    // > 3 × 1 s. RecoveredInstant::backdated (the DebugBackdate*
-    // mechanism) — NOT tokio::time::pause()/advance():
-    // RecoveredInstant.elapsed() reads std::time::Instant which
-    // tokio's paused clock cannot advance, AND the harness's real
-    // sqlx pool PoolTimedOut's under start_paused.
-    entry.test_set_created_at(crate::state::RecoveredInstant::backdated(4));
+    let mut entry = crate::actor::materialize::JobViewEntry::test_unclaimed(job_id);
+    // RecoveredInstant::backdated (the DebugBackdate* mechanism) —
+    // NOT tokio::time::pause()/advance(): RecoveredInstant.elapsed()
+    // reads std::time::Instant which tokio's paused clock cannot
+    // advance, AND the harness's real sqlx pool PoolTimedOut's under
+    // start_paused.
+    entry.test_set_created_at(crate::state::RecoveredInstant::backdated(backdate_secs));
     entry.test_set_parked_until(parked_until);
+    if let Some(ex) = holder {
+        entry.mint_claim(ex);
+    }
     let h = crate::state::DrvHash::from(hash);
     actor.materialization_jobs.insert(h.clone(), entry);
 
     let authority = actor.dag_authority().expect("always-leader test actor");
-    actor
-        .tick_reevaluate_parked_materialization_jobs(&authority)
-        .await;
+    actor.tick_reevaluate_materialization_jobs(&authority).await;
 
+    let in_view = actor.materialization_jobs.get(&h).is_some();
+    let in_pg = sdb(&db.pool)
+        .unresolved_job_for_derivation(drv)
+        .await?
+        .is_some();
+    assert_eq!(
+        in_view, in_pg,
+        "view eviction and durable resolve are atomic per remove_settled"
+    );
+    Ok(in_view)
+}
+
+/// Positive-path wrapper: the two `is_none_or(|u| u <= now)` arms
+/// (never-parked and park-expired) at 4s > 3×1s threshold, no holder.
+async fn assert_unclaimed_ages_out(
+    hash: &str,
+    parked_until: Option<std::time::Instant>,
+) -> TestResult {
+    let survived = run_age_out_predicate(hash, 4, parked_until, None).await?;
     assert!(
-        actor.materialization_jobs.get(&h).is_none(),
+        !survived,
         "the age-out arm collects holder()=None && parked_until.\
          is_none_or(|u| u <= now) && created_at.elapsed() > 3s → \
          resolve_materialization_job(ResolvedFromSource) → \
          remove_settled evicts the entry; pre-fix the phase-15 filter \
          was parked_until.is_some_and(|u| u > now) only — never-parked \
          AND park-expired entries excluded"
-    );
-    let after = sdb(&db.pool).unresolved_job_for_derivation(drv).await?;
-    assert!(
-        after.is_none(),
-        "the durable row is terminal ResolvedFromSource"
     );
     Ok(())
 }
@@ -9789,6 +9810,50 @@ async fn park_expired_unclaimed_job_ages_out_to_from_source() -> TestResult {
         Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
     )
     .await
+}
+
+/// sh-044 negative conjunct (a): `created_at.elapsed() <= threshold` ⇒
+/// the entry survives. A refactor that off-by-ones the `>` comparison
+/// (or drops it) would mass-resolve every fresh unclaimed job
+/// `ResolvedFromSource` on the next tick — this is the predicate's
+/// only age conjunct, and the positive tests above only ever backdate
+/// PAST the threshold.
+// r[verify sched.materialize.unclaimed-age-out]
+#[tokio::test]
+async fn aged_out_survives_under_threshold() -> TestResult {
+    let survived = run_age_out_predicate("ageout-fresh", 2, None, None).await?;
+    assert!(
+        survived,
+        "2s ≤ 3×1s threshold: the age-out arm's `created_at.elapsed() \
+         > age_out_after` conjunct must NOT match a fresh entry"
+    );
+    Ok(())
+}
+
+/// sh-044 negative conjunct (b): `holder()=Some` past the threshold ⇒
+/// the entry survives. A refactor that drops the `if e.holder()
+/// .is_some() { continue }` guard at the top of the partition would
+/// resolve actively-claimed jobs `ResolvedFromSource` MID-PULL — every
+/// other `JobViewEntry` in the suite is `fresh_now()`-stamped and
+/// never reaches the age-out arm, so without this pin the guard
+/// deletion passes the entire test set.
+// r[verify sched.materialize.unclaimed-age-out]
+#[tokio::test]
+async fn aged_out_survives_when_holder_some() -> TestResult {
+    let survived = run_age_out_predicate(
+        "ageout-held",
+        4,
+        None,
+        Some(crate::state::ExecutorId::from("store-0-w0")),
+    )
+    .await?;
+    assert!(
+        survived,
+        "holder()=Some past the threshold: the partition's \
+         `e.holder().is_some() → continue` guard must keep the \
+         actively-claimed entry out of BOTH arms"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

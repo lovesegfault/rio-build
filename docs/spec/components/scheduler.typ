@@ -2326,8 +2326,10 @@ the skip unconditionally.
 
 #r("sched.materialize.unclaimed-age-out")[
   A materialization job that remains unclaimed (no holder, not currently
-  parked) past `max_attempts × attempt_deadline_secs` MUST be resolved
-  from-source so the node is re-admitted to dispatch.
+  parked) past `max_attempts × attempt_deadline_secs` MUST, when
+  `from_source_viable` holds, be resolved from-source so the node is
+  re-admitted to dispatch; when not viable it stays in the view and is
+  counted by the stalled gauge.
 ]
 The phase-15 age-out arm: `holder().is_none() &&
 parked_until.is_none_or(|u| u <= now) && created_at.elapsed() >
@@ -2339,11 +2341,14 @@ never-parked AND park-expired). Bounded above by `(max_attempts+1) ×
 attempt_deadline_secs + park_backoff_cap_secs` (default ≈ 4h15m): the
 predicate's conjuncts mean age-out cannot fire while Held or currently
 parked, and `holder()=Some` is itself bounded by phase-12 attempt-expiry
-/ the merged_bug_055 ghost two-strike repair, `parked_until>now` by
-`park_backoff_cap_secs`. The age-out arm does NOT consult
-`from_source_viable` or the Item-T strictness knobs (a never-touched job
-has zero worker charges and zero park dwell by construction --- both
-knobs would refuse forever); it is the executor-liveness backstop for
+(and the merged_bug_055 ghost two-strike repair), `parked_until>now` by
+`park_backoff_cap_secs`. The age-out arm consults `from_source_viable`
+(the same gate as the parked-conversion arm: a `ChildlessLeaf+Pruned`
+node --- closure deliberately dropped --- stays in the stalled gauge
+instead of looping evict→re-probe→new-job→3h) but does NOT consult the
+Item-T strictness knobs (a never-touched job has zero worker charges and
+zero park dwell by construction --- both knobs would refuse forever); it
+is the executor-liveness backstop for
 #rref("sched.dispatch.probe-skip-pending-mat"), not a budget-exhaustion
 conversion. Counted by
 #(refs.metric)("rio_scheduler_materialization_aged_out_total").

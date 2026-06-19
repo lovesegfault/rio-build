@@ -714,10 +714,16 @@ pub(crate) struct JobViewEntry {
     created_at: crate::state::RecoveredInstant,
     /// Failover-exact mirror of `materialization_jobs.origin`
     /// (migration 078): the phase-15 unclaimed age-out arm's
-    /// `{origin}` counter label, read IN-MEMORY for the same reason as
-    /// `created_at`. The parked-conversion arm's PG-authoritative
-    /// origin read stays as-is (the dedup may have upgraded it after
-    /// the view entry was created); out of slot to refactor.
+    /// `{origin}` counter label and `from_source_viable` ChildlessLeaf
+    /// gate, read IN-MEMORY for the same reason as `created_at`.
+    /// Refreshed on the `feed_job_view_entry` dedup-upgrade branch so
+    /// the in-memory mirror tracks PG's `…_origin_upgraded_total` edge
+    /// (a `Pruned` merge dedup-upgrading a `CacheOpportunity` row
+    /// rewrites the field here too — the age-out arm's
+    /// `from_source_viable(ChildlessLeaf, origin)` and `{origin}`
+    /// label then read the upgraded value). The parked-conversion
+    /// arm's PG-authoritative origin read stays as-is (it already had
+    /// the per-entry PG round-trip for `classify_durable_evidence`).
     origin: crate::state::JobOrigin,
 }
 
@@ -932,6 +938,17 @@ impl JobViewEntry {
     fn park(&mut self, until: std::time::Instant) {
         self.parked_until = Some(until);
         self.parked_at = Some(crate::state::RecoveredInstant::fresh_now());
+    }
+
+    /// Test-only filler-free constructor (sh-044 r1): every test caller
+    /// of [`Self::new_unclaimed`] passed the identical
+    /// `(None, JobOrigin::CacheOpportunity)` filler — the next field
+    /// add to the production constructor would otherwise force another
+    /// 28-site mechanical edit. Tests that need a non-default carrier
+    /// or origin go through [`Self::new_unclaimed`] directly.
+    #[cfg(test)]
+    pub(crate) fn test_unclaimed(job_id: Uuid) -> Self {
+        Self::new_unclaimed(job_id, None, crate::state::JobOrigin::CacheOpportunity)
     }
 
     /// Test seeding of the park axis (the production writer is the
@@ -2038,6 +2055,20 @@ impl DagActor {
                            "dedup re-feed skipped: node has no db_id yet");
                 }
             }
+        } else {
+            // `!created && have_entry`: dedup onto an entry the view
+            // already tracks. Armament state is preserved (the kept
+            // entry's park/claim/defer); the ORIGIN mirror is refreshed
+            // to match PG's dedup-upgrade write
+            // (`FencedJobCreate::Applied{upgraded:true}` rewrote the
+            // durable column — the age-out arm reads `entry.origin`
+            // in-memory for both the `from_source_viable` gate and the
+            // `…_aged_out_total{origin}` label, so a stale mirror skews
+            // the alert-seeded series and misroutes a Pruned-upgraded
+            // ChildlessLeaf through age-out).
+            if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
+                entry.origin = origin;
+            }
         }
         // Mirror the durable set-if-null carrier semantics on the view
         // copy (display only) — applies to fresh, kept, and rehydrated
@@ -2357,6 +2388,32 @@ pub(crate) use rio_evidence_kernel::routing::{
 /// rollout, no old-store skew lane); an unknown nonzero value is
 /// `Refusal::Unrecognized` — conservative refusal routing, kept for
 /// future-evolution robustness, not as a rollout hedge.
+/// The PD-20 from-source-viable predicate (T-D2.2/PD-D4): a parked or
+/// aged-out materialization job may resolve `ResolvedFromSource` iff
+/// the node's durable closure evidence is `Vouched`/`Pending` (a
+/// buildable dependency closure exists), or `ChildlessLeaf` with a
+/// non-`Pruned` origin (merged_bug_301: a structural leaf has no
+/// closure to be missing — from-source is viable; a pruned root's
+/// closure was deliberately dropped and must NOT requeue). `Holed`
+/// evidence and `ChildlessLeaf+Pruned` stay in the view (the stalled
+/// gauge counts them). Shared by both phase-15 arms so the gate is one
+/// edit point — a refactor that drops the `ChildlessLeaf` origin
+/// conjunct cannot drift between the parked-conversion and age-out
+/// settlements.
+fn from_source_viable(
+    evidence: rio_evidence_kernel::ClosureEvidence,
+    origin: Option<crate::state::JobOrigin>,
+) -> bool {
+    use rio_evidence_kernel::ClosureEvidence;
+    match evidence {
+        ClosureEvidence::Vouched | ClosureEvidence::Pending => true,
+        ClosureEvidence::ChildlessLeaf => {
+            origin.is_some_and(|o| o != crate::state::JobOrigin::Pruned)
+        }
+        ClosureEvidence::Holed => false,
+    }
+}
+
 pub(super) fn refusal_from_wire(refusal: i32) -> Refusal {
     use rio_proto::types::UnobtainableRefusal as Wire;
     match Wire::try_from(refusal) {
@@ -4176,6 +4233,22 @@ impl DagActor {
 
     // r[impl obs.metric.materialization-stalled+2]
     // r[impl sched.materialize.routing+7]
+    /// PD-20 (design §2.5, Phase B T-6.1): the materialization-job
+    /// housekeeping arm — both the parked re-evaluation AND the
+    /// unclaimed age-out (the partition covers all `holder()=None`
+    /// entries). Every tick, flag-on, leader-only:
+    ///
+    ///   1. **Parked re-evaluation** — the original PD-20 conversion
+    ///      (jobs with `parked_until > now`); see item-1 below.
+    ///   2. **Unclaimed age-out** — the sh-044 backstop (jobs with
+    ///      `parked_until.is_none_or(|u| u <= now)` past `max_attempts
+    ///      × attempt_deadline_secs`); see the
+    ///      `r[impl sched.materialize.unclaimed-age-out]` block.
+    ///   3. **Visibility** — the stalled gauge over BOTH populations
+    ///      that this pass left in the view.
+    ///
+    /// The pre-existing item enumeration follows (parked arm only):
+    ///
     /// PD-20 (design §2.5, Phase B T-6.1): the parked-job housekeeping
     /// arm. Every tick, flag-on, leader-only:
     ///
@@ -4203,7 +4276,7 @@ impl DagActor {
     /// Leader-only by construction (`handle_tick` returns early on
     /// standby).
     // r[impl sched.materialize.settlement]
-    pub(super) async fn tick_reevaluate_parked_materialization_jobs(
+    pub(super) async fn tick_reevaluate_materialization_jobs(
         &mut self,
         _authority: &super::DagAuthority,
     ) {
@@ -4225,7 +4298,7 @@ impl DagActor {
         // `parked_until>now` by `park_backoff_cap_secs`).
         let age_out_after = std::time::Duration::from_secs(
             u64::from(self.materialization_cfg.max_attempts)
-                * self.materialization_cfg.attempt_deadline_secs,
+                .saturating_mul(self.materialization_cfg.attempt_deadline_secs),
         );
         let mut parked: Vec<(DrvHash, Uuid)> = Vec::new();
         let mut aged_out: Vec<(DrvHash, Uuid, crate::state::JobOrigin)> = Vec::new();
@@ -4297,16 +4370,7 @@ impl DagActor {
                     None
                 }
             };
-            let from_source_viable = matches!(
-                evidence,
-                rio_evidence_kernel::ClosureEvidence::Vouched
-                    | rio_evidence_kernel::ClosureEvidence::Pending
-            ) || (matches!(
-                evidence,
-                rio_evidence_kernel::ClosureEvidence::ChildlessLeaf
-            ) && origin
-                .is_some_and(|o| o != crate::state::JobOrigin::Pruned));
-            if !from_source_viable {
+            if !from_source_viable(evidence, origin) {
                 continue;
             }
             // r[impl sched.materialize.conversion-strictness]
@@ -4419,10 +4483,9 @@ impl DagActor {
             }
         }
         // sh-044: the unclaimed age-out arm. Shares the
-        // `resolve_materialization_job → remove_settled →
-        // requeue_after_attempt + counter` body with the
-        // parked-conversion arm above, but does NOT consult
-        // `from_source_viable` (`classify_durable_evidence`) or the
+        // `from_source_viable` gate and the `resolve_materialization_job
+        // → remove_settled → requeue_after_attempt + counter` body with
+        // the parked-conversion arm above, but does NOT consult the
         // Item-T strictness knobs (`conversion_requires_worker_charge`
         // / `conversion_min_park_dwell_secs`): a never-touched job has
         // zero worker charges and zero park dwell by construction, so
@@ -4437,16 +4500,42 @@ impl DagActor {
         // `{origin,reason}` live series would desync from the seeded
         // `{origin}`-only series — birth-gap protection lost).
         //
-        // The predicate is pure in-memory AND the `{origin}` label is
-        // read in-memory from `entry.origin` — NO per-entry PG read
-        // (without threading origin into `JobViewEntry`, the 7725-row
-        // backlog would be a serial-PG drain on the first post-deploy
-        // tick — exactly the on-actor serial-await sibling shape this
-        // function's parked arm already exhibits at the
-        // `classify_durable_evidence`/`unresolved_job_for_derivation`
-        // reads above).
+        // The `from_source_viable` gate IS consulted (mirroring the
+        // parked arm): a `ChildlessLeaf+Pruned` node — closure
+        // deliberately dropped — must NOT be evicted-and-requeued (it
+        // would re-probe cached → new mat job → 3h loop, or dispatch a
+        // build whose closure was dropped) and must stay in the stalled
+        // gauge. The evidence read is the per-entry
+        // `classify_durable_evidence` PG round-trip (the same
+        // serial-await shape the parked arm already exhibits, bounded
+        // by the aged-out population — alerted at sustained rate); the
+        // ORIGIN read is in-memory `entry.origin` (refreshed on
+        // dedup-upgrade by `feed_job_view_entry`, so no second PG
+        // read).
         // r[impl sched.materialize.unclaimed-age-out]
         for (drv_hash, job_id, origin) in aged_out {
+            let Some(db_id) = self.dag.node(drv_hash.as_str()).and_then(|s| s.db_id) else {
+                // No durable identity → no evidence to classify; the
+                // job stays in the view (the backstop sweep folds moot
+                // rows). Count as stalled (it is).
+                still_parked += 1;
+                continue;
+            };
+            let evidence = match self.db.classify_durable_evidence(db_id).await {
+                Ok(ev) => ev,
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, error = %e,
+                          "age-out evidence query failed; job stays unclaimed (stalled)");
+                    still_parked += 1;
+                    continue;
+                }
+            };
+            if !from_source_viable(evidence, Some(origin)) {
+                // Same as the parked arm's `continue`: not viable →
+                // stays in the view, counted as stalled.
+                still_parked += 1;
+                continue;
+            }
             let serving_generation = self.serving_generation();
             let d = self
                 .resolve_materialization_job(
@@ -4482,7 +4571,10 @@ impl DagActor {
                 );
             }
         }
-        // The stalled gauge: ground truth after the re-evaluation pass.
+        // The stalled gauge: ground truth after the re-evaluation pass
+        // — parked entries the conversion did not resolve PLUS aged-out
+        // entries the `from_source_viable` gate refused (both are
+        // genuinely stuck; the §2.5 operator signal).
         crate::observability::LeaderGauge::MaterializationStalled.set(still_parked as f64);
     }
 
