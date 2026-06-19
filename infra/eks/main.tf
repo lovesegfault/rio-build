@@ -160,15 +160,26 @@ module "vpc" {
   private_subnet_enable_dns64                                   = true
   private_subnet_enable_resource_name_dns_aaaa_record_on_launch = true
 
-  # EKS requires these tags for subnet auto-discovery by the
-  # load-balancer-controller and cluster-autoscaler.
+  # Subnet auto-discovery tag for the load-balancer-controller
+  # (internet-facing LBs). The internal-elb counterpart lives on
+  # database_subnet_tags below.
   public_subnet_tags = {
     "kubernetes.io/role/elb" = "1"
   }
   private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = "1"
     # Karpenter EC2NodeClass subnetSelectorTerms matches on this.
     "karpenter.sh/discovery" = var.cluster_name
+  }
+  # internal-elb goes on the DATABASE tier, not the private tier: the
+  # gateway NLB is dualstack (needs 8 free v4 addresses per subnet) and
+  # the private subnets are ipv6_native — AvailableIpAddressCount is
+  # structurally 0 there, so the load-balancer-controller's subnet
+  # resolution fails forever ("3 have insufficient available IP
+  # addresses") if they carry the tag. The database subnets are the
+  # dual-stack tier the NLB was designed to live in (see the tier
+  # comment above).
+  database_subnet_tags = {
+    "kubernetes.io/role/internal-elb" = "1"
   }
 }
 

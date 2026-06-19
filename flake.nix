@@ -608,6 +608,16 @@
                 coverage = false;
               };
 
+              # issue #57 1c: tier-3 k3s tests, run only on merge_group +
+              # nightly. The list is here (not in nix/tests/) because the
+              # split is a CI-policy concern, not a property of the test;
+              # `checks.*` and `nix build .#ci` keep the full set.
+              vmTestsSlowNames = [
+                "vm-lifecycle-prod-parity-k3s"
+                "vm-dashboard-k3s"
+                "vm-substitute-scale-k3s"
+              ];
+
               # Coverage-mode VM tests. Not in `checks` (too slow for flake
               # check) — consumed by nix/coverage.nix for the per-test +
               # merged lcov (packages.coverage.vm-*). Each per-test lcov
@@ -768,7 +778,22 @@
                 fuzz = fuzz.runs;
                 # Normal VM tests. Keys: vm-<scenario>-<fixture>. Per-test
                 # red/green signal in the GHA UI.
-                vm-test = vmTests;
+                #
+                # issue #57 1c: tier-3 k3s tests moved to vm-test-slow so
+                # the per-PR vm-test job sheds the three slowest, lowest-
+                # signal-on-typical-PR derivations. Why these three:
+                # prod-parity boots the bootstrap-Job overlay (rarely
+                # touched outside bootstrap PRs), dashboard pulls the
+                # gateway-API + envoy stack for a curl-shape assertion,
+                # substitute-scale is a closed-loop scaling soak. All
+                # three keep their `checks.*` membership (vmTests is the
+                # full set; the partition is purely at the GHA-matrix
+                # layer) so `nix-fast-build .#checks` and `nix build
+                # .#ci.vm-test` are unchanged. The vm-test-slow GHA job
+                # only runs on merge_group + nightly schedule; ci-gate
+                # treats it as allowed-skip on per-PR pushes.
+                vm-test = builtins.removeAttrs vmTests vmTestsSlowNames;
+                vm-test-slow = pkgs.lib.getAttrs vmTestsSlowNames vmTests;
                 # lcov-producing jobs, one per Codecov flag. `unit-*`
                 # run on spot (one per workspace member, so a single-
                 # crate edit only rebuilds that one); `vm-*` need KVM
