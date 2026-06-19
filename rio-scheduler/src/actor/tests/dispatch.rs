@@ -3138,7 +3138,14 @@ async fn queued_by_system_equal_across_both_rpcs_under_backoff() {
 /// GREEN: `fan_out_probes` under ONE `AttemptBudget` completes the
 /// same 8 hung probes in exactly one grpc_timeout (30 s), every
 /// outcome `TimedOut` → the dropped-from-fold arm.
+///
+/// The sweep-BUDGET-CAP green half (`DISPATCH_PROBE_SWEEP_BUDGET`): the
+/// production phase-17 site constructs the same `AttemptBudget` at
+/// `grpc_timeout.min(DISPATCH_PROBE_SWEEP_BUDGET)` and `fan_out_probes`
+/// folds every hung probe to `TimedOut` at exactly that budget — the
+/// fail-open arm `batch_probe_cached_ready` re-admits next generation.
 // r[verify sched.dispatch.probe-budget]
+// r[verify sched.dispatch.probe-sweep-budget]
 #[tokio::test(start_paused = true)]
 async fn hung_tenant_sweep_is_bounded_by_one_timeout() {
     use crate::actor::dispatch::{ProbeOutcome, fan_out_probes};
@@ -3178,6 +3185,29 @@ async fn hung_tenant_sweep_is_bounded_by_one_timeout() {
         t0.elapsed(),
         grpc_timeout,
         "the whole hung sweep costs exactly ONE grpc_timeout"
+    );
+
+    // GREEN-CAP: the production phase-17 budget is `grpc_timeout.min(
+    // DISPATCH_PROBE_SWEEP_BUDGET)` (= 5.5 s); the same hung sweep
+    // folds every probe TimedOut at exactly that cap.
+    let cap = grpc_timeout.min(crate::actor::DISPATCH_PROBE_SWEEP_BUDGET);
+    assert_eq!(cap, rio_lease::SELF_FENCE_AFTER / 2);
+    let budget = rio_common::transport::AttemptBudget::new(cap);
+    let probes: Vec<(usize, ())> = (0..T).map(|i| (i, ())).collect();
+    let t0 = tokio::time::Instant::now();
+    let fold = fan_out_probes(probes, &budget, grpc_timeout, |()| {
+        std::future::pending::<Result<tonic::Response<()>, tonic::Status>>()
+    })
+    .await;
+    assert!(
+        fold.iter()
+            .all(|(_, o)| matches!(o, ProbeOutcome::TimedOut)),
+        "every hung probe folds TimedOut at the cap → fail-open"
+    );
+    assert_eq!(
+        t0.elapsed(),
+        cap,
+        "the phase-17 hung sweep costs exactly DISPATCH_PROBE_SWEEP_BUDGET"
     );
 }
 

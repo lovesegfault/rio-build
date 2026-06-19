@@ -2062,10 +2062,16 @@ impl DagActor {
     /// either way — the establishment kernel DEFERS build attempts),
     /// `NoClient` when no store client is configured (the only shape
     /// where charging without a probe is honest; the old `Option`
-    /// return conflated it with probe failure). Wrapped in
-    /// `grpc_timeout` so a dead store stalls the sweep at most ONCE
-    /// (not N×); feeds `cache_breaker` like the merge-time FMP path so
-    /// a 30s stall here counts toward opening.
+    /// return conflated it with probe failure). Wrapped in the FULL
+    /// `grpc_timeout` (NOT `DISPATCH_PROBE_SWEEP_BUDGET`): the
+    /// `Err(_)` arm calls `cache_breaker.record_failure()`, so a 5.5 s
+    /// cap would reclassify a 6–29 s store response from
+    /// `record_success` (resets counter) to `record_failure`
+    /// (increments toward `OPEN_THRESHOLD = 5`) — five consecutive
+    /// phase-12 ticks against a slow-but-healthy store would open the
+    /// breaker. Phase-12 is rare (only when the expired-mat set is
+    /// non-empty) and is not the actor-hot-path the sweep cap defends;
+    /// the breaker-feed semantics own the timeout here.
     pub(super) async fn batch_probe_orphan_outputs(
         &mut self,
         store_paths: Vec<String>,
@@ -2078,11 +2084,7 @@ impl DagActor {
         };
         let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         rio_proto::interceptor::inject_current(req.metadata_mut());
-        // sh-044: capped at `DISPATCH_PROBE_SWEEP_BUDGET` (= 5.5 s) —
-        // the on-actor sibling of the phase-17 cap. SINGLE caller
-        // (housekeeping.rs phase-12 expired-mat sweep); fail-open
-        // `StoreProbe::Unavailable` → phase-12 retries next tick.
-        let grpc_timeout = self.grpc_timeout.min(super::DISPATCH_PROBE_SWEEP_BUDGET);
+        let grpc_timeout = self.grpc_timeout;
         match tokio::time::timeout(grpc_timeout, client.find_missing_paths(req)).await {
             Ok(Ok(resp)) => {
                 self.cache_breaker.record_success();

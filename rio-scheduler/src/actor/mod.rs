@@ -327,8 +327,12 @@ const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_se
 pub(crate) const DISPATCH_PROBE_TICK_QUOTA: usize = 2048;
 
 /// Wall-clock ceiling for the phase-17 ready-cache sweep's on-actor
-/// `FindMissingPaths` (and its on-actor siblings — the phase-12
-/// orphan-output probe, the per-outcome `reprobe_live_wanted_paths`).
+/// `FindMissingPaths`. Deliberately NOT applied to the phase-12
+/// orphan-output probe (breaker-feed semantics own that timeout — a
+/// 5.5 s cap there reclassifies a slow-but-healthy store as a breaker
+/// failure) or the per-outcome `reprobe_live_wanted_paths` (per-RPC
+/// settlement, not per-tick; a 5.5 s shared serial budget breaks
+/// 3-tenant 2.5 s/ea into a bare-re-arm livelock until age-out).
 /// Named `SELF_FENCE_AFTER/2` (= 5.5 s): the threshold past which the
 /// pre-guard-isolated lease shape would have starved a renew, and the
 /// budget the phase-17 WARN names. With sh-044's candidate filter the

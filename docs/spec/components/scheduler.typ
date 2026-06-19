@@ -2295,17 +2295,21 @@ bound by construction because the budget, not the loop shape, owns the
 clock.
 
 #r("sched.dispatch.probe-sweep-budget")[
-  The phase-17 ready-cache sweep's on-actor `FindMissingPaths` (and its
-  on-actor siblings: the phase-12 orphan-output probe, the per-outcome
-  reprobe) MUST be bounded at `DISPATCH_PROBE_SWEEP_BUDGET` (=
-  `SELF_FENCE_AFTER`/2); on expiry the unprobed tail fails open to the
-  next `probe_generation`.
+  The phase-17 ready-cache sweep's on-actor `FindMissingPaths` MUST be
+  bounded at `DISPATCH_PROBE_SWEEP_BUDGET` (= `SELF_FENCE_AFTER`/2); on
+  expiry the unprobed tail fails open to the next `probe_generation`.
 ]
 Defense-in-depth behind #rref("sched.dispatch.probe-skip-pending-mat"):
 with the candidate filter the steady-state set is the freshly-Ready
 frontier only; this bounds the cold-merge / store-slow tail at the
 budget the WARN names. Under nominal store latency (\~100 ms/1k)
-headroom is \~50×.
+headroom is \~50×. The cap is phase-17-only: the phase-12
+orphan-output probe feeds `cache_breaker` (a 5.5 s cap there
+reclassifies a slow-but-healthy store as a breaker failure) and the
+per-outcome reprobe is per-RPC settlement, not per-tick (a 5.5 s
+shared serial budget breaks multi-tenant settlement into bare re-arm
+until #rref("sched.materialize.unclaimed-age-out") fires with the
+wrong terminal outcome).
 
 #r("sched.dispatch.probe-skip-pending-mat")[
   The phase-17 ready-cache sweep's candidate filter MUST skip Ready
