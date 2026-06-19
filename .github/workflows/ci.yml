@@ -3,6 +3,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # issue #57 1c: vm-test-slow runs only here (and on the nightly cron).
+  # The merge queue is the last gate before main, so the tier-3 tests
+  # still block a bad merge — they just stop running on every PR push.
+  merge_group:
+  schedule:
+    - cron: '17 3 * * *'
 
 permissions:
   contents: read
@@ -50,6 +56,7 @@ jobs:
       formal-nowait: ${{ steps.gen.outputs.formal-nowait }}
       fuzz: ${{ steps.gen.outputs.fuzz }}
       vm-test: ${{ steps.gen.outputs.vm-test }}
+      vm-test-slow: ${{ steps.gen.outputs.vm-test-slow }}
       coverage: ${{ steps.gen.outputs.coverage }}
       coverage-paths: ${{ steps.gen.outputs.coverage-paths }}
     steps:
@@ -372,6 +379,38 @@ jobs:
       - run: |
           read -ra drvs <<< "${{ matrix.drvs }}"
           nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
+  # Tier-3 k3s tests (issue #57 1c). Same build steps as vm-test; the
+  # only differences are the matrix source and the event-name gate.
+  # Gated on merge_group + schedule so a typical PR push never spins up
+  # these three KVM runners — but a bad change still cannot reach main
+  # without passing them in the queue. The `!= '[]'` check stays so a
+  # fully-cached merge-queue run skips cleanly.
+  vm-test-slow:
+    name: vm-slow / ${{ matrix.name }}
+    needs: [gen-matrix, warm]
+    if: |
+      !cancelled()
+      && (github.event_name == 'merge_group' || github.event_name == 'schedule')
+      && needs.gen-matrix.result == 'success'
+      && needs.warm.result != 'failure'
+      && needs.gen-matrix.outputs.vm-test-slow != '[]'
+    runs-on: rio-ci-kvm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gen-matrix.outputs.vm-test-slow) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+        with:
+          kvm: true
+          drv-cache: 'true'
+      - name: Verify KVM
+        run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
+      - run: |
+          read -ra drvs <<< "${{ matrix.drvs }}"
+          nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
   coverage:
     name: coverage / ${{ matrix.name }}
     needs: [gen-matrix, warm]
@@ -459,6 +498,7 @@ jobs:
       - formal-nowait
       - fuzz
       - vm-test
+      - vm-test-slow
       - coverage
       - coverage-upload
     runs-on: rio-ci
@@ -476,4 +516,8 @@ jobs:
           # warm stage failed (in which case warm is the red one).
           # gen-matrix and coverage-upload are NOT listed: both must
           # always run — if either skips, something is wrong.
-          allowed-skips: warm, checks, check-nowait, formal, formal-nowait, fuzz, vm-test, coverage
+          # vm-test-slow is allowed-skip on every event except
+          # merge_group/schedule (it skips by design on PR push); on
+          # those events it either runs or skips because cached — both
+          # are green. A real failure surfaces as failure, not skip.
+          allowed-skips: warm, checks, check-nowait, formal, formal-nowait, fuzz, vm-test, vm-test-slow, coverage

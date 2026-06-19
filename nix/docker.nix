@@ -86,6 +86,22 @@ let
       docker-archive:${src} ${dest}
   '';
 
+  # VM-test airgap variant: layers UNCOMPRESSED inside the OCI layout.
+  # k3s's airgap importer is single-core and runs serially before kubelet
+  # — per-layer decompress dominated import time (~100-180s of cilium-
+  # agent gunzip alone, issue #57). With uncompressed layers the import
+  # is a 9p read + a tar extract, no gunzip. The seed grows ~2-3× on
+  # disk; the cost lands on the build cache, not the test wall-clock.
+  # `--dest-decompress` undoes the source's zstd; `--dest-oci-accept-
+  # uncompressed-layers` stops the oci: transport from re-compressing
+  # what was just decompressed (its default is "compress anything that
+  # isn't").
+  ociSkopeoCopyUncompressed = src: dest: ''
+    skopeo --insecure-policy --tmpdir="$TMPDIR" copy \
+      --dest-decompress --dest-oci-accept-uncompressed-layers -f oci \
+      docker-archive:${src} ${dest}
+  '';
+
   # ── Multi-manifest OCI seed builder ───────────────────────────────────
   # Packs N docker-archive images into ONE oci: layout via repeated
   # skopeo copies, then tars it. The destination's content-addressed
@@ -131,8 +147,32 @@ let
   # N times instead of once — wasted CPU on otherwise-idle cores, not
   # wall-clock.
   mkSeed =
-    { name, images }:
-    pkgs.runCommand "rio-${name}-seed.oci.tar.gz"
+    {
+      name,
+      images,
+      # uncompressed=true → layer blobs land as plain tar in the OCI
+      # layout AND the outer archive is plain tar (no gzip). Used only
+      # by vmTestSeed (issue #57): the airgap import is the per-PR k3s
+      # gate's longest serial step, and 9p-read of a larger plain tar
+      # is faster than gunzip of a smaller one. executorSeed keeps
+      # uncompressed=false — its layer digests MUST match the ECR push
+      # (ociSkopeoCopyArgs zstd-6, see executorSeedLayerParity), and
+      # the AMI closure cost matters there.
+      #
+      # Reference-scanner: uncompressed config-json and layer blobs
+      # contain visible /nix/store paths, so the seed's runtime closure
+      # picks up the image contents (the gzip outer tar masked them).
+      # vmTestSeed's only consumer is the VM-test NixOS closure, which
+      # already has those paths via the source docker-archives — no net
+      # closure growth where it would matter.
+      uncompressed ? false,
+    }:
+    let
+      copy = if uncompressed then ociSkopeoCopyUncompressed else ociSkopeoCopy;
+      ext = if uncompressed then "oci.tar" else "oci.tar.gz";
+      pack = if uncompressed then "cat > $out" else "gzip -1n > $out";
+    in
+    pkgs.runCommand "rio-${name}-seed.${ext}"
       {
         nativeBuildInputs = [
           pkgs.skopeo
@@ -147,7 +187,7 @@ let
             i:
             { ref, archive }:
             ''
-              (${ociSkopeoCopy archive "oci:$TMPDIR/oci-${toString i}:${ref}"}) &
+              (${copy archive "oci:$TMPDIR/oci-${toString i}:${ref}"}) &
             ''
           ) images
         )}
@@ -171,7 +211,7 @@ let
 
         tar -C $d -c \
           --sort=name --mtime='@1' --owner=0 --group=0 --numeric-owner \
-          . | gzip -1n > $out
+          . | ${pack}
       '';
 
   # Common to all images. cacert for TLS (S3, upstream binary caches),
@@ -700,6 +740,10 @@ rec {
     in
     mkSeed {
       name = "vmtest";
+      # issue #57 1a: uncompressed layers + plain outer tar — drops
+      # ~40-60s of single-core gunzip from every k3s VM test's airgap-
+      # import phase. See mkSeed's `uncompressed` for the trade-off.
+      uncompressed = true;
       images = [
         (dev "gateway" gateway)
         (dev "scheduler" scheduler)

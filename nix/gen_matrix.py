@@ -106,8 +106,12 @@ DEFAULT_WORKERS = 8
 # crate's cluster -- it still gets built.
 CHECK_KIND_RE = re.compile(r"^(clippy-test|clippy|doc|nextest)-(.+)$")
 
-# All matrix kinds, in stable emission order.
-MATRIX_KINDS = ("checks", "formal", "fuzz", "vm-test", "coverage")
+# All matrix kinds, in stable emission order. vm-test-slow (issue #57
+# 1c) carries the tier-3 k3s tests that only run in the merge queue +
+# nightly; the workflow gates that job on github.event_name, so on a
+# normal PR push the kind evaluates, cache-filters, and emits an empty
+# matrix (the warm trunk still benefits from its drv closures).
+MATRIX_KINDS = ("checks", "formal", "fuzz", "vm-test", "vm-test-slow", "coverage")
 
 # Kinds whose clusters are partitioned into a warm-gated matrix and a
 # nowait matrix (`<kind>` / `<kind>-nowait`) by trunk overlap. fuzz /
@@ -533,6 +537,7 @@ def build_outputs(results):
         "formal": cluster_formal,
         "fuzz": singletons,
         "vm-test": singletons,
+        "vm-test-slow": singletons,
         "coverage": cluster_coverage,
     }
     # Cluster every kind first: the trunk analysis is global, so it
@@ -775,6 +780,7 @@ def main():
         "formal-nowait",
         "fuzz",
         "vm-test",
+        "vm-test-slow",
         "coverage",
     ):
         print(f"::notice::{key}: {outputs[key]}")

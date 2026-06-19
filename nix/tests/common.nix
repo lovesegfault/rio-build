@@ -103,6 +103,63 @@ rec {
       '';
     };
 
+  # ── Batch-test composition (issue #57 1e: collapse k3s VM-test boots) ─
+  # Sibling of mkFragmentTest. One fixture boot, N subtest GROUPS run
+  # sequentially via lib/driver.py run_batch — each group's `body` is a
+  # flat col-0 Python string (typically a `${concatMapStrings fragments}`
+  # of `with subtest:` blocks, or a scenario's exported `body`). Wrapped
+  # here as `def _grp_<name>(ctx):` by 4-space-indenting every non-empty
+  # line. Bodies see all prelude globals (kubectl, build, tenant_jwt,
+  # pf_exec, ...) by closure; `ctx` (SubtestCtx) is passed but groups
+  # MAY ignore it.
+  #
+  # Order matters: groups run in list order. Put state-sensitive groups
+  # (e.g. cli's `builds` empty-state assertion) BEFORE groups that
+  # mutate that state (lifecycle-core submits builds), and store-global
+  # side-effects (TriggerGC) LAST.
+  #
+  # Indent caveat: a body line that is the col-0 sentinel of a Python
+  # heredoc / triple-quoted string would shift under the 4-space prefix
+  # and change the string content. None today (every shell heredoc is
+  # inside a single-quoted k3s_server.succeed string and no fragment
+  # uses col-0 `"""`); pyflakes on `.driverInteractive` catches a new
+  # one in ~10s.
+  mkBatchTest =
+    {
+      scenario,
+      prelude,
+      fixture,
+      groups,
+      globalTimeout,
+      isolation ? "tenant",
+    }:
+    let
+      pyName = lib.replaceStrings [ "-" ] [ "_" ];
+      indent =
+        body:
+        lib.concatMapStringsSep "\n" (l: if l == "" then "" else "    " + l) (lib.splitString "\n" body);
+      mkDef = g: ''
+        def _grp_${pyName g.name}(ctx):
+        ${indent g.body}
+      '';
+      mkEntry = g: ''("${g.name}", _grp_${pyName g.name}, ${toString g.timeout}),'';
+    in
+    pkgs.testers.runNixOSTest {
+      name = "rio-${scenario}";
+      skipTypeCheck = true;
+      globalTimeout = globalTimeout + covTimeoutHeadroom;
+      inherit (fixture) nodes;
+      testScript = ''
+        ${prelude}
+        ${driver}
+        ${lib.concatMapStrings mkDef groups}
+        run_batch([
+        ${lib.concatMapStringsSep "\n" mkEntry groups}
+        ], isolation="${isolation}")
+        ${collectCoverage fixture.pyNodeVars}
+      '';
+    };
+
   # Chain assertions: each entry is either
   #   { before = "a"; after = "b"; msg = "..."; }  → a must precede b
   #   { name = "x"; last = true; msg = "..."; }    → x must be last
@@ -267,6 +324,13 @@ rec {
   # assert_set_eq, psql, dump_all_logs, load_otel_spans). Scenarios prepend
   # `${common.assertions}` to their testScript. See lib/assertions.py.
   assertions = builtins.readFile ./lib/assertions.py;
+
+  # Batch-subtest harness (run_batch / run_concurrent, SubtestCtx).
+  # Spliced by mkBatchTest AFTER the scenario prelude so Machine globals
+  # + assertions.py + every prelude-level helper are already in scope.
+  # Sequential by design — see lib/driver.py header for the
+  # Machine.execute() thread-safety rationale.
+  driver = builtins.readFile ./lib/driver.py;
 
   # KVM hard-fail gate — verifies /dev/kvm is openable RDWR and
   # KVM_CREATE_VM ioctl succeeds before start_all(). Hard-fails with
