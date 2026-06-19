@@ -2303,7 +2303,7 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
 /// sh-044: phase-17's candidate filter MUST skip Ready nodes that
 /// already carry an unresolved `materialization_jobs` entry — the job
 /// row owns disposition (`ReportPullOutcome` → `remove_settled`
-/// re-admits). Without the conjunct, every Tick re-probes the SAME
+/// re-admits). Without the conjunct, every Tick re-probes the same
 /// ~1047 substitutable paths the previous sweep already routed to
 /// jobs, pinning `tick_phase_seconds{phase="17-ready-cache-sweep"}`
 /// at the on-actor FMP wall-clock (8.77 s/tick under sh-044's store)
@@ -2312,6 +2312,7 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
 /// Structural: 1000 IA leaves with substitutable outputs; the merge's
 /// inline sweep creates 1000 CacheOpportunity jobs; the next Tick's
 /// candidate set MUST be empty (zero new FMP calls).
+// r[verify sched.dispatch.probe-skip-pending-mat]
 #[tokio::test]
 async fn batch_probe_skips_pending_mat_jobs() -> TestResult {
     use std::sync::atomic::Ordering;

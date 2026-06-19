@@ -2294,6 +2294,56 @@ behind it. Any future partitioning of the probe groups inherits the
 bound by construction because the budget, not the loop shape, owns the
 clock.
 
+#r("sched.dispatch.probe-sweep-budget")[
+  The phase-17 ready-cache sweep's on-actor `FindMissingPaths` (and its
+  on-actor siblings: the phase-12 orphan-output probe, the per-outcome
+  reprobe) MUST be bounded at `DISPATCH_PROBE_SWEEP_BUDGET` (=
+  `SELF_FENCE_AFTER`/2); on expiry the unprobed tail fails open to the
+  next `probe_generation`.
+]
+Defense-in-depth behind #rref("sched.dispatch.probe-skip-pending-mat"):
+with the candidate filter the steady-state set is the freshly-Ready
+frontier only; this bounds the cold-merge / store-slow tail at the
+budget the WARN names. Under nominal store latency (\~100 ms/1k)
+headroom is \~50×.
+
+#r("sched.dispatch.probe-skip-pending-mat")[
+  The phase-17 ready-cache sweep's candidate filter MUST skip Ready
+  nodes that already carry an unresolved materialization job: the job
+  row owns disposition (`ReportPullOutcome` → `remove_settled` re-admits
+  the node to the next generation's candidate set), so re-probing it
+  cannot change in-memory state, and `probe_generation` advancing every
+  Tick would otherwise re-admit the same set indefinitely.
+]
+With this conjunct the steady-state on-actor `FindMissingPaths` input
+collapses from the full pending-job population to the freshly-Ready
+frontier; the #rref("sched.materialize.unclaimed-age-out") arm bounds
+the skip unconditionally.
+
+#r("sched.materialize.unclaimed-age-out")[
+  A materialization job that remains unclaimed (no holder, not currently
+  parked) past `max_attempts × attempt_deadline_secs` MUST be resolved
+  from-source so the node is re-admitted to dispatch.
+]
+The phase-15 age-out arm: `holder().is_none() &&
+parked_until.is_none_or(|u| u <= now) && created_at.elapsed() >
+max_attempts × attempt_deadline_secs` → `ResolvedFromSource` →
+`remove_settled` → requeue. The second conjunct is the exact complement
+of the parked-conversion arm's `parked_until.is_some_and(|u| u > now)`,
+so the two arms partition `holder()=None` on the park axis (covers
+never-parked AND park-expired). Bounded above by `(max_attempts+1) ×
+attempt_deadline_secs + park_backoff_cap_secs` (default ≈ 4h15m): the
+predicate's conjuncts mean age-out cannot fire while Held or currently
+parked, and `holder()=Some` is itself bounded by phase-12 attempt-expiry
+/ the merged_bug_055 ghost two-strike repair, `parked_until>now` by
+`park_backoff_cap_secs`. The age-out arm does NOT consult
+`from_source_viable` or the Item-T strictness knobs (a never-touched job
+has zero worker charges and zero park dwell by construction --- both
+knobs would refuse forever); it is the executor-liveness backstop for
+#rref("sched.dispatch.probe-skip-pending-mat"), not a budget-exhaustion
+conversion. Counted by
+#(refs.metric)("rio_scheduler_materialization_aged_out_total").
+
 #r("sched.dispatch.fod-substitute+3")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream

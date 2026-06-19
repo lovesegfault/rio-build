@@ -9765,6 +9765,7 @@ async fn assert_unclaimed_ages_out(
 /// at 368e279cf. With the phase-17 candidate filter skipping nodes
 /// that carry an unresolved job, this is the residual that strands a
 /// Ready node forever — c4's age-out arm closes it.
+// r[verify sched.materialize.unclaimed-age-out]
 #[tokio::test]
 async fn pending_unclaimed_job_ages_out_to_from_source() -> TestResult {
     assert_unclaimed_ages_out("ageout-never-parked", None).await
@@ -9780,6 +9781,7 @@ async fn pending_unclaimed_job_ages_out_to_from_source() -> TestResult {
 /// miss it. The `is_none_or(|u| u <= now)` conjunct is the EXACT
 /// complement of the parked-conversion arm's `is_some_and(|u| u >
 /// now)` — the two arms partition `holder()=None`.
+// r[verify sched.materialize.unclaimed-age-out]
 #[tokio::test]
 async fn park_expired_unclaimed_job_ages_out_to_from_source() -> TestResult {
     assert_unclaimed_ages_out(

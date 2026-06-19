@@ -185,13 +185,14 @@ impl DagActor {
     /// SKIPPED — the job row owns disposition (`ReportPullOutcome` →
     /// `JobViewState::remove_settled` re-admits the node to the next
     /// generation's candidate set). Without this conjunct, the sweep
-    /// re-probes the SAME substitutable set every generation (1047
+    /// re-probes the same substitutable set every generation (1047
     /// paths × 8.77 s/tick under sh-044's store → cost-axis
     /// backpressure latched). The phase-15 age-out arm at
     /// `tick_reevaluate_parked_materialization_jobs` bounds the skip
     /// unconditionally.
     // r[impl sched.dispatch.fod-substitute+3]
     // r[impl sched.admission.work-per-turn]
+    // r[impl sched.dispatch.probe-skip-pending-mat]
     async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
             return HashSet::new();
@@ -363,6 +364,7 @@ impl DagActor {
         // applies when `candidates.len() > DISPATCH_PROBE_TICK_QUOTA`
         // — it does NOT shard a within-quota batch.
         // r[impl sched.dispatch.probe-budget]
+        // r[impl sched.dispatch.probe-sweep-budget]
         let budget = rio_common::transport::AttemptBudget::new(
             self.grpc_timeout.min(super::DISPATCH_PROBE_SWEEP_BUDGET),
         );

@@ -4444,6 +4444,7 @@ impl DagActor {
         // function's parked arm already exhibits at the
         // `classify_durable_evidence`/`unresolved_job_for_derivation`
         // reads above).
+        // r[impl sched.materialize.unclaimed-age-out]
         for (drv_hash, job_id, origin) in aged_out {
             let serving_generation = self.serving_generation();
             let d = self
