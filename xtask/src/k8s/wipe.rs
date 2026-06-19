@@ -11,7 +11,6 @@
 //! survive; `rio-gateway-ssh` (tenant keys) is wiped explicitly.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::future::try_join_all;
@@ -22,7 +21,6 @@ use super::eks::destroy::{k, uninstall_chart};
 use super::provider::ProviderKind;
 use super::qa::ctx::PgHandle;
 use super::{NS, NS_BUILDERS, NS_FETCHERS, NS_STORE, client as kube};
-use crate::sh::{self, cmd, shell};
 use crate::{aws, tofu, ui};
 
 /// Namespaces deleted wholesale. `rio-system` excluded — see module doc.
@@ -91,7 +89,23 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     // ── 6–8. Provider-specific data resets ──────────────────────────
     match kind {
         ProviderKind::Eks => {
-            wait_rio_nodeclaims_gone().await?;
+            // Karpenter (tofu-managed) survives wipe and reaps the
+            // chart's NodePool-backed claims in the background once
+            // their pools are gone — no need to block on the drain.
+            // Kick a non-blocking delete on shim-pool claims so any
+            // controller-minted straggler that raced uninstall_chart's
+            // step-1b sweep is marked for GC before the next deploy.
+            ui::step("delete shim-pool NodeClaims (non-blocking)", || {
+                k(&[
+                    "delete",
+                    "nodeclaim",
+                    "-l",
+                    "karpenter.sh/nodepool=rio-nodeclaim-shim",
+                    "--ignore-not-found",
+                    "--wait=false",
+                ])
+            })
+            .await?;
             empty_chunk_buckets().await?;
             // PG-schema reset MUST come after the namespace deletes:
             // store/scheduler pods hold connections that block DROP
@@ -113,35 +127,6 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Karpenter terminates NodeClaims when their NodePool is deleted;
-/// wipe keeps Karpenter alive (unlike `destroy`, which deletes
-/// NodeClaims itself because Karpenter is also being torn down), so
-/// we just wait. Prefix-filtered for non-rio NodePools sharing the
-/// cluster.
-async fn wait_rio_nodeclaims_gone() -> Result<()> {
-    ui::step("wait for rio-* NodeClaims to drain", || async {
-        ui::poll(
-            "rio-* NodeClaims gone",
-            Duration::from_secs(10),
-            60, // 10 min — builder nodes can take a while under load
-            || async {
-                // Separate var: jsonpath braces collide with cmd!'s {}.
-                let jp = r#"jsonpath={range .items[*]}{.metadata.labels.karpenter\.sh/nodepool}{"\n"}{end}"#;
-                let sh = shell()?;
-                let out = sh::try_read(cmd!(sh, "kubectl get nodeclaims -o {jp}"))
-                    .unwrap_or_default();
-                let n_rio = out.lines().filter(|l| l.starts_with("rio-")).count();
-                if n_rio > 0 {
-                    info!("{n_rio} rio-* NodeClaims still draining");
-                }
-                Ok((n_rio == 0).then_some(()))
-            },
-        )
-        .await
-    })
-    .await
 }
 
 /// Empty the standard chunk bucket plus every per-AZ S3 Express One

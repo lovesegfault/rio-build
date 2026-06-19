@@ -199,8 +199,8 @@ pub(in crate::k8s) async fn uninstall_chart() -> Result<()> {
     // not found") → NodeClaim stuck → Node stuck → builder pods stuck
     // → helm uninstall blocks. Delete the claims FIRST (--wait=false)
     // so Karpenter drains them while the shim NodePool still exists.
-    // `destroy`'s step 4 / `wipe`'s `wait_rio_nodeclaims_gone` then
-    // waits for completion.
+    // `destroy`'s step 4 then waits for completion; `wipe` does not
+    // block — Karpenter consolidates in the background.
     ui::step(
         "delete controller-created NodeClaims (non-blocking)",
         || {
