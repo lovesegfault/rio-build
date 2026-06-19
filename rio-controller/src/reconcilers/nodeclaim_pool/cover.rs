@@ -786,9 +786,10 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
         )
         .increment(1);
     }
-    // sh-043: when headroom is already exhausted (live_unlaunched ≥
-    // cap, or earlier cells minted it dry) the FFD bin-search +
-    // affordability walk below would clamp to 0 anyway — skip the
+    // sh-043: when no intent fits or headroom is already exhausted
+    // (live_unlaunched ≥ cap, or earlier cells minted it dry) the FFD
+    // bin-search + affordability walk below would clamp to 0 anyway —
+    // skip the
     // per-iteration intent clones, sim LiveNode allocs, and
     // simulate() calls. Runs AFTER the over-cap warn loop so
     // `reclassify_over_cap` still sees `over`; `min_eta=f64::MAX` is
