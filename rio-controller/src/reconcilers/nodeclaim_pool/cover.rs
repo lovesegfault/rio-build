@@ -627,6 +627,11 @@ pub struct SizingCfg {
     pub max_node_disk: u64,
     pub budget: u32,
     pub fuse_cache_bytes: u64,
+    /// sh-043: the third law term — `max_inflight_unlaunched −
+    /// |{live: Launched≠True}| − created.len()` (this-tick-so-far).
+    /// `cover_deficit` recomputes per cell from the same accumulator
+    /// `created_cores` reads. Tests pass `u32::MAX` for the no-op.
+    pub inflight_headroom: u32,
 }
 
 /// Per-claim `(cores, mem, ephemeral-storage)` requests covering `u`'s
@@ -650,11 +655,15 @@ pub struct SizingCfg {
 /// affordable family starves the cell in steady state), and only
 /// budget < `max_i c` (the family's floor) yields zero claims, with
 /// the warn + counter disclosure the over-cap sibling carries.
-/// live_049 L1: the former flat `per_tick_cap` term is
-/// RETIRED — minting is bounded by demand (`n_pack`, the FFD bin
-/// count over real placeable-gated footprints) and by the fleet
-/// budget, the two quantities with safety meaning, and by nothing
-/// else (`ctrl.nodeclaim.mint-deficit-proportional`).
+/// sh-043: the former flat `per_tick_cap` term stays RETIRED —
+/// minting is bounded by demand (`n_pack`, the FFD bin count over
+/// real placeable-gated footprints), by the fleet budget, AND by the
+/// concurrent-unlaunched headroom (the third term;
+/// `ctrl.nodeclaim.mint-deficit-proportional`). The headroom term is
+/// a GLOBAL ceiling: under healthy launch throughput it acts as a
+/// ≈`max_inflight_unlaunched`/tick velocity cap matched to
+/// Karpenter's launch rate; under backlog it tightens to zero so
+/// `Synced()=false` windows stay ≪ tick.
 ///
 /// Each claim is uniformly `uniform_claim` (private fn, plain-code
 /// reference): `(max(⌈Σc/n⌉, max_i c),
@@ -785,10 +794,20 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
         .find(|&n| super::ffd::sim_packs(cell, &fits, claim_at(n), n, cfg.fuse_cache_bytes))
         .unwrap_or(n_hi);
     // r[impl ctrl.nodeclaim.mint-deficit-proportional+2]
-    // live_049 L1: the two-term mint law — demand x budget. The
-    // retired flat cap stretched the live ramp to 18 ticks while
-    // protecting nothing: every claim it deferred was demanded
-    // (placeable-gated), budget-affordable, and right-sized.
+    // sh-043: the three-term mint law — demand × budget ×
+    // inflight-headroom. The headroom term is a GLOBAL
+    // concurrent-unlaunched ceiling: under healthy launch throughput
+    // (`live_unlaunched≈0` between 10s ticks) it acts as a global
+    // ≈`max_inflight_unlaunched`/tick velocity cap matched to
+    // Karpenter's downstream launch rate; under backlog it tightens
+    // to zero so `Synced()=false` windows stay ≪ tick. live_049 L1's
+    // retired cap was per-CELL × arbitrary-8 × backlog-BLIND; this
+    // is GLOBAL (round-robin fair) × throughput-matched-50 ×
+    // backlog-ADAPTIVE — it bounds the `Synced()`-blocking
+    // population, which the L1 cap never targeted. The L1 cap
+    // stretched the live ramp to 18 ticks while protecting nothing:
+    // every claim it deferred was demanded (placeable-gated),
+    // budget-affordable, and right-sized.
     //
     // bug_062: affordability QUANTIFIES over the claim family.
     // `uniform_claim` is weakly decreasing in n down to
@@ -838,7 +857,7 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
         };
     };
     let (chunk, mem, disk) = claim_at(n_aff);
-    let n = n_aff.min(cfg.budget / chunk);
+    let n = n_aff.min(cfg.budget / chunk).min(cfg.inflight_headroom);
     Sizing {
         claims: vec![(chunk, mem, disk); n as usize],
         min_eta,
@@ -1226,6 +1245,7 @@ mod tests {
             max_node_disk: 450 * GI,
             budget,
             fuse_cache_bytes: 50 * GI,
+            inflight_headroom: u32::MAX,
         }
     }
 
@@ -1242,6 +1262,59 @@ mod tests {
 
     fn h_spot() -> Cell {
         Cell("h".into(), CapacityType::Spot)
+    }
+
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    /// **sh-043** — *the inflight-headroom term bounds the per-tick
+    /// mint count* (the `Synced()`-blocking population cap;
+    /// operation-count, zero wall-clock). The mint law is
+    /// `min(n_aff, ⌊budget/chunk⌋, inflight_headroom)` — the third
+    /// term is the GLOBAL concurrent-unlaunched ceiling. Pre-fix RED
+    /// (transcript in the commit body): the two-term law minted 100
+    /// — `cluster.Synced()` blocked rio-general for ~7min on the
+    /// live ~700-mint cold start (459 parked at `Launched=Unknown`).
+    #[test]
+    fn cover_deficit_caps_unlaunched_inflight() {
+        let u: Vec<_> = (0..100)
+            .map(|k| intent_hd(&format!("i{k}"), 1, GI, GI, Some(true)))
+            .collect();
+        let refs: Vec<&SpawnIntent> = u.iter().collect();
+        // max_node_cores=1 → n_aff=100 (one claim per intent);
+        // budget/chunk=1000/1=1000; only headroom varies.
+        let scfg = |h: u32| SizingCfg {
+            max_node_cores: 1,
+            max_node_mem: 256 * GI,
+            max_node_disk: 450 * GI,
+            budget: 1000,
+            fuse_cache_bytes: 0,
+            inflight_headroom: h,
+        };
+        let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &scfg(10));
+        assert_eq!(
+            c.len(),
+            10,
+            "sh-043: the inflight-headroom term binds — 100 demanded, \
+             1000-core budget, headroom=10 ⇒ 10 (pre-fix RED: 100; the \
+             two-term law minted demand×budget unbounded by the \
+             Synced()-blocking population)"
+        );
+        // Second case — `live_unlaunched=5` (5 stuck at Unknown) +
+        // `created.len()=0` ⇒ headroom = 10 − 5 = 5. The cell-loop
+        // recompute mirrors `created_cores` exactly.
+        let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &scfg(5));
+        assert_eq!(
+            c.len(),
+            5,
+            "sh-043: headroom tightens under backlog — 5 unlaunched in \
+             `live` ⇒ mint 5 (pre-fix RED: 100)"
+        );
+        // headroom=0 ⇒ claims.is_empty() ⇒ the :2536 early-continue.
+        let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &scfg(0));
+        assert!(
+            c.is_empty(),
+            "sh-043: headroom=0 ⇒ zero claims (live_unlaunched ≥ cap \
+             — the `Synced()=false` window is already at its bound)"
+        );
     }
 
     // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
@@ -1513,6 +1586,7 @@ mod tests {
             max_node_disk: 450 * GI,
             budget: u32::MAX,
             fuse_cache_bytes: 50 * GI,
+            inflight_headroom: u32::MAX,
         };
         let refs: Vec<&SpawnIntent> = u.iter().collect();
         let Sizing { claims, .. } = sizing(&h_spot(), &refs, &scfg);
@@ -2806,6 +2880,7 @@ mod tests {
                 max_node_disk: 450 * GI,
                 budget: u32::MAX,
                 fuse_cache_bytes: 0,
+                inflight_headroom: u32::MAX,
             },
         );
         assert!(
@@ -3187,6 +3262,7 @@ mod mint_law_tests {
                         max_node_disk: 450 * GI,
                         budget: u32::MAX,
                         fuse_cache_bytes: 50 * GI,
+                        inflight_headroom: u32::MAX,
                     },
                 )
                 .claims

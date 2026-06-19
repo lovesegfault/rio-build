@@ -2727,6 +2727,7 @@ pub(crate) mod tests {
                             max_node_disk: 450 * GI,
                             budget,
                             fuse_cache_bytes: 0,
+                            inflight_headroom: u32::MAX,
                         },
                     )
                     .claims
@@ -2925,6 +2926,7 @@ pub(crate) mod tests {
                             max_node_disk: 450 * GI,
                             budget,
                             fuse_cache_bytes: 0,
+                            inflight_headroom: u32::MAX,
                         },
                     )
                     .claims

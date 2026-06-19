@@ -1426,6 +1426,16 @@ karpenter:
   enabled: false
   nodeclaimPool:
     leaseName: rio-controller-nodeclaim-pool
+    # sh-043: GLOBAL ceiling on the concurrent-unlaunched NodeClaim
+    # population (`Launched≠True` ⟺ `status.providerID==""` — the
+    # `cluster.Synced()`-blocking proxy). Karpenter v1.11-1.13's
+    # provisioner busy-spins on `Synced()` while ANY NodeClaim across
+    # ALL NodePools lacks a providerID (aws/karpenter-provider-aws
+    # #7428: not-planned), so an uncapped cold-start mint starves
+    # rio-general. 50 ≈ 2.5-5s of `Synced()=false` per 10s tick at
+    # the observed ~10-20/s CreateFleet throughput (sh-043 §5a,
+    # unsourced — verify against iter9 per Q2).
+    maxInflightUnlaunched: 50
     # r35 bug_050: per-hw-class-prefix `consolidate_after` floor
     # (seconds). §13e routed Fetcher Pools through the nodeclaim_pool
     # reconciler, dropping Karpenter's `consolidateAfter: 10m` to the

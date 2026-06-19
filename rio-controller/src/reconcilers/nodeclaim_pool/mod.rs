@@ -439,6 +439,20 @@ pub struct NodeClaimPoolConfig {
     /// all owned NodeClaims, Registered + in-flight). Helm:
     /// `sla.maxFleetCores`.
     pub max_fleet_cores: u32,
+    /// sh-043: GLOBAL ceiling on the concurrent-unlaunched population
+    /// (`Launched≠True` ⟺ `status.providerID==""` — the
+    /// `cluster.Synced()`-blocking proxy). Karpenter v1.11-v1.13's
+    /// `provisioner.go::Reconcile` busy-spins on `Synced()` while ANY
+    /// NodeClaim across ALL NodePools lacks a providerID
+    /// (aws/karpenter-provider-aws#7428: not-planned), so an
+    /// uncapped cold-start mint starves rio-general. The third law
+    /// term (`ctrl.nodeclaim.mint-deficit-proportional`) bounds the
+    /// `Synced()=false` window. Default 50: Karpenter's CreateFleet
+    /// observed throughput is ~10-20/s (sh-043 §5a, unsourced —
+    /// verify against iter9's `nodeclaim_created_total` rate per
+    /// Q2), so 50 ≈ 2.5-5s of `Synced()=false` per 10s tick. Helm:
+    /// `karpenter.nodeclaimPool.maxInflightUnlaunched`.
+    pub max_inflight_unlaunched: u32,
     /// §13b lead-time Schmitt clamp ceiling (seconds). Helm:
     /// `sla.maxLeadTime`.
     pub max_lead_time: f64,
@@ -784,6 +798,12 @@ impl Default for NodeClaimPoolConfig {
             // local ceiling (derived from `karpenter.dataVolumeSize`).
             // ≈ 500Gi `dataVolumeSize` × 90% allocatable.
             max_node_disk: 450 * (1 << 30),
+            // sh-043: GLOBAL concurrent-unlaunched ceiling. 50 ≈
+            // 2.5-5s of `Synced()=false` per tick at the observed
+            // ~10-20/s CreateFleet throughput; ⌈D/50⌉ ticks to cover
+            // a D-deficit cold start when headroom replenishes each
+            // tick.
+            max_inflight_unlaunched: 50,
             metal_sizes: Vec::new(),
             fuse_cache_bytes: pool::pod::BUILDER_FUSE_CACHE_BYTES,
             fetcher_fuse_cache_bytes: pool::pod::FETCHER_FUSE_CACHE_BYTES,
@@ -2462,6 +2482,29 @@ impl NodeClaimPoolReconciler {
             return Ok(CoverResult::default());
         };
         let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
+        // sh-043: the `Synced()`-blocking population at LIST time
+        // (OWNER_LABEL-scoped — bounds rio's contribution to the
+        // global gate; rio-general's own NodeClaims are
+        // Karpenter-managed). `Launched=True` ⟺ providerID populated
+        // (`LiveNode` carries no direct providerID field), so
+        // `launched() != Some(true)` is the precise proxy;
+        // `!n.registered` excludes the impossible Registered-without-
+        // providerID; `!n.terminating()` excludes mid-Karpenter-GC
+        // `Launched=False` claims (drain <1s). Over-counts by THIS
+        // tick's `health::classify`-reaped claims (still in `live`
+        // with `launched()≠Some(true)` but deleted before
+        // `cover_deficit` runs) — the 1-tick conservative lag is
+        // intentional and bounded by the prior tick's mint count.
+        // NOT `self.inflight_created.len()`: at `cover_deficit`
+        // entry, `vanish_fold` has pruned it ⊆ `live`
+        // (`health.rs:364-365`), so the `launched()≠Some(true)`
+        // subset double-counts and the `Some(true)` boot-stage
+        // subset is not Synced()-blocking. The within-tick addend is
+        // the local `created.len()` below.
+        let live_unlaunched: u32 = live
+            .iter()
+            .filter(|n| !n.registered && !n.terminating() && n.launched() != Some(true))
+            .count() as u32;
         let mut created_cores = 0u32;
 
         // bug_050: the controller's mintable universe — the same
@@ -2515,6 +2558,18 @@ impl NodeClaimPoolReconciler {
                     class_created.get(&cell.0).copied().unwrap_or(0),
                 ),
                 fuse_cache_bytes: self.cfg.fuse_cache_bytes,
+                // sh-043: the third law term, recomputed per-cell
+                // from the SAME accumulate-across-cells shape as
+                // `created_cores`/`class_created` (the `created` Vec
+                // below is the this-tick-so-far Ok-count per the
+                // bug_015 polarity). When 0 → `claims.is_empty()` →
+                // the `:2536` continue fires; round-robin keeps
+                // cross-tick fairness.
+                inflight_headroom: self
+                    .cfg
+                    .max_inflight_unlaunched
+                    .saturating_sub(live_unlaunched)
+                    .saturating_sub(created.len() as u32),
             };
             let cover::Sizing {
                 claims,
@@ -4099,6 +4154,7 @@ mod tests {
             max_node_disk: 450 * GI,
             budget: u32::MAX,
             fuse_cache_bytes: 50 * GI,
+            inflight_headroom: u32::MAX,
         };
         let cell = Cell("hi-ebs-x86".into(), CapacityType::Spot);
         let none = HashSet::new();
@@ -4197,6 +4253,7 @@ mod tests {
                 max_node_disk: cfg.max_node_disk,
                 budget: u32::MAX,
                 fuse_cache_bytes: cfg.fuse_cache_bytes,
+                inflight_headroom: u32::MAX,
             };
             let cell = Cell("probe-x86".into(), CapacityType::Spot);
             let none = HashSet::new();

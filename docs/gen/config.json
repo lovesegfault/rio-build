@@ -832,6 +832,12 @@
         "description": "§13b deficit-cover budget cap (sum of `allocatable.cpu` across all owned NodeClaims, Registered + in-flight)."
       },
       {
+        "key": "nodeclaim_pool.max_inflight_unlaunched",
+        "type": "uint32",
+        "default": "50",
+        "description": "sh-043: GLOBAL ceiling on the concurrent-unlaunched population (`Launched≠True` ⟺ `status.providerID==\"\"` — the `cluster.Synced()`-blocking proxy)."
+      },
+      {
         "key": "nodeclaim_pool.max_lead_time",
         "type": "double",
         "default": "600.0",
