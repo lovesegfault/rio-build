@@ -61,6 +61,7 @@ message ResourceUsage {
   optional double cpu_seconds_total = 10;    // Cumulative cpu.stat usage_usec ÷ 1e6 since cgroup creation
   optional double peak_io_pressure_pct = 11; // max(io.pressure some avg10) over poll loop, [0.0, 100.0]
   optional uint64 peak_disk_bytes = 12;      // max(project-quota dqb_curspace) on overlay emptyDir; absent = no prjquota
+  optional uint64 cpu_throttled_usec = 13;   // sh-045 (transport-only): cgroup v2 cpu.stat throttled_usec — periods runnable tasks were throttled at the cpu.max quota. Shipped on heartbeat + completion; not yet a gating input (the future (Timeout, Cores) discriminator).
 }
 
 // ───────────────────────────────────────────────────────────────────────────

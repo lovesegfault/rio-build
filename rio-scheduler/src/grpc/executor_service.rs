@@ -1055,6 +1055,56 @@ impl ExecutorService for SchedulerGrpc {
         }
     }
 
+    // r[impl sched.executor.running-telemetry]
+    /// sh-045: cache the builder's periodic running-telemetry on
+    /// `SchedHint.last_reported_peaks`. Best-effort; the actor verifies
+    /// the token↔intent binding before the cache write.
+    async fn report_running_telemetry(
+        &self,
+        request: Request<rio_proto::types::ReportRunningTelemetryRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.executor_prologue(&request)?;
+        // r[impl sec.executor.identity-token+3]
+        // Same per-unary credential extraction as `report_outcome`: the
+        // metadata header is the only carrier (no body token field).
+        let auth_intent =
+            match self.credential_for(PayloadCredentialKind::Build { body_token: "" }, &request) {
+                Ok(ResolvedCredential::Executor(verified)) => verified.map(|v| v.claims.intent_id),
+                Ok(ResolvedCredential::StoreService(_)) => None,
+                Err(rej) => return Err(rej.into_status_counted("report_running_telemetry")),
+            };
+        let req = request.into_inner();
+        let exec_id: uuid::Uuid = req
+            .exec_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
+        // r[impl sched.executor.input-bounds+2]
+        // proto3 `double` admits ±Inf/NaN; bound at intake (the same
+        // filter `ObservedPeaks::from_report` applies, defence in depth).
+        let mut resources = req.resources.unwrap_or_default();
+        resources.cpu_seconds_total = resources
+            .cpu_seconds_total
+            .filter(|c| c.is_finite() && *c >= 0.0);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.actor
+            .send_unchecked(ActorCommand::ReportRunningTelemetry {
+                exec_id,
+                auth_intent,
+                peak_memory_bytes: req.peak_memory_bytes,
+                resources,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(Self::actor_error_to_status)?;
+        match reply_rx
+            .await
+            .map_err(|_| Status::internal("actor dropped ReportRunningTelemetry reply"))?
+        {
+            Ok(()) => Ok(Response::new(())),
+            Err(r) => Err(rejection_counted(&r, "report_running_telemetry")),
+        }
+    }
+
     /// Store-replica poll for claimable materialization jobs
     /// (substitution-replacement Phase A, design §2.2 item 1).
     ///

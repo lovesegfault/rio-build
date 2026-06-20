@@ -4739,6 +4739,12 @@ mod tests {
         {
             Err(Status::unavailable("not leader (standby replica)"))
         }
+        async fn report_running_telemetry(
+            &self,
+            _: Request<rio_proto::types::ReportRunningTelemetryRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unavailable("not leader (standby replica)"))
+        }
     }
 
     /// The scheduler LEADER: lists one claimable job and delivers its
@@ -4778,6 +4784,12 @@ mod tests {
             Ok(Response::new(
                 rio_proto::types::ReportMaterializationProgressResponse {},
             ))
+        }
+        async fn report_running_telemetry(
+            &self,
+            _: Request<rio_proto::types::ReportRunningTelemetryRequest>,
+        ) -> Result<Response<()>, Status> {
+            Ok(Response::new(()))
         }
     }
 

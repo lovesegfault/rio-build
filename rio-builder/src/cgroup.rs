@@ -524,9 +524,22 @@ pub(crate) fn parse_cpu_stat_usage_usec(content: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
+/// sh-045 (transport-only): cgroup v2 `cpu.stat` `throttled_usec` —
+/// cumulative microseconds runnable tasks were throttled at the
+/// `cpu.max` quota. High when `ninja -jN` over-subscribes; near-zero
+/// when `make -j1` saturates one core (the future `(Timeout, Cores)`
+/// discriminator). Same one-file-read as `usage_usec`.
+pub(crate) fn parse_cpu_stat_throttled_usec(content: &str) -> Option<u64> {
+    content
+        .lines()
+        .find(|l| l.starts_with("throttled_usec "))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+}
+
 /// Read a single-line decimal u64 file. cgroup v2 `memory.peak`,
 /// `memory.current`, etc. all use this format: `"12345\n"`.
-fn read_single_u64(path: &Path) -> Option<u64> {
+pub(crate) fn read_single_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
@@ -728,11 +741,16 @@ pub fn final_sample(
     peak_disk_bytes: Option<u64>,
     prev: rio_proto::types::ResourceUsage,
 ) -> rio_proto::types::ResourceUsage {
-    let cpu_seconds_total = fs::read_to_string(root.join("cpu.stat"))
-        .ok()
-        .and_then(|c| parse_cpu_stat_usage_usec(&c))
+    let cpu_stat = fs::read_to_string(root.join("cpu.stat")).ok();
+    let cpu_seconds_total = cpu_stat
+        .as_deref()
+        .and_then(parse_cpu_stat_usage_usec)
         .map(|u| u as f64 / 1e6)
         .or(prev.cpu_seconds_total);
+    let cpu_throttled_usec = cpu_stat
+        .as_deref()
+        .and_then(parse_cpu_stat_throttled_usec)
+        .or(prev.cpu_throttled_usec);
     let peak_io_pressure_pct = fs::read_to_string(root.join("io.pressure"))
         .ok()
         .and_then(|s| parse_io_pressure_some_avg10(&s))
@@ -743,6 +761,7 @@ pub fn final_sample(
         .or(prev.peak_disk_bytes);
     rio_proto::types::ResourceUsage {
         cpu_seconds_total,
+        cpu_throttled_usec,
         peak_io_pressure_pct,
         peak_disk_bytes,
         ..prev
@@ -847,9 +866,8 @@ pub async fn utilization_reporter_loop_with_shutdown(
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
         }
 
-        let now_usage = fs::read_to_string(&cpu_stat_path)
-            .ok()
-            .and_then(|c| parse_cpu_stat_usage_usec(&c));
+        let cpu_stat = fs::read_to_string(&cpu_stat_path).ok();
+        let now_usage = cpu_stat.as_deref().and_then(parse_cpu_stat_usage_usec);
         let now_instant = std::time::Instant::now();
 
         let mem_current = read_single_u64(&mem_current_path);
@@ -913,6 +931,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
             // SLA model wants total CPU-seconds per build; with one build
             // per pod the post-build snapshot ≈ the build's CPU-seconds.
             cpu_seconds_total: now_usage.map(|u| u as f64 / 1e6),
+            cpu_throttled_usec: cpu_stat.as_deref().and_then(parse_cpu_stat_throttled_usec),
             peak_io_pressure_pct: Some(peak_io_pressure_pct),
             peak_disk_bytes,
         };
@@ -984,6 +1003,33 @@ mod tests {
                        system_usec 23456789\n\
                        nr_periods 0\n";
         assert_eq!(parse_cpu_stat_usage_usec(content), Some(123_456_789));
+    }
+
+    #[test]
+    fn parse_cpu_stat_throttled_usec_happy() {
+        let content = "usage_usec 123456789\n\
+                       user_usec 100000000\n\
+                       nr_periods 42\n\
+                       nr_throttled 7\n\
+                       throttled_usec 5678\n";
+        assert_eq!(parse_cpu_stat_throttled_usec(content), Some(5678));
+        // No cpu.max set → no throttling fields.
+        assert_eq!(parse_cpu_stat_throttled_usec("usage_usec 1\n"), None);
+    }
+
+    /// sh-045: `final_sample` populates `cpu_throttled_usec` from the
+    /// same `cpu.stat` read as `cpu_seconds_total` (no extra syscall).
+    #[test]
+    fn report_running_telemetry_ticks_from_cgroup_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cpu.stat"),
+            "usage_usec 6480000000\nthrottled_usec 540000000\n",
+        )
+        .unwrap();
+        let ru = final_sample(dir.path(), None, rio_proto::types::ResourceUsage::default());
+        assert_eq!(ru.cpu_seconds_total, Some(6480.0));
+        assert_eq!(ru.cpu_throttled_usec, Some(540_000_000));
     }
 
     #[test]

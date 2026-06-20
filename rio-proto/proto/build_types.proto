@@ -809,6 +809,18 @@ message ReportMaterializationProgressRequest {
 }
 message ReportMaterializationProgressResponse {}
 
+// ── ReportRunningTelemetry (sh-045: periodic heartbeat carrying live
+//    cgroup peaks; best-effort, droppable — a missed heartbeat degrades
+//    to the witnessed-axis-only floor synthesis). The (peak_memory_bytes,
+//    ResourceUsage) shape mirrors CompletionReport's field-4 + field-8
+//    split: ResourceUsage.memory_used_bytes is CURRENT, not peak, so the
+//    kernel's memory.peak ships as a separate scalar.
+message ReportRunningTelemetryRequest {
+  string exec_id = 1;
+  uint64 peak_memory_bytes = 2;
+  ResourceUsage resources = 3;
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Build status (QueryBuildStatus)
 // ───────────────────────────────────────────────────────────────────────────

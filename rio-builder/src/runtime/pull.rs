@@ -362,6 +362,67 @@ impl PullTransport for AuthedPullTransport {
     }
 }
 
+/// sh-045: the running-telemetry ticker cadence. 5s (NOT the snapshot
+/// loop's 10s) so the worst-case `cpu_seconds` under-read at SIGKILL is
+/// ≤5s/60s ≈ 8.3% against `compute_bound_min_wall_secs=60` (a 20s
+/// under-read at the old cadence is gate-defeating: a true-0.90 cpu_util
+/// reads ≈0.60 and fails the 0.80 threshold). Each tick reads `cpu.stat`
+/// FRESH via `final_sample` (HF-1: not the cached snapshot) — eliminates
+/// the snapshot-staleness term.
+const TELEMETRY_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+// r[impl sched.executor.running-telemetry]
+/// sh-045: spawn the periodic running-telemetry heartbeat. Each tick
+/// reads `(memory.peak, final_sample(cpu.stat fresh))` from the parent
+/// cgroup and best-effort ships it via `ReportRunningTelemetry`. RPC
+/// error → `debug!` + continue (a dropped heartbeat degrades to the
+/// witnessed-axis-only fallback). The returned `JoinHandle` is aborted
+/// by the caller after `build_phase_with_abort` returns; the caller
+/// also does ONE final fresh-read+ship at that point so the last
+/// heartbeat is ≤0s stale at process exit.
+fn spawn_running_telemetry_ticker(
+    mut client: super::setup::WorkerClient,
+    executor_token: String,
+    exec_id: String,
+    cgroup_parent: std::path::PathBuf,
+    resources: crate::cgroup::ResourceSnapshotHandle,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(TELEMETRY_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let (peak_mem, ru) = sample_running_telemetry(&cgroup_parent, &resources);
+            let req = rio_proto::types::ReportRunningTelemetryRequest {
+                exec_id: exec_id.clone(),
+                peak_memory_bytes: peak_mem,
+                resources: Some(ru),
+            };
+            if let Err(e) = client
+                .report_running_telemetry(authed_request(req, &executor_token))
+                .await
+            {
+                tracing::debug!(error = %e, "ReportRunningTelemetry dropped (best-effort)");
+            }
+        }
+    })
+}
+
+/// One fresh `(memory.peak, ResourceUsage)` read from the parent cgroup.
+/// `final_sample` reads `cpu.stat` directly (HF-1: NOT the ≤10s-stale
+/// cached snapshot); `memory.peak` is the kernel's own running max
+/// (one-build-per-pod: the parent cgroup includes small rio-builder
+/// overhead, conservative).
+fn sample_running_telemetry(
+    cgroup_parent: &std::path::Path,
+    resources: &crate::cgroup::ResourceSnapshotHandle,
+) -> (u64, rio_proto::types::ResourceUsage) {
+    let peak_mem = crate::cgroup::read_single_u64(&cgroup_parent.join("memory.peak")).unwrap_or(0);
+    let prev = *resources.read().unwrap_or_else(|e| e.into_inner());
+    let ru = crate::cgroup::final_sample(cgroup_parent, None, prev);
+    (peak_mem, ru)
+}
+
 /// Ask for the assignment until the question is resolved.
 ///
 /// - Unservable (retryable RPC error: not-leader, recovery-gated,
@@ -1135,11 +1196,43 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     };
     spawn_build_task(*assignment, guard, &rt.build_ctx).await;
 
+    // sh-045: the running-telemetry heartbeat. Spawned AFTER the build
+    // task (so the cgroup is populated) with the SAME authed transport
+    // as the pull/report unaries; aborted after `build_phase_with_abort`
+    // returns (ticker lifetime is bounded by the assignment).
+    let telemetry_ticker = spawn_running_telemetry_ticker(
+        rt.scheduler_client.clone(),
+        executor_token.clone(),
+        exec_id.clone(),
+        rt.build_ctx.cgroup_parent.clone(),
+        rt.build_ctx.resources.clone(),
+    );
+
     let mut sink_rx = rt
         .pull_sink_rx
         .take()
         .expect("pull mode always carries the sink receiver");
     let completion = build_phase_with_abort(&rt.slot, &drv_path, &mut sink_rx, &rt.shutdown).await;
+    // One final fresh-read + ship BEFORE aborting the ticker, so the
+    // last heartbeat is ≤0s stale at process exit (not ≤5s).
+    {
+        let (peak_mem, ru) =
+            sample_running_telemetry(&rt.build_ctx.cgroup_parent, &rt.build_ctx.resources);
+        let req = rio_proto::types::ReportRunningTelemetryRequest {
+            exec_id: exec_id.clone(),
+            peak_memory_bytes: peak_mem,
+            resources: Some(ru),
+        };
+        if let Err(e) = rt
+            .scheduler_client
+            .clone()
+            .report_running_telemetry(authed_request(req, &executor_token))
+            .await
+        {
+            tracing::debug!(error = %e, "final ReportRunningTelemetry dropped (best-effort)");
+        }
+    }
+    telemetry_ticker.abort();
     let Some(completion) = completion else {
         // Cannot happen while build_ctx holds a sender; treat as a
         // builder bug and let the pod-terminal path classify it.

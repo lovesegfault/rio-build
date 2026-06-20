@@ -119,6 +119,7 @@
       "ListMaterializationJobsResponse",
       "ReportMaterializationProgressRequest",
       "ReportMaterializationProgressResponse",
+      "ReportRunningTelemetryRequest",
       "BuildStatus",
       "SubmitBuildRequest",
       "WatchBuildRequest",

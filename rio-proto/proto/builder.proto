@@ -1,6 +1,7 @@
 syntax = "proto3";
 package rio.builder;
 
+import "google/protobuf/empty.proto";
 import "build_types.proto";
 
 // Executor-facing RPCs served by the rio-scheduler process.
@@ -55,4 +56,16 @@ service ExecutorService {
   // Phase B; in Phase A the handler acknowledges and drops.
   rpc ReportMaterializationProgress(rio.types.ReportMaterializationProgressRequest)
       returns (rio.types.ReportMaterializationProgressResponse);
+
+  // sh-045: periodic running-telemetry heartbeat — (memory.peak,
+  // ResourceUsage snapshot) for the open attempt. Best-effort; the
+  // scheduler caches last-seen on SchedHint.last_reported_peaks for the
+  // controller-WITNESSED close to consume (a kubelet-SIGKILLed build
+  // never sends ReportOutcome, so without this the witnessed lane has no
+  // cpu_seconds). Auth: same per-unary token↔intent binding as
+  // ReportOutcome (sec.executor.identity-token, applied per-unary).
+  // Idempotency key: exec_id; a heartbeat for an unknown/closed exec is
+  // acknowledged and ignored.
+  rpc ReportRunningTelemetry(rio.types.ReportRunningTelemetryRequest)
+      returns (google.protobuf.Empty);
 }
