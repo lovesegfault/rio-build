@@ -1737,6 +1737,37 @@ mod tests {
         }
     }
 
+    // r[verify sched.floor.axis-trust]
+    /// sh-045 (f) — *proposition: a forged-HIGH `cpu_seconds` from the
+    /// heartbeat lane (cpu_util > TRUST_BAND_CORES) refuses on the
+    /// cores axis regardless of producer.* GREEN at c0 (the band gate
+    /// at `observe_peaks` is producer-agnostic; at c0 the
+    /// `Witnessed(_)` arm short-circuits earlier on `!hard_cores()`,
+    /// after c4 the band-refusal arm fires) — proves the trust
+    /// envelope survives the heartbeat producer.
+    #[test]
+    fn heartbeat_forged_cpu_seconds_band_refused() {
+        use rio_proto::types::AttemptTerminalReason as T;
+        let mut s = st();
+        s.sched.last_intent = Some(intent(0, 0, 32, 0));
+        // cpu_util = 32×600×5 / (600×32) = 5.0 > TRUST_BAND_CORES.
+        let forged = ObservedPeaks {
+            cpu_seconds: Some(32.0 * 600.0 * 5.0),
+            wall: Some(Duration::from_secs(600)),
+            ..Default::default()
+        };
+        let o = observe(
+            &mut s,
+            forged,
+            AttemptCloseReason::Witnessed(T::EvictedEmptyDirSizeLimit),
+        );
+        assert!(
+            !o.hard_promoted && !o.hard_grew && s.sched.resource_floor.cores == 0,
+            "forged-HIGH heartbeat cpu_seconds is band-refused on the \
+             witnessed lane (cores untouched)"
+        );
+    }
+
     // r[verify sched.executor.input-bounds+2]
     /// sh-041u r1 — *proposition: a forged-HIGH `cpu_seconds` (∞,
     /// NaN, or any `cpu_util > TRUST_BAND_CORES`) refuses on the

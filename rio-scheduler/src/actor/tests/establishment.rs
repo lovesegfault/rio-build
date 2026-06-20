@@ -1315,6 +1315,328 @@ async fn witnessed_emptydir_eviction_doubles_disk_floor_and_reaped_establishes()
     Ok(())
 }
 
+/// sh-045: drive the `ReportRunningTelemetry` intake (the builder's
+/// periodic heartbeat). Returns the actor's reply.
+async fn report_running_telemetry(
+    handle: &ActorHandle,
+    exec_id: uuid::Uuid,
+    auth_intent: &str,
+    peak_memory_bytes: u64,
+    resources: rio_proto::types::ResourceUsage,
+) -> Result<(), crate::actor::pull::PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportRunningTelemetry {
+            exec_id,
+            auth_intent: Some(auth_intent.into()),
+            peak_memory_bytes,
+            resources,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+// r[verify sched.floor.witnessed-peaks]
+// r[verify sched.floor.axis-trust]
+/// **sh-045 red-first (a) — the live-incident reproduction.**
+/// *Proposition: a CPU-saturated build kubelet-evicted on emptyDir
+/// sizeLimit, with a heartbeat cached, jumps `floor.cores` to prov_max
+/// at the witnessed establishment.* RED at c0: `observe_witnessed_floor`
+/// still calls `ObservedPeaks::witnessed()` which sets
+/// `cpu_seconds: None` — `floor.cores` stays 0 (the sh-045 incident:
+/// `floor = {mem:0, disk:2Gi, cores:0}` from `/tmp/rio-dev/sh045-drv.log`).
+#[tokio::test]
+async fn witnessed_emptydir_with_heartbeat_cpu_saturated_jumps_cores() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh045-wit-a";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, drv).await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    // Scheduler-side wall anchor: 1800s (≥ min_wall=60s).
+    assert!(handle.debug_backdate_running(drv, 1800).await?);
+    // Assigned: cores=4, mem=1 GiB, disk=1 GiB (under fixture ceilings).
+    handle.debug_seed_intent_cores(drv, 4, 3600).await?;
+    handle
+        .debug_seed_sched_hint(drv, Some(1 << 30), Some(1 << 30), None, None)
+        .await?;
+    // The builder's heartbeat: cpu_util = 6480/(1800×4) = 0.90 ≥ 0.8.
+    report_running_telemetry(
+        &handle,
+        exec_id,
+        drv,
+        512 << 20,
+        rio_proto::types::ResourceUsage {
+            cpu_seconds_total: Some(6480.0),
+            peak_disk_bytes: Some(512 << 20),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("heartbeat acked");
+    // Kubelet evicts on emptyDir sizeLimit (witnessed); the controller's
+    // terminal-absent reap establishes synchronously via the WITNESSED
+    // reason (the sh-039 pattern — no housekeeping tick needed).
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::EvictedEmptyDirSizeLimit,
+    )
+    .await
+    .expect("witnessed report acked");
+    let res = report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("synthesized Reaped acked");
+    assert!(matches!(
+        res,
+        crate::actor::pull::AttemptResolution::Resolved
+    ));
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.cores, 16,
+        "the heartbeat's cpu_seconds reaches observe_peaks: floor.cores \
+         jumps to prov_max (RED at c0: 0 — observe_witnessed_floor still \
+         synthesizes cpu_seconds=None)"
+    );
+    assert_eq!(
+        s.sched.resource_floor.disk_bytes,
+        2 << 30,
+        "the witnessed-disk axis hard-doubles (last.disk × 2.0)"
+    );
+    assert!(
+        s.sched.resource_floor.mem_bytes > 0 && s.sched.resource_floor.mem_bytes < (1 << 30),
+        "mem soft-observes (heartbeat peak_mem × 1.2 — \
+         Witnessed(EvictedEmptyDirSizeLimit) is NOT mem-hard)"
+    );
+    Ok(())
+}
+
+// r[verify sched.floor.witnessed-peaks]
+// r[verify sched.floor.axis-trust]
+/// **sh-045 red-first (b) — the OomKilled symmetric sibling.**
+/// *Proposition: a CPU-saturated build OOM-killed by kubelet, with a
+/// heartbeat cached, jumps `floor.cores` to prov_max AND hard-doubles
+/// mem.* RED at c0: `floor = {mem:2Gi, disk:0, cores:0}` — the cores
+/// axis stays 0 (cpu_seconds never reaches observe_peaks).
+#[tokio::test]
+async fn witnessed_oom_with_heartbeat_cpu_saturated_jumps_cores_and_mem() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh045-wit-b";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, drv).await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    assert!(handle.debug_backdate_running(drv, 1800).await?);
+    handle.debug_seed_intent_cores(drv, 4, 3600).await?;
+    handle
+        .debug_seed_sched_hint(drv, Some(1 << 30), Some(1 << 30), None, None)
+        .await?;
+    report_running_telemetry(
+        &handle,
+        exec_id,
+        drv,
+        1 << 30,
+        rio_proto::types::ResourceUsage {
+            cpu_seconds_total: Some(6480.0),
+            peak_disk_bytes: Some(512 << 20),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("heartbeat acked");
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("witnessed report acked");
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("synthesized Reaped acked");
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.cores, 16,
+        "Witnessed(OomKilled) with cpu_util=0.90: floor.cores jumps to \
+         prov_max (RED at c0: 0)"
+    );
+    assert_eq!(
+        s.sched.resource_floor.mem_bytes,
+        2 << 30,
+        "the witnessed-OOM axis hard-doubles mem (heartbeat peak_mem × 2.0)"
+    );
+    assert!(
+        s.sched.resource_floor.disk_bytes > 0 && s.sched.resource_floor.disk_bytes < (1 << 30),
+        "disk soft-observes (heartbeat peak_disk × 1.2 — \
+         Witnessed(OomKilled) is NOT disk-hard)"
+    );
+    Ok(())
+}
+
+// r[verify sched.floor.witnessed-peaks]
+/// **sh-045 (d) — negative control.** *Proposition: a witnessed
+/// emptyDir-eviction with NO heartbeat falls back to the
+/// witnessed-axis-only synthesis: `floor = {mem:0, disk:2×, cores:0}`
+/// — exact base behaviour.* GREEN at c0 AND head (proves chokepoint B's
+/// fallback branch preserves today).
+#[tokio::test]
+async fn witnessed_emptydir_no_heartbeat_falls_back_disk_only() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh045-wit-d";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, drv).await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    assert!(handle.debug_backdate_running(drv, 1800).await?);
+    handle.debug_seed_intent_cores(drv, 4, 3600).await?;
+    handle
+        .debug_seed_sched_hint(drv, Some(1 << 30), Some(1 << 30), None, None)
+        .await?;
+    // NO heartbeat. The witnessed close has no cpu_seconds source.
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::EvictedEmptyDirSizeLimit,
+    )
+    .await
+    .expect("witnessed report acked");
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("synthesized Reaped acked");
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.cores, 0,
+        "no heartbeat → no cpu_seconds → cores untouched (the axis-only \
+         fallback)"
+    );
+    assert_eq!(
+        s.sched.resource_floor.disk_bytes,
+        2 << 30,
+        "the witnessed-disk axis hard-doubles from last.disk (the \
+         fallback synthesis)"
+    );
+    assert_eq!(
+        s.sched.resource_floor.mem_bytes, 0,
+        "no heartbeat → no peak_mem → mem untouched"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.running-telemetry]
+/// **sh-045 (g) — lifecycle pin.** *Proposition: the heartbeat cache is
+/// cleared at the dispatch-mint restamp, so a stale prior-attempt's
+/// `cpu_seconds` cannot leak into a new attempt's witnessed close.*
+#[tokio::test]
+async fn heartbeat_cleared_on_redispatch() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh045-wit-g";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let a1 = pull_deliver(&handle, drv).await;
+    let exec_a: uuid::Uuid = a1.exec_id.parse()?;
+    report_running_telemetry(
+        &handle,
+        exec_a,
+        drv,
+        1 << 30,
+        rio_proto::types::ResourceUsage {
+            cpu_seconds_total: Some(9999.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("heartbeat acked");
+    assert!(
+        expect_drv(&handle, drv)
+            .await
+            .sched
+            .last_reported_peaks
+            .is_some(),
+        "heartbeat cached"
+    );
+    // Close attempt A (witnessed → Reaped, the synchronous path).
+    report_attempt_outcome(
+        &handle,
+        exec_a,
+        rio_proto::types::AttemptTerminalReason::EvictedEmptyDirSizeLimit,
+    )
+    .await
+    .expect("witnessed acked");
+    report_attempt_outcome(
+        &handle,
+        exec_a,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("Reaped acked");
+    // Re-dispatch: the mint restamps last_intent and MUST clear the
+    // heartbeat cache.
+    let a2 = pull_deliver(&handle, drv).await;
+    assert_ne!(a2.exec_id, a1.exec_id, "fresh attempt minted");
+    assert!(
+        expect_drv(&handle, drv)
+            .await
+            .sched
+            .last_reported_peaks
+            .is_none(),
+        "the dispatch-mint restamp clears last_reported_peaks (a stale \
+         prior-attempt heartbeat cannot leak into the new attempt's \
+         witnessed close)"
+    );
+    Ok(())
+}
+
+// r[verify sec.executor.identity-token+3]
+// r[verify sched.executor.running-telemetry]
+/// **sh-045 (i) — auth-before-side-effect.** *Proposition: a heartbeat
+/// whose attested intent does NOT match the attempt's drv is rejected
+/// `TokenMismatch` with the cache untouched.* A builder holding a valid
+/// token for drv X that learns drv Y's `exec_id` (UUIDv7, surfaced in
+/// job names/logs) must not be able to write Y's heartbeat cache.
+#[tokio::test]
+async fn heartbeat_wrong_intent_rejected() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh045-wit-i";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, drv).await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    let res = report_running_telemetry(
+        &handle,
+        exec_id,
+        "some-other-drv-hash",
+        1 << 30,
+        rio_proto::types::ResourceUsage {
+            cpu_seconds_total: Some(9999.0),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(res, Err(crate::actor::pull::PullRejection::TokenMismatch)),
+        "wrong attested intent → TokenMismatch (got {res:?})"
+    );
+    assert!(
+        expect_drv(&handle, drv)
+            .await
+            .sched
+            .last_reported_peaks
+            .is_none(),
+        "the auth check runs BEFORE the cache write — cache untouched"
+    );
+    Ok(())
+}
+
 // r[verify sched.attempt.witnessed-terminal+2]
 /// live_058-b (W10-CG-b precision matrix): every witnessed letter
 /// other than the two per-container kubelet attributions (OomKilled,

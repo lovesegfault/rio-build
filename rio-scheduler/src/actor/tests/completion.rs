@@ -6874,6 +6874,78 @@ async fn e3a_compute_bound_jumps_floor_cores_to_provisionable_max() -> TestResul
     Ok(())
 }
 
+// r[verify sched.floor.axis-trust]
+/// **sh-045 red-first (c) — THE ONE TRUE BASE-RED ANCHOR.** *Proposition:
+/// a worker-reported `Infra(DiskFull)` close with cpu_util ≥ threshold
+/// jumps `floor.cores` to the partition-aware provisionable max.* RED at
+/// `fd861de43`: `hard_cores()` is `matches!(ExecutorVariant|WorkerAbort)`
+/// — `Infra(_)` is excluded — so the cores arm at floor.rs short-circuits
+/// on `!reason.hard_cores()` and `floor.cores` stays 0. The
+/// worker-reported `Infra(*)` lane already CARRIES `cpu_seconds_total` at
+/// chokepoint #2; sh-045 makes it cores-Hard (the I-170/I-199
+/// not-derivation-intrinsic boundary).
+#[tokio::test]
+async fn infra_diskfull_cpu_saturated_jumps_cores() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh045-infra-disk";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let exec = open_pull_exec(&handle, drv).await;
+    // Scheduler-side wall anchor: 600s (≥ min_wall=60s).
+    assert!(handle.debug_backdate_running(drv, 600).await?);
+    // Assigned shape: cores=4, disk=1 GiB (under the fixture's 6 GiB
+    // ceiling so the disk-axis at-cap arm cannot mask), mem=1 GiB.
+    handle.debug_seed_intent_cores(drv, 4, 600).await?;
+    handle
+        .debug_seed_sched_hint(drv, Some(1 << 30), Some(1 << 30), None, None)
+        .await?;
+    // cpu_util = 2040 / (600 × 4) = 0.85 ≥ 0.8; disk peak at the
+    // assigned (DiskFull saturates at the kubelet-stamped sizeLimit).
+    pull_report_exec(
+        &handle,
+        exec,
+        drv,
+        PullReportPayload {
+            peak_memory_bytes: 256 << 20,
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_seconds_total: Some(2040.0),
+                peak_disk_bytes: Some(kubelet_minted_hard_limit(&crate::state::SolvedIntent {
+                    disk_bytes: 1 << 30,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            ..pull_payload(rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+                error_msg: rio_proto::DISK_FULL_MSG.into(),
+                failure_classification: Some(rio_proto::types::FailureClassification {
+                    class: rio_proto::types::FailureClass::DiskFull.into(),
+                    quota: None,
+                }),
+                ..Default::default()
+            })
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.cores, 16,
+        "Infra(DiskFull) is not derivation-intrinsic: cpu_util=0.85 jumps \
+         floor.cores to the partition-aware prov_max (RED at fd861de43: 0 — \
+         hard_cores() excluded Infra(_))"
+    );
+    assert!(
+        s.sched.resource_floor.disk_bytes >= (2 << 30),
+        "the disk axis hard-doubles (Infra(DiskFull) is disk-hard)"
+    );
+    assert!(
+        s.sched.resource_floor.mem_bytes > 0 && s.sched.resource_floor.mem_bytes < (1 << 30),
+        "mem soft-observes (peak × 1.2 — Infra(DiskFull) is NOT mem-hard)"
+    );
+    Ok(())
+}
+
 // r[verify sched.sla.reactive-floor+7]
 /// **sh-041u red-first (g)** — *proposition: an E3a row at mem-cap with
 /// cpu_util ≪ threshold stamps `row.floor_at_cap = false` (the
