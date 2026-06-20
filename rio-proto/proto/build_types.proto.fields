@@ -69,6 +69,7 @@ google.protobuf.Timestamp stop_time = 5;
 google.protobuf.Timestamp submitted_at = 9;
 google.protobuf.Timestamp timestamp = 3;
 optional ResourceUsage final_resources = 8;
+optional double wall_seconds = 4;
 optional string hw_class = 9;
 optional string node_name = 7;
 optional uint32 assigned_cores = 10;

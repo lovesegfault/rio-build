@@ -465,7 +465,16 @@ WIRE_SECS_CALL = re.compile(r"\bfrom_secs\s*\(")
 WIRE_SECS_LET_ANY = re.compile(
     r"\blet\s+(?:mut\s+)?(\w+)\s*(?::[^=;]*)?=\s*([^;]*?\.\w*_seconds\b(?!\s*\()[^;]*?);"
 )
-WIRE_SECS_PROTO_OPTIONAL = re.compile(r"\boptional\s+\w+\s+\w*_seconds\s*=")
+# Integer scalar types only: a `double`/`float` *_seconds field cannot
+# feed `Duration::from_secs(u64)` without an explicit cast (which the
+# inline/binding grammar already catches), and its f64 → Duration path
+# is `clamped_duration_secs` (the disallowed-method wrapper).
+# `ReportRunningTelemetryRequest.wall_seconds: optional double` is the
+# narrowing record (consumed via `clamped_duration_secs`,
+# floor.rs `from_witnessed`).
+WIRE_SECS_PROTO_OPTIONAL = re.compile(
+    r"\boptional\s+(?:u?int(?:32|64)|s?fixed(?:32|64)|sint(?:32|64))\s+\w*_seconds\s*="
+)
 
 
 def scan_proto_optional_seconds(src_root):

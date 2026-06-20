@@ -1494,7 +1494,7 @@ async fn witnessed_oom_with_heartbeat_cpu_saturated_jumps_cores_and_mem() -> Tes
 /// includes ~100-300 MiB rio-builder overhead) STILL hard-doubles the
 /// mem floor.* RED at r0: `max(last, hb) = 556 MiB > 256 MiB × 1.05`
 /// → `count_refusal("mem")` → `floor.mem_bytes = 0` → re-OOM at the
-/// same size (the regression vs the retired `ObservedPeaks::witnessed`
+/// same size (the regression vs the retired witnessed-only constructor,
 /// which passed exactly `last.mem_bytes`).
 #[tokio::test]
 async fn witnessed_oom_heartbeat_mem_overhead_still_hard_doubles() -> TestResult {

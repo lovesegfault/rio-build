@@ -1079,7 +1079,7 @@ impl ExecutorService for SchedulerGrpc {
             .parse()
             .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
         // r[impl sched.executor.input-bounds+2]
-        // proto3 `double` admits ±Inf/NaN; bound at intake — the SAME
+        // proto3 `double` admits ±Inf/NaN; bound at intake — the same
         // [`sanitize_cpu_seconds`] filter `ObservedPeaks::from_report`
         // applies (defence in depth, one shared predicate).
         let mut resources = req.resources.unwrap_or_default();
