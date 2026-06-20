@@ -1898,8 +1898,9 @@ mod tests {
     /// heartbeat lane (cpu_util > TRUST_BAND_CORES) refuses on the
     /// cores axis regardless of producer.* GREEN at c0 (the band gate
     /// at `observe_peaks` is producer-agnostic; at c0 the
-    /// `Witnessed(_)` arm short-circuits earlier on `!hard_cores()`,
-    /// after c4 the band-refusal arm fires) — proves the trust
+    /// `Witnessed(_)` arm short-circuits earlier on
+    /// `!axis_hard(Cores)`, after c4 the band-refusal arm fires) —
+    /// proves the trust
     /// envelope survives the heartbeat producer.
     #[test]
     fn heartbeat_forged_cpu_seconds_band_refused() {

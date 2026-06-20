@@ -6933,7 +6933,7 @@ async fn infra_diskfull_cpu_saturated_jumps_cores() -> TestResult {
         s.sched.resource_floor.cores, 16,
         "Infra(DiskFull) is not derivation-intrinsic: cpu_util=0.85 jumps \
          floor.cores to the partition-aware prov_max (RED at fd861de43: 0 — \
-         hard_cores() excluded Infra(_))"
+         the cores-axis predicate excluded Infra(_))"
     );
     assert!(
         s.sched.resource_floor.disk_bytes >= (2 << 30),

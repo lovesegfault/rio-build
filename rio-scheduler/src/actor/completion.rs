@@ -1348,7 +1348,7 @@ impl DagActor {
         // — read FRESH at the moment of the corroborated failure (so a
         // mask that opened during the attempt re-admits the larger
         // class). sh-041u r1: gated on the cores arm's own preconditions
-        // (`cpu_seconds ∧ wall ∧ hard_cores`) — the cost-table walk is
+        // (`cpu_seconds ∧ wall ∧ axis_hard(Cores)`) — the cost-table walk is
         // unused on every other close.
         let prov_max_cores =
             if peaks.cpu_seconds.is_some() && peaks.wall.is_some() && reason.axis_hard(Axis::Cores)

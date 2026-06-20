@@ -1236,7 +1236,7 @@ no-followups directive forbids.
 
 #r("sched.floor.timeout-cores-suppressed-metric")[
   The deadline-ratchet arm MUST increment
-  `rio_scheduler_timeout_cores_suppressed_total` when a `Timeout` close
+  #(refs.metric)("rio_scheduler_timeout_cores_suppressed_total") when a `Timeout` close
   carries `cpu_util ≥ compute_bound_threshold ∧ wall ≥ min_wall`, so the
   prevalence of parallel-starved Timeout is measurable before any future
   `(Timeout, Cores) → true` policy change.
