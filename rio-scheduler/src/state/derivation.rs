@@ -1008,7 +1008,7 @@ pub struct CaState {
     pub output_unchanged: bool,
 }
 
-// r[impl sched.sla.reactive-floor+7]
+// r[impl sched.sla.reactive-floor+8]
 /// Per-dimension resource floor for the NEXT dispatch (D4).
 ///
 /// sh-041u: every non-success worker close routes through ONE

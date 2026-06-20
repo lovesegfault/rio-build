@@ -1362,7 +1362,7 @@ async fn apply_soft_features_records_for_probe_lookup() {
     );
 }
 
-// r[verify sched.sla.reactive-floor+7]
+// r[verify sched.sla.reactive-floor+8]
 /// D4: `solve_intent_for` clamps its solved (mem, disk) at
 /// `resource_floor`. A derivation with `floor.mem=32GiB` (from prior
 /// `observe_peaks` cycles) gets a SpawnIntent with mem ≥ 32GiB
@@ -1481,7 +1481,7 @@ async fn solve_intent_for_clamps_at_ceil() {
         max_mem
     );
 
-    // r[verify sched.sla.reactive-floor+7]
+    // r[verify sched.sla.reactive-floor+8]
     // cores (a): forced_cores override above max_cores. The override path
     // emits raw `c.ceil()` with no `.min(max_cores)`; the chokepoint is
     // the only clamp.

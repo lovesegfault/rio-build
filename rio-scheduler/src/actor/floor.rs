@@ -460,7 +460,7 @@ impl From<&crate::sla::config::SlaConfig> for ObserveCfg {
     }
 }
 
-// r[impl sched.sla.reactive-floor+7]
+// r[impl sched.sla.reactive-floor+8]
 // r[impl sched.retry.promotion-exempt+4]
 /// sh-041u — the unified peak observe. For each axis with a `Some`
 /// peak: `floor.X = max(floor.X, peak_X × headroom(reason, X))
@@ -700,7 +700,7 @@ fn count_refusal(class: &'static str) {
     .increment(1);
 }
 
-// r[impl sched.attempt.witnessed-terminal+2]
+// r[impl sched.attempt.witnessed-terminal+3]
 /// live_058-b: the per-reason disposition table — controller-WITNESSED
 /// terminal letter → `Some(AttemptCloseReason::Witnessed(..))` for the
 /// TWO per-container kubelet attributions (OomKilled, sh-039's
@@ -1030,7 +1030,7 @@ mod tests {
         observe_peaks(s, peaks, reason, &CEIL, PROV_MAX, &CFG)
     }
 
-    // r[verify sched.sla.reactive-floor+7]
+    // r[verify sched.sla.reactive-floor+8]
     /// sh-041u red-first (a) — *proposition: a `CgroupOom` close with
     /// peaks on every axis hard-doubles MEM and soft-observes DISK.*
     /// Under the retired per-axis-witness shape, the OOM mint touched
@@ -1206,7 +1206,7 @@ mod tests {
         assert_eq!(floor, 0);
     }
 
-    // r[verify sched.sla.reactive-floor+7]
+    // r[verify sched.sla.reactive-floor+8]
     /// **sh-012 D4 cores axis** — *proposition: corroborated
     /// cpu_util ≥ threshold jumps cores; ≪ threshold leaves it.*
     /// (sh-041u: ported from the retired compute-bound-band.)
@@ -1982,7 +1982,7 @@ mod tests {
         ));
     }
 
-    // r[verify sched.attempt.witnessed-terminal+2]
+    // r[verify sched.attempt.witnessed-terminal+3]
     /// live_058-b: the witnessed-reason × establish-disposition
     /// product census (the R25 proof obligation — the injectivity of
     /// the promotion set is COUNTED from the generated table, never

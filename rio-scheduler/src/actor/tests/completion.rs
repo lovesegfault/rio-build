@@ -1133,7 +1133,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 /// `ReportAttemptOutcome` classification fill, which never
 /// promotes).
 // r[verify sched.retry.promotion-exempt+4]
-// r[verify sched.sla.reactive-floor+7]
+// r[verify sched.sla.reactive-floor+8]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -5399,7 +5399,7 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor+7]
+// r[verify sched.sla.reactive-floor+8]
 /// bug_027 companion red — the carried-at-ceiling cell of `set_dim`'s
 /// at_cap law: when the pod was DISPATCHED at the deadline cap (the
 /// carried `BoundIntent` rendered 86400s) and the mint-time solve
@@ -6811,7 +6811,7 @@ async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> Tes
 /// changed the ladder from ×2 to jump-to-max — ComputeBound has no
 /// threshold semantics, so the only useful next probe is the largest
 /// provisionable shape.
-// r[verify sched.sla.reactive-floor+7]
+// r[verify sched.sla.reactive-floor+8]
 // r[verify sched.retry.executor-variant-threshold]
 #[tokio::test]
 async fn e3a_compute_bound_jumps_floor_cores_to_provisionable_max() -> TestResult {
@@ -6946,7 +6946,7 @@ async fn infra_diskfull_cpu_saturated_jumps_cores() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor+7]
+// r[verify sched.sla.reactive-floor+8]
 /// **sh-041u red-first (g)** — *proposition: an E3a row at mem-cap with
 /// cpu_util ≪ threshold stamps `row.floor_at_cap = false` (the
 /// per-handler axis narrowing) so the kernel's `Poison(ComputeBoundAtCap)`

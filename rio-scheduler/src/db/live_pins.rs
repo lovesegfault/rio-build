@@ -1159,7 +1159,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.attempt.witnessed-terminal+2]
+    // r[verify sched.attempt.witnessed-terminal+3]
     /// live_058-b ([GEN-SET], the R23′ bind): the
     /// `observe_resource_floor` caller alphabet is MACHINE-PINNED —
     /// the fn doc's and the lib.rs HELP's "the callers are the

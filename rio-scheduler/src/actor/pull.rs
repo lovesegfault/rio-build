@@ -2283,7 +2283,7 @@ impl DagActor {
     /// Consumes the mark on commit; on tx failure or fence the mark
     /// stays in place and the establishment sweep backstops (same
     /// posture as [`Self::close_pull_attempt_uncharged`]).
-    // r[impl sched.attempt.witnessed-terminal+2]
+    // r[impl sched.attempt.witnessed-terminal+3]
     async fn establish_from_witnessed(
         &mut self,
         attempt: &crate::db::open_attempts::BuildAttempt,
@@ -2827,7 +2827,7 @@ impl DagActor {
             // attempt: the scheduler now holds the verdict — Resolved.
             return Ok(AttemptResolution::Resolved);
         }
-        // r[impl sched.attempt.witnessed-terminal+2]
+        // r[impl sched.attempt.witnessed-terminal+3]
         // live_058-c: the witnessed-terminal mark. The pod is GONE
         // (controller-witnessed terminal) while the attempt holds no
         // classification row — the worker's own report can only still

@@ -1204,6 +1204,55 @@ no-followups directive forbids.
   hint never empties the candidate set.
 ]
 
+#r("sched.floor.axis-trust")[
+  The per-axis hard-headroom gate MUST be ONE `(AttemptCloseReason ×
+  Axis) → bool` match with NO wildcard arm, so a new variant or new
+  `FailureClass` / `AttemptTerminalReason` payload cannot ship without
+  positioning on every axis. The cores-hard set is exactly the
+  not-derivation-intrinsic closes (the I-170/I-199 boundary):
+  `{ExecutorVariant, WorkerAbort, Witnessed(OomKilled |
+  EvictedEmptyDirSizeLimit), Infra(CgroupOom | DiskFull)}`. `Timeout`
+  MUST NOT be cores-hard --- `cpu_util` cannot discriminate
+  serial-saturated from parallel-saturated, the cores arm jumps to
+  `prov_max` so a wrong promotion costs `prov_max×` capacity, and the
+  deadline ratchet is the single-axis response. `Other` MUST NOT be
+  cores-hard (derivation-intrinsic; the build never reruns at the same
+  inputs). Soft 1.2× observe is NOT this chokepoint's concern --- it
+  stays on `peaks.X.is_some()`.
+]
+
+#r("sched.floor.witnessed-peaks")[
+  A controller-witnessed close MUST observe the attempt's last
+  builder-reported running telemetry --- `(peak_memory_bytes,
+  cpu_seconds_total, peak_disk_bytes)` from `last_reported_peaks` ---
+  when present, via the SAME `observe_peaks` consumer the
+  worker-reported lanes feed; absent telemetry MUST fall back to the
+  witnessed-axis-only synthesis (`peak = last_intent.X` on the reason's
+  named axis, every other axis explicit-zero). `ObservedPeaks` MUST have
+  exactly one constructor (`from_report`); chokepoints \#2/\#3/\#4 each
+  call it with real telemetry where it exists and explicit `0`/`None`
+  where it does not.
+]
+
+#r("sched.floor.timeout-cores-suppressed-metric")[
+  The deadline-ratchet arm MUST increment
+  `rio_scheduler_timeout_cores_suppressed_total` when a `Timeout` close
+  carries `cpu_util ≥ compute_bound_threshold ∧ wall ≥ min_wall`, so the
+  prevalence of parallel-starved Timeout is measurable before any future
+  `(Timeout, Cores) → true` policy change.
+]
+
+#r("sched.executor.running-telemetry")[
+  The pull-mode builder MUST periodically (≤10s; the implementation
+  uses 5s and reads `cpu.stat` fresh each tick so the residual
+  worst-case under-read at SIGKILL is ≤8.3% against `min_wall=60s`)
+  report `(exec_id, memory.peak, ResourceUsage snapshot)` via
+  `ReportRunningTelemetry`. The scheduler MUST verify the token↔intent
+  binding BEFORE the cache write, then cache last-seen on
+  `SchedHint.last_reported_peaks`, cleared in lockstep with
+  `last_intent` at the dispatch-mint restamp.
+]
+
 #r("sched.floor.compute-bound-provisionable")[
   A `ComputeBound` `resource_floor.cores` promotion MUST cap at the
   partition-aware provisionable maximum --- the largest
@@ -3835,7 +3884,7 @@ the SUM of the per-class headrooms, never unbounded).
   the pull transaction.
 ]
 
-#r("sched.attempt.witnessed-terminal+2")[
+#r("sched.attempt.witnessed-terminal+3")[
   The `ReportAttemptOutcome` intake MUST record an in-memory
   witnessed-terminal mark `(exec_id → witnessed_at, witnessed_reason)` for
   every pod-terminal letter that resolves to an open, unclassified build
@@ -3855,7 +3904,9 @@ the SUM of the per-class headrooms, never unbounded).
   gated on the establishment transaction's append+decide `won` flag so
   promotion fires at most once per attempt, ever; node-condition
   `EvictedDiskPressure` and every other witnessed letter MUST establish
-  classify-only, leaving the floor untouched. Marks MUST be consumed at
+  classify-only, leaving the floor untouched. The establishment MUST
+  consume `last_reported_peaks` for the observe call
+  (#rref("sched.floor.witnessed-peaks")). Marks MUST be consumed at
   establishment and pruned against the open-attempt view.
 ]
 The promotion narrowing is the I-199 non-recreation argument: the retired

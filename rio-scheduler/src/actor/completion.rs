@@ -1283,7 +1283,7 @@ impl DagActor {
             .collect()
     }
 
-    // r[impl sched.sla.reactive-floor+7]
+    // r[impl sched.sla.reactive-floor+8]
     // r[impl sched.trust.report-corroboration+6]
     /// sh-041u — the unified peak-observe wrapper for `drv_hash`.
     /// Thin wrapper around [`super::floor::observe_peaks`] that
@@ -2438,7 +2438,7 @@ impl DagActor {
             return;
         }
 
-        // r[impl sched.sla.reactive-floor+7]
+        // r[impl sched.sla.reactive-floor+8]
         // sh-041u chokepoint #2: ONE peak-observe call on every
         // non-success worker close, BEFORE the per-status fan-out.
         // The per-handler floor mints (the retired

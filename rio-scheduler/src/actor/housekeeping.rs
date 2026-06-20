@@ -1424,7 +1424,7 @@ impl DagActor {
             .build
             .into_iter()
             .filter_map(|attempt| {
-                // r[impl sched.attempt.witnessed-terminal+2]
+                // r[impl sched.attempt.witnessed-terminal+3]
                 // live_058-c: a controller-witnessed terminal attempt
                 // expires on the WITNESSED clock — the pod is gone, so
                 // the only report the slack still covers is one
@@ -1842,7 +1842,7 @@ impl DagActor {
             // once-per-attempt cap (live_058-b).
             return false;
         }
-        // r[impl sched.attempt.witnessed-terminal+2]
+        // r[impl sched.attempt.witnessed-terminal+3]
         // live_058-b: the witnessed reason feeds the per-reason
         // disposition table — witnessed-OomKilled (label
         // `witnessed_oom`) and sh-039's EvictedEmptyDirSizeLimit

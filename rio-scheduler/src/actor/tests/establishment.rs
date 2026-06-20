@@ -953,7 +953,7 @@ async fn report_attempt_outcome(
         .expect("actor alive")
 }
 
-// r[verify sched.attempt.witnessed-terminal+2]
+// r[verify sched.attempt.witnessed-terminal+3]
 /// live_058-c (W10-CG-a, the witnessed pair's first installment): a
 /// controller-witnessed terminal attempt establishes on the WITNESSED
 /// clock — `witnessed_at + establishment_report_slack` — while still
@@ -1057,7 +1057,7 @@ async fn witnessed_terminal_establishes_on_witnessed_clock() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal+2]
+// r[verify sched.attempt.witnessed-terminal+3]
 /// live_058-c: the mark is first-witnessed-wins. After the mark is
 /// aged past the slack, k level-triggered re-reports arrive — if a
 /// re-report advanced the witnessed clock the next sweep would be
@@ -1127,7 +1127,7 @@ async fn witnessed_mark_first_witnessed_wins_under_re_reports() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal+2]
+// r[verify sched.attempt.witnessed-terminal+3]
 /// live_058-b (W10-CG-b, the witnessed pair's second installment —
 /// the live incident shape, window AND floor in one scenario): the
 /// witnessed-OOM attempt establishes at witnessed+slack AND the mem
@@ -1188,7 +1188,7 @@ async fn witnessed_oom_promotes_mem_floor_at_establishment() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal+2]
+// r[verify sched.attempt.witnessed-terminal+3]
 // r[verify sched.attempt.synthesized-verdict+4]
 /// sh-039 — both walls in one scenario, the live incident shape: a
 /// kubelet emptyDir-sizeLimit eviction (witnessed
@@ -1639,7 +1639,7 @@ async fn heartbeat_wrong_intent_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal+2]
+// r[verify sched.attempt.witnessed-terminal+3]
 /// live_058-b (W10-CG-b precision matrix): every witnessed letter
 /// other than the two per-container kubelet attributions (OomKilled,
 /// sh-039's EvictedEmptyDirSizeLimit) establishes at witnessed+slack
@@ -1705,7 +1705,7 @@ async fn witnessed_eviction_letters_establish_classify_only() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal+2]
+// r[verify sched.attempt.witnessed-terminal+3]
 /// live_058-b (W10-CH — the once-per-attempt cap of the I-199
 /// non-recreation argument): k level-triggered re-reports before the
 /// sweep, the establishment pass, a late re-report, and a replayed
