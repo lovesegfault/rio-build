@@ -226,7 +226,7 @@ impl ObservedPeaks {
         Self {
             mem_bytes: (peak_memory_bytes > 0).then_some(peak_memory_bytes),
             disk_bytes: peak_disk_bytes.filter(|&d| d > 0),
-            cpu_seconds: sanitize_cpu_seconds(cpu_seconds_total),
+            cpu_seconds: sanitize_positive_finite_secs(cpu_seconds_total),
             wall: None,
         }
     }
@@ -265,14 +265,14 @@ impl ObservedPeaks {
     ) -> Self {
         let mem_hard = reason.axis_hard(Axis::Mem);
         let disk_hard = reason.axis_hard(Axis::Disk);
-        let witnessed_axis_peak = |hard: bool, last: u64, hb: u64, ceiling: u64| -> u64 {
-            if hard { last } else { hb.min(ceiling) }
-        };
         match hb {
             Some(&(wall_s, peak_mem, ref ru)) => {
-                let mem_ceiling = (last.mem_bytes as f64 * TRUST_BAND_MEM) as u64;
                 let mut p = Self::from_report(
-                    witnessed_axis_peak(mem_hard, last.mem_bytes, peak_mem, mem_ceiling),
+                    if mem_hard {
+                        last.mem_bytes
+                    } else {
+                        peak_mem.min(mem_trust_ceiling(last.mem_bytes))
+                    },
                     ru.cpu_seconds_total,
                     // Disk: heartbeat `peak_disk_bytes` is the same
                     // prjquota running-max the worker-reported lane
@@ -281,16 +281,16 @@ impl ObservedPeaks {
                     // `overlay_size_limit_bytes(.., H_MAX) + slack` —
                     // a true peak never exceeds it; pass-through is
                     // chokepoint-#2-symmetric.
-                    Some(if disk_hard {
-                        last.disk_bytes
+                    if disk_hard {
+                        Some(last.disk_bytes)
                     } else {
-                        ru.peak_disk_bytes.unwrap_or(0)
-                    }),
+                        ru.peak_disk_bytes
+                    },
                 );
                 // The heartbeat's wall is sampled with `cpu_seconds`
                 // (same instant). `observe_resource_floor` caps it at
                 // the scheduler's `running_since` anchor.
-                p.wall = sanitize_cpu_seconds(Some(wall_s))
+                p.wall = sanitize_positive_finite_secs(Some(wall_s))
                     .map(rio_common::clamped::clamped_duration_secs);
                 p
             }
@@ -306,33 +306,71 @@ impl ObservedPeaks {
 // r[impl sched.executor.input-bounds+2]
 /// sh-041u r1: proto3 `double` admits ±Inf/NaN and arbitrarily large
 /// finite — bounded at intake so the cores arm never divides a
-/// non-finite numerator. Shared by [`ObservedPeaks::from_report`] and
-/// the gRPC heartbeat intake (defence in depth) so the predicates
-/// cannot drift.
-pub fn sanitize_cpu_seconds(c: Option<f64>) -> Option<f64> {
+/// non-finite numerator and the wall-anchor never reaches
+/// `clamped_duration_secs` non-finite. Shared by
+/// [`ObservedPeaks::from_report`] (cpu), [`ObservedPeaks::from_witnessed`]
+/// (wall), and the gRPC heartbeat intake (cpu + wall) so the predicates
+/// cannot drift. sh-045 r2: `cpu_seconds = 0` from a RUNNING build is
+/// degenerate (the sample raced cgroup creation) — the `> 0.0` gate
+/// treats it as `None`, which the unification of the `from_report` and
+/// intake filters made explicit (the pre-r1 intake filter admitted
+/// `Some(0.0)`; `from_report` never did).
+pub fn sanitize_positive_finite_secs(c: Option<f64>) -> Option<f64> {
     c.filter(|&c| c.is_finite() && c > 0.0)
 }
 
+/// sh-045 r2: the mem-axis trust ceiling — `assigned × TRUST_BAND_MEM`.
+/// ONE body so [`ObservedPeaks::from_witnessed`]'s off-axis clamp
+/// equals what [`observe_sizing_axis`] refuses at — they cannot drift
+/// (the false-positive-on-`uncorroborated_sizing_claim_total` the
+/// witnessed constructor exists to prevent).
+fn mem_trust_ceiling(assigned: u64) -> u64 {
+    (assigned as f64 * TRUST_BAND_MEM) as u64
+}
+
 // r[impl sched.floor.timeout-cores-suppressed-metric]
-/// sh-045 r1 — the cores-arm utilization gate. Returns
-/// `Some(cpu_util)` iff the input WOULD fire the cores promotion:
-/// `wall ≥ min_wall ∧ threshold ≤ cpu_util ≤ TRUST_BAND_CORES`. The
-/// real cores arm AND the `timeout_cores_suppressed` emit-guard both
-/// call it, so the metric counts exactly the population it claims to
-/// mirror (the r0 emit-guard omitted the [`TRUST_BAND_CORES`] ceiling
-/// and over-counted band-refused inputs).
-fn cpu_util_gate(cpu: f64, wall: Duration, last_cores: u32, cfg: &ObserveCfg) -> Option<f64> {
+/// sh-045 r2 — the cores-arm utilization gate, returning ONE of four
+/// distinguishable outcomes so every consumer (cores promotion,
+/// `timeout_cores_suppressed`, `count_refusal("cores")`) matches on
+/// the same derived value with NO recomputation.
+#[derive(Debug, Clone, Copy)]
+enum CpuUtilGate {
+    /// `wall ≥ min_wall ∧ threshold ≤ cpu_util ≤ TRUST_BAND_CORES` —
+    /// the input WOULD fire the cores promotion.
+    Passed,
+    /// `wall ≥ min_wall ∧ (cpu_util > TRUST_BAND_CORES ∨ NaN)` —
+    /// forged-HIGH `cpu_seconds` (or non-finite). The counted
+    /// `count_refusal("cores")` population.
+    BandRefused,
+    /// `wall ≥ min_wall ∧ cpu_util < threshold` — not compute-bound.
+    BelowThreshold,
+    /// `last_cores == 0 ∨ wall < min_wall` — preconditions unmet
+    /// (trivially-short / cold-start).
+    Ineligible,
+}
+
+/// See [`CpuUtilGate`]. The r0 emit-guard omitted the
+/// [`TRUST_BAND_CORES`] ceiling and over-counted band-refused inputs;
+/// the r1 `Option<f64>` collapsed three states into `None` so the
+/// band-refusal counter recomputed `wall.as_secs_f64()`, `cpu_util`,
+/// the `min_wall`/NaN/band checks. This tri-state is the ONE predicate.
+fn cpu_util_gate(cpu: f64, wall: Duration, last_cores: u32, cfg: &ObserveCfg) -> CpuUtilGate {
     let wall_s = wall.as_secs_f64();
     if last_cores == 0 || wall_s < cfg.compute_bound_min_wall_secs {
-        return None;
+        return CpuUtilGate::Ineligible;
     }
     let cpu_util = cpu / (wall_s * f64::from(last_cores));
     // sh-041u r2: a NaN that bypasses the `from_report` intake filter
     // is band-refused here as the [`TRUST_BAND_CORES`] doc claims —
     // explicit `is_nan()` so clippy's `neg_cmp_op_on_partial_ord`
     // autofix can't silently re-open the hole.
-    (!cpu_util.is_nan() && cpu_util >= cfg.compute_bound_threshold && cpu_util <= TRUST_BAND_CORES)
-        .then_some(cpu_util)
+    if cpu_util.is_nan() || cpu_util > TRUST_BAND_CORES {
+        CpuUtilGate::BandRefused
+    } else if cpu_util >= cfg.compute_bound_threshold {
+        CpuUtilGate::Passed
+    } else {
+        CpuUtilGate::BelowThreshold
+    }
 }
 
 // r[impl sched.trust.report-corroboration+6]
@@ -512,7 +550,8 @@ impl AttemptCloseReason {
             (Witnessed(T::EvictedEmptyDirSizeLimit), Cores) => true,
             // ── Witnessed(other) — UNREACHABLE BY CONSTRUCTION:
             //    [`witnessed_disposition`] is the SOLE producer of
-            //    `Witnessed(..)` (gated by `observe_witnessed_floor`),
+            //    `Witnessed(..)` (gated by `observe_witnessed_floor`;
+            //    quantifier: census(witnessed_disposition_product_census)),
             //    and it returns `None` for every letter below. A
             //    future flip there (e.g. `EvictedDiskPressure` →
             //    `Some`) compiles cleanly THEN panics here on first
@@ -648,7 +687,7 @@ pub fn observe_peaks(
             &mut o,
             Axis::Mem,
             peak,
-            (last_mem as f64 * TRUST_BAND_MEM) as u64,
+            mem_trust_ceiling(last_mem),
             last_mem / 2,
             reason.axis_hard(Axis::Mem),
             mem_solve_cap(ceil),
@@ -697,6 +736,7 @@ pub fn observe_peaks(
     // `last_intent.deadline_secs` (bug_027: `max(resolved, carried)`
     // — a carried deadline at the cap reads as `wall ≥ cap` and takes
     // the counted at-cap arm).
+    let mut deadline_promoted = false;
     if reason.axis_hard(Axis::Deadline) {
         match (peaks.wall, last_deadline) {
             (Some(wall), assigned) if assigned > 0 => {
@@ -707,6 +747,7 @@ pub fn observe_peaks(
                     let step = set_dim(&mut f, target, u64::from(DEADLINE_CAP_SECS));
                     floor.deadline_secs = f as u32;
                     o.fold_hard(Axis::Deadline, step);
+                    deadline_promoted = true;
                 } else {
                     count_refusal("timed_out");
                 }
@@ -728,35 +769,36 @@ pub fn observe_peaks(
     // `cpu_seconds`.
     if let (Some(cpu), Some(wall)) = (peaks.cpu_seconds, peaks.wall) {
         match cpu_util_gate(cpu, wall, last_cores, cfg) {
-            Some(_) if reason.axis_hard(Axis::Cores) => {
+            CpuUtilGate::Passed if reason.axis_hard(Axis::Cores) => {
                 let step =
                     bump_cores_to_provisionable(&mut floor.cores, last_cores, prov_max_cores);
                 o.fold_hard(Axis::Cores, step);
             }
             // r[impl sched.floor.timeout-cores-suppressed-metric]
-            // sh-045: count CPU-saturated Timeouts where the cores-arm
-            // gate WOULD have fired had `(Timeout, Cores)` been hard.
-            // ONE predicate (`cpu_util_gate`), two consumers — the
-            // metric counts exactly the population it claims to mirror.
-            // A non-trivial rate is the trigger to revisit `(Timeout,
-            // Cores)` once `cpu_throttled_usec` is gating; near-zero
-            // confirms the status quo.
-            Some(_) if reason.axis_hard(Axis::Deadline) => {
+            // sh-045 r2: count CPU-saturated Timeouts where the
+            // cores-arm gate WOULD have fired had `(Timeout, Cores)`
+            // been hard AND the deadline arm DID promote (r0's nesting
+            // — `last_deadline > 0 ∧ wall ≥ assigned/2` — restored;
+            // r1 widened to deadline-refused Timeouts and made any
+            // recorded baseline non-comparable). ONE predicate
+            // ([`cpu_util_gate`]), two consumers — the metric counts
+            // exactly the population it claims to mirror. A non-trivial
+            // rate is the trigger to revisit `(Timeout, Cores)` once
+            // `cpu_throttled_usec` is gating; near-zero confirms the
+            // status quo.
+            CpuUtilGate::Passed if deadline_promoted => {
                 metrics::counter!("rio_scheduler_timeout_cores_suppressed_total").increment(1);
             }
-            Some(_) | None => {}
-        }
-        // The band-refused counted refusal: `cpu_util > TRUST_BAND_CORES`
-        // (or NaN). Only counted on cores-hard reasons (the lane that
-        // would otherwise have promoted) — matches r0's gate.
-        if reason.axis_hard(Axis::Cores)
-            && last_cores > 0
-            && wall.as_secs_f64() >= cfg.compute_bound_min_wall_secs
-        {
-            let cpu_util = cpu / (wall.as_secs_f64() * f64::from(last_cores));
-            if cpu_util.is_nan() || cpu_util > TRUST_BAND_CORES {
+            // The band-refused counted refusal — only on cores-hard
+            // reasons (the lane that would otherwise have promoted).
+            // No recomputation: same [`cpu_util_gate`] derivation.
+            CpuUtilGate::BandRefused if reason.axis_hard(Axis::Cores) => {
                 count_refusal("cores");
             }
+            CpuUtilGate::Passed
+            | CpuUtilGate::BandRefused
+            | CpuUtilGate::BelowThreshold
+            | CpuUtilGate::Ineligible => {}
         }
     }
 

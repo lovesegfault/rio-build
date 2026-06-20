@@ -520,27 +520,30 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
     )
 }
 
-/// sh-045 r1: per-field max-merge of one heartbeat into the cache.
-/// `wall_seconds`, `peak_memory_bytes`, `cpu_seconds_total`,
-/// `cpu_throttled_usec`, `peak_disk_bytes` are all builder-monotone
-/// across one attempt; max-merging makes RPC ordering irrelevant (a
-/// stale ticker RPC landing after the final ship cannot regress them).
+/// sh-045 r2: per-field max-merge of one heartbeat into the cache.
+/// `wall_seconds` and `peak_memory_bytes` are builder-monotone across
+/// one attempt; the [`ResourceUsage`](rio_proto::types::ResourceUsage)
+/// monotone fields are handled by
+/// [`ResourceUsage::max_merge`](rio_proto::types::ResourceUsage::max_merge)
+/// (whose exhaustive destructure is the per-field-rule witness).
+/// Max-merging makes RPC ordering irrelevant — a stale ticker RPC
+/// landing after the abort-first final ship cannot regress any
+/// monotone field. `resources` is borrowed so the hot-path miss in
+/// [`DagActor::try_merge_heartbeat`] can fall through to the cold path
+/// without a by-value move.
 fn merge_heartbeat_peaks(
     slot: &mut Option<(f64, u64, rio_proto::types::ResourceUsage)>,
     wall_seconds: f64,
     peak_memory_bytes: u64,
-    mut resources: rio_proto::types::ResourceUsage,
+    resources: &rio_proto::types::ResourceUsage,
 ) {
-    if let Some((w, m, prev)) = slot.as_ref() {
-        resources.cpu_seconds_total = match (resources.cpu_seconds_total, prev.cpu_seconds_total) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
-        resources.cpu_throttled_usec = resources.cpu_throttled_usec.max(prev.cpu_throttled_usec);
-        resources.peak_disk_bytes = resources.peak_disk_bytes.max(prev.peak_disk_bytes);
-        *slot = Some((wall_seconds.max(*w), peak_memory_bytes.max(*m), resources));
-    } else {
-        *slot = Some((wall_seconds, peak_memory_bytes, resources));
+    match slot {
+        Some((w, m, cached)) => {
+            cached.max_merge(resources);
+            *w = (*w).max(wall_seconds);
+            *m = (*m).max(peak_memory_bytes);
+        }
+        None => *slot = Some((wall_seconds, peak_memory_bytes, *resources)),
     }
 }
 
@@ -2534,6 +2537,34 @@ impl DagActor {
         let _ = reply.send(result);
     }
 
+    /// sh-045 r2: the `node_mut(key) ∧ state.exec_id == exec_id →
+    /// merge_heartbeat_peaks` block, shared by the hot and cold
+    /// heartbeat arms. Returns `true` iff the cache was written. A new
+    /// top-level heartbeat field (like `wall_seconds` was) edits ONE
+    /// signature.
+    fn try_merge_heartbeat(
+        &mut self,
+        key: &str,
+        exec_id: Uuid,
+        wall_seconds: f64,
+        peak_memory_bytes: u64,
+        resources: &rio_proto::types::ResourceUsage,
+    ) -> bool {
+        if let Some(state) = self.dag.node_mut(key)
+            && state.exec_id == Some(exec_id)
+        {
+            merge_heartbeat_peaks(
+                &mut state.sched.last_reported_peaks,
+                wall_seconds,
+                peak_memory_bytes,
+                resources,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     async fn report_running_telemetry_inner(
         &mut self,
         exec_id: Uuid,
@@ -2542,9 +2573,6 @@ impl DagActor {
         peak_memory_bytes: u64,
         resources: rio_proto::types::ResourceUsage,
     ) -> Result<(), PullRejection> {
-        if !self.leader.is_leader() {
-            return Err(PullRejection::NotLeader);
-        }
         // r[impl sec.executor.identity-token+3]
         // sh-045 r1 hot path: `auth_intent` IS the dispatch intent's
         // drv_hash (server-minted at pull, [`ExecutorClaims::intent_id`]).
@@ -2556,17 +2584,17 @@ impl DagActor {
         // the ATTESTED intent and gated on `state.exec_id == exec_id`,
         // so a builder holding a token for drv X that learns drv Y's
         // `exec_id` cannot touch Y.
-        if let Some(auth) = auth_intent
-            && let Some(state) = self.dag.node_mut(auth)
-            && state.exec_id == Some(exec_id)
-        {
-            merge_heartbeat_peaks(
-                &mut state.sched.last_reported_peaks,
-                wall_seconds,
-                peak_memory_bytes,
-                resources,
-            );
-            return Ok(());
+        if let Some(auth) = auth_intent {
+            // The hot-path leader gate; the cold path's lives in
+            // [`Self::resolve_authed_attempt`] (sh-045 r2: the
+            // function-entry check ran twice on the cold path).
+            if !self.leader.is_leader() {
+                return Err(PullRejection::NotLeader);
+            }
+            if self.try_merge_heartbeat(auth, exec_id, wall_seconds, peak_memory_bytes, &resources)
+            {
+                return Ok(());
+            }
         }
         // Cold path: same prologue as `report_outcome_inner` (PG
         // resolve + token-binding); preserves `Err(TokenMismatch)` for
@@ -2582,16 +2610,13 @@ impl DagActor {
         // landing after the final ship — `abort()` is fire-and-forget
         // — cannot regress monotone fields). A heartbeat for a closed
         // attempt's exec_id finds no live node and no-ops.
-        if let Some(state) = self.dag.node_mut(attempt.core().drv_hash.as_str())
-            && state.exec_id == Some(exec_id)
-        {
-            merge_heartbeat_peaks(
-                &mut state.sched.last_reported_peaks,
-                wall_seconds,
-                peak_memory_bytes,
-                resources,
-            );
-        }
+        self.try_merge_heartbeat(
+            attempt.core().drv_hash.as_str(),
+            exec_id,
+            wall_seconds,
+            peak_memory_bytes,
+            &resources,
+        );
         Ok(())
     }
 

@@ -1329,7 +1329,7 @@
       {
         "name": "rio_scheduler_timeout_cores_suppressed_total",
         "kind": "counter",
-        "help": "sh-045: a Timeout close carried cpu_util ≥ compute_bound_threshold ∧ wall ≥ min_wall — the cores-arm gate WOULD have fired had (Timeout, Cores) been hard. Timeout is NOT cores-hard (cpu_util cannot discriminate serial-saturated from parallel-saturated; the cores arm jumps to prov_max so a wrong promotion costs prov_max× capacity); this counter measures whether parallel-starved Timeout actually occurs in production before any future (Timeout, Cores) → true policy change once cpu.stat throttled_usec is gating. No labels."
+        "help": "sh-045: a Timeout close whose deadline arm DID promote (last_deadline > 0 ∧ wall ≥ assigned/2) AND carried cpu_util ≥ compute_bound_threshold ∧ wall ≥ min_wall — the cores-arm gate WOULD have fired had (Timeout, Cores) been hard. Timeout is NOT cores-hard (cpu_util cannot discriminate serial-saturated from parallel-saturated; the cores arm jumps to prov_max so a wrong promotion costs prov_max× capacity); this counter measures whether parallel-starved Timeout actually occurs in production before any future (Timeout, Cores) → true policy change once cpu.stat throttled_usec is gating. No labels."
       },
       {
         "name": "rio_scheduler_topdown_prune_total",

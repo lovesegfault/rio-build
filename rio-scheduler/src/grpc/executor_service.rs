@@ -1080,13 +1080,17 @@ impl ExecutorService for SchedulerGrpc {
             .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
         // r[impl sched.executor.input-bounds+2]
         // proto3 `double` admits ±Inf/NaN; bound at intake — the same
-        // [`sanitize_cpu_seconds`] filter `ObservedPeaks::from_report`
-        // applies (defence in depth, one shared predicate).
+        // [`sanitize_positive_finite_secs`] filter
+        // `ObservedPeaks::from_report` applies (defence in depth, one
+        // shared predicate). sh-045 r2: this is a TIGHTENING vs the
+        // pre-r1 inline `>= 0.0` — `cpu_seconds = 0` from a running
+        // build is degenerate (the sample raced cgroup creation) and
+        // is now treated as `None` here as well as in `from_report`.
         let mut resources = req.resources.unwrap_or_default();
         resources.cpu_seconds_total =
-            crate::actor::floor::sanitize_cpu_seconds(resources.cpu_seconds_total);
+            crate::actor::floor::sanitize_positive_finite_secs(resources.cpu_seconds_total);
         let wall_seconds =
-            crate::actor::floor::sanitize_cpu_seconds(req.wall_seconds).unwrap_or(0.0);
+            crate::actor::floor::sanitize_positive_finite_secs(req.wall_seconds).unwrap_or(0.0);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.actor
             .send_unchecked(ActorCommand::ReportRunningTelemetry {

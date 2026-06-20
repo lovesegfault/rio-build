@@ -377,7 +377,7 @@ const TELEMETRY_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 /// aborted by the caller after `build_phase_with_abort` returns; the
 /// caller also fires ONE detached final ship at that point so the last
 /// heartbeat is ≤0s stale at process exit.
-fn spawn_running_telemetry_ticker(ship: TelemetryShip) -> tokio::task::JoinHandle<()> {
+fn spawn_running_telemetry_ticker(mut ship: TelemetryShip) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // sh-045 r1: first tick at t=TELEMETRY_TICK (not t=0 — the
         // immediate first tick was a guaranteed-wasted RPC + actor
@@ -417,8 +417,11 @@ impl TelemetryShip {
     /// (one-build-per-pod: the parent cgroup includes small
     /// rio-builder overhead; `from_witnessed` clamps it). RPC error →
     /// `debug!` + continue (a dropped heartbeat degrades to the
-    /// witnessed-axis-only fallback).
-    async fn ship_once(&self) {
+    /// witnessed-axis-only fallback). `&mut self` so the
+    /// tonic-generated `report_running_telemetry(&mut self, ..)` runs
+    /// without a per-tick `client.clone()`; both callers own the
+    /// `TelemetryShip` outright.
+    async fn ship_once(&mut self) {
         let peak_mem =
             crate::cgroup::read_single_u64(&self.cgroup_parent.join("memory.peak")).unwrap_or(0);
         let prev = *self.resources.read().unwrap_or_else(|e| e.into_inner());
@@ -431,7 +434,6 @@ impl TelemetryShip {
         };
         if let Err(e) = self
             .client
-            .clone()
             .report_running_telemetry(authed_request(req, &self.executor_token))
             .await
         {
@@ -1242,8 +1244,23 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     // per-field max-merge makes RPC ordering irrelevant (a still-in-
     // flight ticker RPC carrying a pre-final sample cannot regress
     // monotone fields).
+    //
+    // sh-045 r2: a sub-5s build sees ZERO ticker fires (first tick at
+    // t=5s) and this detached spawn is not joined — if process exit
+    // outraces the RPC the scheduler lands `hb = None`. That is the
+    // DESIGNED fallback at `ObservedPeaks::from_witnessed`
+    // (rio-scheduler/src/actor/floor.rs: the `hb = None` arm
+    // synthesises witnessed-axis-only, reproducing pre-sh-045
+    // behaviour exactly). In practice the spawn is issued BEFORE
+    // `report_until_acked(...).await` on the same channel to the same
+    // scheduler — the multi-threaded runtime runs `ship_once`
+    // concurrently and the outcome-ack cannot land before the
+    // heartbeat's send sequences on the shared connection.
     telemetry_ticker.abort();
-    tokio::spawn(async move { telemetry_ship.ship_once().await });
+    tokio::spawn(async move {
+        let mut ship = telemetry_ship;
+        ship.ship_once().await;
+    });
     let Some(completion) = completion else {
         // Cannot happen while build_ctx holds a sender; treat as a
         // builder bug and let the pod-terminal path classify it.

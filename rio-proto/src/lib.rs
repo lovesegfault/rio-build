@@ -124,6 +124,46 @@ pub mod types {
     tonic::include_proto!("rio.types");
 }
 
+impl types::ResourceUsage {
+    /// sh-045 r2: per-field max-merge of `other` into `self` for every
+    /// attempt-monotone field (cumulative counters and builder-side
+    /// running-max peaks). The scheduler's heartbeat cache calls this
+    /// so a stale ticker RPC landing after the abort-first final ship
+    /// cannot regress a monotone field — the "max-merge makes RPC
+    /// ordering irrelevant" guarantee holds for the WHOLE struct, not
+    /// an enumerated subset.
+    ///
+    /// Every `ResourceUsage` field added MUST take a row below — the
+    /// exhaustive destructure of `other` is the compile-time witness
+    /// (a new proto field fails this match until it is classified as
+    /// monotone-max-merged or gauge-ignored).
+    pub fn max_merge(&mut self, other: &Self) {
+        let Self {
+            // Gauge / capacity / config fields — NOT attempt-monotone.
+            // The heartbeat cache has no consumer for these; left as-is
+            // (first-writer) rather than last-writer so `max_merge`
+            // names exactly what it does.
+            cpu_fraction: _,
+            memory_used_bytes: _,
+            memory_total_bytes: _,
+            disk_used_bytes: _,
+            disk_total_bytes: _,
+            cpu_limit_cores: _,
+            // Attempt-monotone — max-merged below.
+            cpu_seconds_total,
+            peak_io_pressure_pct,
+            peak_disk_bytes,
+            cpu_throttled_usec,
+        } = *other;
+        self.cpu_seconds_total =
+            rio_common::opt_reduce(self.cpu_seconds_total, cpu_seconds_total, f64::max);
+        self.peak_io_pressure_pct =
+            rio_common::opt_reduce(self.peak_io_pressure_pct, peak_io_pressure_pct, f64::max);
+        self.peak_disk_bytes = self.peak_disk_bytes.max(peak_disk_bytes);
+        self.cpu_throttled_usec = self.cpu_throttled_usec.max(cpu_throttled_usec);
+    }
+}
+
 /// `DerivationEvent` helper ctors. The proto is flat (`kind` enum +
 /// per-kind payload fields) rather than a oneof of five near-empty
 /// messages; these restore the one-ctor-per-variant ergonomics at the

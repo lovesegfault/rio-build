@@ -393,8 +393,9 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_timeout_cores_suppressed_total",
-        "sh-045: a Timeout close carried cpu_util ≥ compute_bound_threshold ∧ \
-         wall ≥ min_wall — the cores-arm gate WOULD have fired had (Timeout, \
+        "sh-045: a Timeout close whose deadline arm DID promote (last_deadline \
+         > 0 ∧ wall ≥ assigned/2) AND carried cpu_util ≥ compute_bound_threshold \
+         ∧ wall ≥ min_wall — the cores-arm gate WOULD have fired had (Timeout, \
          Cores) been hard. Timeout is NOT cores-hard (cpu_util cannot \
          discriminate serial-saturated from parallel-saturated; the cores arm \
          jumps to prov_max so a wrong promotion costs prov_max× capacity); \

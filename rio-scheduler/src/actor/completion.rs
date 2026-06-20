@@ -1350,10 +1350,7 @@ impl DagActor {
         // no regression); a forged-LOW wall inflates cpu_util and is
         // band-refused by [`TRUST_BAND_CORES`].
         let anchored = state.running_since.map(|since| since.elapsed());
-        peaks.wall = match (peaks.wall, anchored) {
-            (Some(hb), Some(a)) => Some(hb.min(a)),
-            (hb, a) => hb.or(a),
-        };
+        peaks.wall = rio_common::opt_reduce(peaks.wall, anchored, std::cmp::min);
         // r[impl sched.floor.compute-bound-provisionable]
         // sh-031b: the cores axis caps at the partition-aware
         // provisionable max — feature/arch-routed AND non-ICE-exhausted
@@ -3568,10 +3565,7 @@ impl DagActor {
                                     && *c > 0.0
                                     && *c <= crate::sla::config::MAX_CORES_HARD
                             });
-                            match (assigned, cgroup) {
-                                (Some(a), Some(c)) => Some(a.min(c)),
-                                (a, c) => a.or(c),
-                            }
+                            rio_common::opt_reduce(assigned, cgroup, f64::min)
                         },
                         // Worker-supplied floats below: kept only when
                         // finite and inside their physical domain

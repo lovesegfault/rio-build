@@ -69,3 +69,17 @@ pub fn semaphore_permits(v: u64) -> usize {
         .unwrap_or(usize::MAX)
         .min(tokio::sync::Semaphore::MAX_PERMITS)
 }
+
+/// `(Some a, Some b) → Some(f a b); else a.or(b)`. The Option-reduce
+/// idiom hand-rolled at every "min/max two optional observations,
+/// preferring the one that exists" site (sh-045 r2 raised the count
+/// from 1 to 4). Takes the reducer as a closure so `f64` (no `Ord`)
+/// and `Ord` types share one body — `opt_reduce(a, b, f64::min)` /
+/// `opt_reduce(a, b, std::cmp::min)`.
+// r[impl common.helpers]
+pub fn opt_reduce<T>(a: Option<T>, b: Option<T>, f: impl FnOnce(T, T) -> T) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(f(a, b)),
+        (a, b) => a.or(b),
+    }
+}
