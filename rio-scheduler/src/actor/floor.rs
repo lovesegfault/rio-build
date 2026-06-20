@@ -353,7 +353,7 @@ enum CpuUtilGate {
 /// [`TRUST_BAND_CORES`] ceiling and over-counted band-refused inputs;
 /// the r1 `Option<f64>` collapsed three states into `None` so the
 /// band-refusal counter recomputed `wall.as_secs_f64()`, `cpu_util`,
-/// the `min_wall`/NaN/band checks. This tri-state is the ONE predicate.
+/// the `min_wall`/NaN/band checks. This four-state is the ONE predicate.
 fn cpu_util_gate(cpu: f64, wall: Duration, last_cores: u32, cfg: &ObserveCfg) -> CpuUtilGate {
     let wall_s = wall.as_secs_f64();
     if last_cores == 0 || wall_s < cfg.compute_bound_min_wall_secs {

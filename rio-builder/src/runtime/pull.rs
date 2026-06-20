@@ -1251,11 +1251,9 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     // DESIGNED fallback at `ObservedPeaks::from_witnessed`
     // (rio-scheduler/src/actor/floor.rs: the `hb = None` arm
     // synthesises witnessed-axis-only, reproducing pre-sh-045
-    // behaviour exactly). In practice the spawn is issued BEFORE
-    // `report_until_acked(...).await` on the same channel to the same
-    // scheduler — the multi-threaded runtime runs `ship_once`
-    // concurrently and the outcome-ack cannot land before the
-    // heartbeat's send sequences on the shared connection.
+    // behaviour exactly). Ordering between the detached ship and
+    // `report_until_acked` is NOT guaranteed (independent h2 streams);
+    // the `hb = None` arm is load-bearing.
     telemetry_ticker.abort();
     tokio::spawn(async move {
         let mut ship = telemetry_ship;
