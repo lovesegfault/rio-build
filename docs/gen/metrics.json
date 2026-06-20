@@ -213,6 +213,7 @@
     "rio_scheduler_store_degraded_requeues_total",
     "rio_scheduler_substituting_derivations",
     "rio_scheduler_tick_phase_seconds",
+    "rio_scheduler_timeout_cores_suppressed_total",
     "rio_scheduler_topdown_prune_total",
     "rio_scheduler_topdown_substitute_fail_total",
     "rio_scheduler_transition_rejected_total",
@@ -1414,6 +1415,11 @@
         "name": "rio_scheduler_tick_phase_seconds",
         "kind": "histogram",
         "help": "Per-phase housekeeping Tick latency (labeled by phase: 00-priority-sweep..18-snapshot-publish). Decomposes rio_scheduler_actor_cmd_seconds{cmd=Tick} the way merge_phase_seconds decomposes MergeDag: the Tick is a leader-only single-threaded actor turn, so one slow phase head-of-line blocks every queued RPC and starves admin-served probes — a phase in the tens-of-seconds buckets names the term to bound, instead of a log-silent stall."
+      },
+      {
+        "name": "rio_scheduler_timeout_cores_suppressed_total",
+        "kind": "counter",
+        "help": "sh-045: a Timeout close whose deadline arm DID promote (last_deadline > 0 ∧ wall ≥ assigned/2) AND carried cpu_util ≥ compute_bound_threshold ∧ wall ≥ min_wall — the cores-arm gate WOULD have fired had (Timeout, Cores) been hard. Timeout is NOT cores-hard (cpu_util cannot discriminate serial-saturated from parallel-saturated; the cores arm jumps to prov_max so a wrong promotion costs prov_max× capacity); this counter measures whether parallel-starved Timeout actually occurs in production before any future (Timeout, Cores) → true policy change once cpu.stat throttled_usec is gating. No labels."
       },
       {
         "name": "rio_scheduler_topdown_prune_total",
