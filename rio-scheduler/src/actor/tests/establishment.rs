@@ -1342,8 +1342,8 @@ async fn report_running_telemetry(
 /// *Proposition: a CPU-saturated build kubelet-evicted on emptyDir
 /// sizeLimit, with a heartbeat cached, jumps `floor.cores` to prov_max
 /// at the witnessed establishment.* RED at c0: `observe_witnessed_floor`
-/// still calls `ObservedPeaks::witnessed()` which sets
-/// `cpu_seconds: None` — `floor.cores` stays 0 (the sh-045 incident:
+/// still synthesized peaks with `cpu_seconds: None` (the now-retired
+/// witnessed constructor) — `floor.cores` stays 0 (the sh-045 incident:
 /// `floor = {mem:0, disk:2Gi, cores:0}` from `/tmp/rio-dev/sh045-drv.log`).
 #[tokio::test]
 async fn witnessed_emptydir_with_heartbeat_cpu_saturated_jumps_cores() -> TestResult {
@@ -1432,13 +1432,13 @@ async fn witnessed_oom_with_heartbeat_cpu_saturated_jumps_cores_and_mem() -> Tes
     assert!(handle.debug_backdate_running(drv, 1800).await?);
     handle.debug_seed_intent_cores(drv, 4, 3600).await?;
     handle
-        .debug_seed_sched_hint(drv, Some(1 << 30), Some(1 << 30), None, None)
+        .debug_seed_sched_hint(drv, Some(1 << 28), Some(1 << 30), None, None)
         .await?;
     report_running_telemetry(
         &handle,
         exec_id,
         drv,
-        1 << 30,
+        1 << 28,
         rio_proto::types::ResourceUsage {
             cpu_seconds_total: Some(6480.0),
             peak_disk_bytes: Some(512 << 20),
@@ -1470,8 +1470,10 @@ async fn witnessed_oom_with_heartbeat_cpu_saturated_jumps_cores_and_mem() -> Tes
     );
     assert_eq!(
         s.sched.resource_floor.mem_bytes,
-        2 << 30,
-        "the witnessed-OOM axis hard-doubles mem (heartbeat peak_mem × 2.0)"
+        1 << 29,
+        "the witnessed-OOM axis hard-doubles mem (last.mem × 2.0 — kubelet \
+         killed AT the limit, so the witnessed axis carries last.X \
+         regardless of heartbeat under-read)"
     );
     assert!(
         s.sched.resource_floor.disk_bytes > 0 && s.sched.resource_floor.disk_bytes < (1 << 30),

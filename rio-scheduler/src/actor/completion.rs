@@ -38,6 +38,7 @@ use crate::state::{
 };
 
 use super::DagActor;
+use super::floor::Axis;
 
 /// The identity witness of a late report's OWN execution (bug_098):
 /// minted ONLY where the fold resolved its evidence — the pull report
@@ -1350,7 +1351,8 @@ impl DagActor {
         // (`cpu_seconds ∧ wall ∧ hard_cores`) — the cost-table walk is
         // unused on every other close.
         let prov_max_cores =
-            if peaks.cpu_seconds.is_some() && peaks.wall.is_some() && reason.hard_cores() {
+            if peaks.cpu_seconds.is_some() && peaks.wall.is_some() && reason.axis_hard(Axis::Cores)
+            {
                 let feat = state.effective_features().as_slice();
                 let arch = rio_common::k8s::system_to_k8s_arch(&state.system);
                 let cost = self.cost_table.read();
@@ -1435,13 +1437,28 @@ impl DagActor {
         outcome
     }
 
-    /// sh-041u r1: chokepoint-#4 wrapper — both establishment-sweep
-    /// witnessed callers (housekeeping.rs / pull.rs) collapse to this
-    /// one call. The `witnessed_disposition` table gates the two
-    /// promoting letters; the `last_intent` lookup and the
-    /// `peak = last.X` synthesis live HERE so a future witnessed-axis
-    /// change edits one body. The `won`-gated once-per-attempt cap is
-    /// the caller's responsibility (live_058-b).
+    // r[impl sched.floor.witnessed-peaks]
+    /// sh-041u r1 + sh-045: chokepoint-#4 wrapper — both
+    /// establishment-sweep witnessed callers (housekeeping.rs /
+    /// pull.rs) collapse to this one call. The `witnessed_disposition`
+    /// table gates the two promoting letters; the peak-construction
+    /// lives HERE so a future witnessed-axis change edits one body.
+    ///
+    /// sh-045 chokepoint B: read `last_reported_peaks` (the builder's
+    /// heartbeat cache). When present, build `ObservedPeaks` from REAL
+    /// telemetry (the same `from_report` constructor chokepoints #2/#3
+    /// use); the witnessed-axis hard-doubling still applies because
+    /// `axis_hard(Mem|Disk)` is consulted by `observe_sizing_axis`.
+    /// When ABSENT (skew, sub-5s build, RPC-dropped), fall back to the
+    /// witnessed-axis-only synthesis (`peak = last.X` on the reason's
+    /// named axis, every other axis explicit-zero) — the structurally
+    /// honest "no off-axis evidence" that reproduces the pre-sh-045
+    /// behaviour exactly. `from_report` is the SOLE constructor;
+    /// chokepoints #2/#3/#4 each call it with REAL telemetry where it
+    /// exists and explicit `0`/`None` where it doesn't.
+    ///
+    /// The `won`-gated once-per-attempt cap is the caller's
+    /// responsibility (live_058-b).
     pub(super) async fn observe_witnessed_floor(
         &mut self,
         drv_hash: &DrvHash,
@@ -1450,14 +1467,42 @@ impl DagActor {
         let Some(reason) = super::floor::witnessed_disposition(terminal_reason) else {
             return;
         };
-        let Some(last) = self
-            .dag
-            .node(drv_hash)
-            .and_then(|s| s.sched.last_intent.as_ref())
-        else {
+        let Some(state) = self.dag.node(drv_hash) else {
             return;
         };
-        let peaks = super::floor::ObservedPeaks::witnessed(last, &reason);
+        let Some(last) = state.sched.last_intent.as_ref() else {
+            return;
+        };
+        let peaks = match state.sched.last_reported_peaks {
+            Some((peak_mem, ru)) => super::floor::ObservedPeaks::from_report(
+                // The witnessed axis carries `Some(last.X)` regardless
+                // of heartbeat (kubelet killed AT the limit; the
+                // heartbeat's last-sample may be ≤5s under-read).
+                if reason.axis_hard(Axis::Mem) {
+                    last.mem_bytes.max(peak_mem)
+                } else {
+                    peak_mem
+                },
+                ru.cpu_seconds_total,
+                Some(if reason.axis_hard(Axis::Disk) {
+                    last.disk_bytes.max(ru.peak_disk_bytes.unwrap_or(0))
+                } else {
+                    ru.peak_disk_bytes.unwrap_or(0)
+                }),
+            ),
+            // No heartbeat: the witnessed-axis-only synthesis (the
+            // pre-sh-045 behaviour). Explicit `0`/`None` on every
+            // off-axis so the soft-observe arms short-circuit.
+            None => super::floor::ObservedPeaks::from_report(
+                if reason.axis_hard(Axis::Mem) {
+                    last.mem_bytes
+                } else {
+                    0
+                },
+                None,
+                reason.axis_hard(Axis::Disk).then_some(last.disk_bytes),
+            ),
+        };
         let _ = self.observe_resource_floor(drv_hash, peaks, reason).await;
     }
 
@@ -4489,7 +4534,7 @@ impl DagActor {
         // (error_msg) is display/narration and drives nothing. sh-041u:
         // the observe ran at chokepoint #2 (the dispatch chokepoint
         // before this match); `floor_outcome` is threaded in. HARD
-        // headroom is gated on `reason.hard_mem()`/`hard_disk()`
+        // headroom is gated on `reason.axis_hard(Mem|Disk)`
         // (I-199: `CgroupOom` / `DiskFull` — the worker-reported
         // sizing signals; FUSE EIO / PutPath race /
         // store-replica-restart classify as `Other` and observe SOFT

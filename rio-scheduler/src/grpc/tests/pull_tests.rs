@@ -1688,6 +1688,17 @@ async fn every_executor_service_method_is_standby_gated() -> anyhow::Result<()> 
                 .await
                 .expect_err("standby")
                 .code(),
+            "ReportRunningTelemetry" => grpc
+                .report_running_telemetry(Request::new(
+                    rio_proto::types::ReportRunningTelemetryRequest {
+                        exec_id: uuid::Uuid::now_v7().to_string(),
+                        peak_memory_bytes: 0,
+                        resources: None,
+                    },
+                ))
+                .await
+                .expect_err("standby")
+                .code(),
             other => panic!(
                 "ExecutorService method {other:?} has no standby-sweep arm — add the arm \
                  AND the executor_prologue to its handler"

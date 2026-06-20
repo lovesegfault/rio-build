@@ -233,19 +233,6 @@ impl ObservedPeaks {
             wall: None,
         }
     }
-
-    /// Chokepoint #4: a controller-WITNESSED close has no
-    /// `CompletionReport` → no peaks. The assigned shape IS the peak
-    /// (kubelet killed AT the limit), so the witnessed axis carries
-    /// `Some(last.X)`; every other axis is `None` (untouched).
-    pub fn witnessed(last: &crate::state::SolvedIntent, reason: &AttemptCloseReason) -> Self {
-        Self {
-            mem_bytes: reason.hard_mem().then_some(last.mem_bytes),
-            disk_bytes: reason.hard_disk().then_some(last.disk_bytes),
-            cpu_seconds: None,
-            wall: None,
-        }
-    }
 }
 
 // r[impl sched.trust.report-corroboration+6]
@@ -320,56 +307,121 @@ impl AttemptCloseReason {
         }
     }
 
-    /// The mem-axis hard-event predicate (CgroupOom / witnessed-OOM).
-    pub(super) fn hard_mem(&self) -> bool {
-        use rio_proto::types::{AttemptTerminalReason as T, FailureClass};
-        matches!(
-            self,
-            Self::Infra(FailureClass::CgroupOom) | Self::Witnessed(T::OomKilled)
-        )
-    }
-
-    /// sh-041u r1: the cores-axis hard-event predicate — the
-    /// infra-side closes that cut off a still-running build
-    /// (`ExecutorVariant`: the build's own internal timeout / nix
-    /// `MiscFailure` — sh-031; `WorkerAbort`: SIGTERM for work the
-    /// scheduler still wants — the sh-041 spot-reclaim case). Mirrors
-    /// [`Self::hard_mem`] / [`Self::hard_disk`] / the deadline arm's
-    /// `matches!(Timeout)`: every other axis gates HARD headroom on
-    /// `reason`; without this gate the cores arm fired on `Other`
-    /// (E3b PermanentFailure / NotDeterministic / InputRejected /
-    /// LogLimitExceeded — derivation-intrinsic), persisting a
-    /// `prov_max` floor for a build that never reruns at the same
-    /// inputs (the I-170/I-199 over-fire on the cores axis).
+    // r[impl sched.floor.axis-trust]
+    /// sh-045 — the per-axis HARD-headroom gate. Replaces
+    /// `hard_{mem,disk,cores}()`: ONE `(reason, axis) → bool` match
+    /// with **NO `_` arm**, so a new `AttemptCloseReason` variant (or
+    /// new `FailureClass` / `AttemptTerminalReason` payload) cannot
+    /// ship without positioning on every axis (rustc exhaustiveness —
+    /// the §Nth-strike "Partition at type level" template). Soft 1.2×
+    /// observe is NOT this chokepoint's concern — soft stays on
+    /// sh-041u's `peaks.X.is_some()` → `observe_sizing_axis(..,
+    /// hard_claim: bool, ..)` path; `axis_hard` decides hard-promotion
+    /// ONLY.
     ///
-    /// sh-041u r2: `Witnessed(_)` is NOT a member — unlike
-    /// [`Self::hard_mem`] / [`Self::hard_disk`] which match a
-    /// specific witnessed letter, the witnessed lane carries no
-    /// `cpu_seconds` ([`ObservedPeaks::witnessed`] sets it `None`),
-    /// so the cores arm's `let (Some(cpu), Some(wall))` guard makes
-    /// any witnessed match dead. A wildcard here would admit every
-    /// future witnessed letter without per-letter review, bypassing
-    /// the discipline [`witnessed_disposition`]'s doc demands.
-    pub(super) fn hard_cores(&self) -> bool {
-        matches!(self, Self::ExecutorVariant | Self::WorkerAbort)
-    }
-
-    /// The disk-axis hard-event predicate (DiskFull / witnessed
-    /// emptyDir-sizeLimit). LIVE with TWO producers: (1) live_057-b —
-    /// the worker quota-attributed DiskFull lane (the TYPED
-    /// `failure_classification` wire field; `rio_proto::DISK_FULL_MSG`
-    /// is DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — merged_bug_100: free
-    /// text drives nothing); and (2) sh-039 — the
-    /// controller-witnessed pod-attributed emptyDir-sizeLimit
-    /// eviction. Node-condition `EvictedDiskPressure` stays
-    /// classify-only (I-199): [`witnessed_disposition`] returns
-    /// `None` for it, so it never reaches this predicate.
-    pub(super) fn hard_disk(&self) -> bool {
-        use rio_proto::types::{AttemptTerminalReason as T, FailureClass};
-        matches!(
-            self,
-            Self::Infra(FailureClass::DiskFull) | Self::Witnessed(T::EvictedEmptyDirSizeLimit)
-        )
+    /// **The cores-hard boundary is the I-170/I-199 line**: closes
+    /// where the build was running and the close is NOT
+    /// derivation-intrinsic (i.e., the same drv reruns at the same
+    /// inputs) — `{ExecutorVariant, WorkerAbort, Infra(CgroupOom |
+    /// DiskFull), Witnessed(OomKilled | EvictedEmptyDirSizeLimit)}`.
+    /// `Other` is out (derivation-intrinsic by definition: a build
+    /// that never reruns at the same inputs cannot benefit from a
+    /// `prov_max` floor — the I-170/I-199 over-fire). `Timeout` is out
+    /// by owner decision: `cpu_util` cannot discriminate
+    /// serial-saturated from parallel-saturated, the cores arm jumps to
+    /// `prov_max` so a wrong promotion costs `prov_max×` capacity, and
+    /// the discriminator (`cpu.stat throttled_usec`) is being plumbed
+    /// (transport-only) but not yet gating. Status quo pinned by
+    /// `cores_hard_promote_gated_on_reason`; the
+    /// `rio_scheduler_timeout_cores_suppressed_total` counter measures
+    /// prevalence before any future revisit.
+    ///
+    /// The Witnessed/Infra cores=Hard widening is safe under the
+    /// existing trust envelope: `wall` is scheduler-anchored
+    /// (`running_since.elapsed()`), `cpu_util ≤ TRUST_BAND_CORES`
+    /// ceiling-band-refuses forged-HIGH, `cpu_util ≥
+    /// compute_bound_threshold ∧ wall ≥ min_wall` floor-gates
+    /// trivially-short runs, the `won`-flag is the once-per-attempt
+    /// cap, and the M_044 `GREATEST()` ratchet is unchanged.
+    ///
+    /// Mem/disk: unchanged from the retired `hard_{mem,disk}()` —
+    /// `Infra(CgroupOom)` / `Witnessed(OomKilled)` are mem-hard;
+    /// `Infra(DiskFull)` / `Witnessed(EvictedEmptyDirSizeLimit)` are
+    /// disk-hard (live_057-b worker quota-attributed lane + sh-039
+    /// controller-witnessed lane; node-condition `EvictedDiskPressure`
+    /// stays classify-only by I-199 — [`witnessed_disposition`]
+    /// returns `None` for it so it never reaches this predicate).
+    /// Deadline: only `Timeout` is hard (the deadline ratchet's
+    /// existing `matches!` body, now a row here).
+    pub(super) fn axis_hard(&self, axis: Axis) -> bool {
+        use AttemptCloseReason::{ExecutorVariant, Infra, Other, Timeout, Witnessed, WorkerAbort};
+        use Axis::{Cores, Deadline, Disk, Mem};
+        use rio_proto::types::{AttemptTerminalReason as T, FailureClass as F};
+        match (self, axis) {
+            // ── Infra(CgroupOom) — worker per-container OOM attribution
+            (Infra(F::CgroupOom), Mem) => true,
+            (Infra(F::CgroupOom), Disk) => false,
+            (Infra(F::CgroupOom), Deadline) => false,
+            (Infra(F::CgroupOom), Cores) => true,
+            // ── Infra(DiskFull) — worker per-container quota attribution
+            (Infra(F::DiskFull), Mem) => false,
+            (Infra(F::DiskFull), Disk) => true,
+            (Infra(F::DiskFull), Deadline) => false,
+            (Infra(F::DiskFull), Cores) => true,
+            // ── Infra(Unspecified) — from_status routes to Self::Other
+            (Infra(F::Unspecified), Mem | Disk | Deadline | Cores) => {
+                unreachable!("from_status routes Unspecified → Self::Other")
+            }
+            // ── Timeout — worker self-kill at scheduler deadline (E5)
+            (Timeout, Mem) => false,
+            (Timeout, Disk) => false,
+            (Timeout, Deadline) => true,
+            (Timeout, Cores) => false,
+            // ── ExecutorVariant — heuristic exit≠0 (sh-031)
+            (ExecutorVariant, Mem) => false,
+            (ExecutorVariant, Disk) => false,
+            (ExecutorVariant, Deadline) => false,
+            (ExecutorVariant, Cores) => true,
+            // ── WorkerAbort — SIGTERM for still-wanted work (sh-041)
+            (WorkerAbort, Mem) => false,
+            (WorkerAbort, Disk) => false,
+            (WorkerAbort, Deadline) => false,
+            (WorkerAbort, Cores) => true,
+            // ── Witnessed(OomKilled) — kubelet per-container OOM
+            (Witnessed(T::OomKilled), Mem) => true,
+            (Witnessed(T::OomKilled), Disk) => false,
+            (Witnessed(T::OomKilled), Deadline) => false,
+            (Witnessed(T::OomKilled), Cores) => true,
+            // ── Witnessed(EvictedEmptyDirSizeLimit) — kubelet per-pod
+            //    emptyDir attribution (sh-039)
+            (Witnessed(T::EvictedEmptyDirSizeLimit), Mem) => false,
+            (Witnessed(T::EvictedEmptyDirSizeLimit), Disk) => true,
+            (Witnessed(T::EvictedEmptyDirSizeLimit), Deadline) => false,
+            (Witnessed(T::EvictedEmptyDirSizeLimit), Cores) => true,
+            // ── Witnessed(other) — witnessed_disposition gates the
+            //    alphabet to the two letters above
+            (
+                Witnessed(
+                    T::Unspecified
+                    | T::EvictedDiskPressure
+                    | T::EvictedOther
+                    | T::Completed
+                    | T::Error
+                    | T::DeadlineExceeded
+                    | T::Cancelled
+                    | T::Preempted
+                    | T::Reaped
+                    | T::NoEligibleSource,
+                ),
+                Mem | Disk | Deadline | Cores,
+            ) => unreachable!("witnessed_disposition returns None for these"),
+            // ── Other — derivation-intrinsic (E3b PermanentFailure /
+            //    NotDeterministic / InputRejected / LogLimitExceeded)
+            (Other, Mem) => false,
+            (Other, Disk) => false,
+            (Other, Deadline) => false,
+            (Other, Cores) => false,
+        }
     }
 
     /// The metric/log label — the caller-census alphabet, derived
@@ -475,7 +527,7 @@ pub fn observe_peaks(
             peak,
             (last_mem as f64 * TRUST_BAND_MEM) as u64,
             last_mem / 2,
-            reason.hard_mem(),
+            reason.axis_hard(Axis::Mem),
             mem_solve_cap(ceil),
             ("mem", "cgroup_oom"),
         );
@@ -505,7 +557,7 @@ pub fn observe_peaks(
             peak,
             eff_max,
             eff_min / 2,
-            reason.hard_disk(),
+            reason.axis_hard(Axis::Disk),
             ceil.max_disk,
             ("disk", "disk_full"),
         );
@@ -528,6 +580,22 @@ pub fn observe_peaks(
                     let step = set_dim(&mut f, target, u64::from(DEADLINE_CAP_SECS));
                     floor.deadline_secs = f as u32;
                     o.fold_hard(Axis::Deadline, step);
+                    // r[impl sched.floor.timeout-cores-suppressed-metric]
+                    // sh-045: count CPU-saturated Timeouts where the
+                    // cores-arm gate WOULD have fired had `(Timeout,
+                    // Cores)` been hard. A non-trivial rate is the
+                    // trigger to revisit `(Timeout, Cores)` once
+                    // `cpu_throttled_usec` is gating; near-zero
+                    // confirms the status quo.
+                    if let Some(cpu) = peaks.cpu_seconds
+                        && last_cores > 0
+                        && wall.as_secs_f64() >= cfg.compute_bound_min_wall_secs
+                        && cpu / (wall.as_secs_f64() * f64::from(last_cores))
+                            >= cfg.compute_bound_threshold
+                    {
+                        metrics::counter!("rio_scheduler_timeout_cores_suppressed_total")
+                            .increment(1);
+                    }
                 } else {
                     count_refusal("timed_out");
                 }
@@ -536,20 +604,20 @@ pub fn observe_peaks(
         }
     }
 
-    // ── cores (sh-012, sh-031, sh-041) ─────────────────────────────
+    // ── cores (sh-012, sh-031, sh-041, sh-045) ─────────────────────
     // r[impl sched.floor.compute-bound-provisionable]
     // `cpu_util = cpu_seconds / (wall × assigned_cores) ≥ threshold`
     // jumps cores to the partition-aware provisionable max. Gated on
-    // [`AttemptCloseReason::hard_cores`] — the infra-side closes
-    // only (sh-041: a compute-bound build interrupted by spot
-    // reclaim reports `WorkerAbort`; sh-031: a saturated build that
-    // exits on its own internal timeout BEFORE the nix deadline
-    // reports `ExecutorVariant`). `min_wall` guards trivially-short
-    // saturated runs (the inverse-cost bound); `TRUST_BAND_CORES`
-    // refuses forged-HIGH `cpu_seconds`.
+    // `axis_hard(Cores)` — the not-derivation-intrinsic closes
+    // (sh-041: spot-reclaim `WorkerAbort`; sh-031: `ExecutorVariant`
+    // self-timeout; sh-045: `Infra(CgroupOom|DiskFull)` worker-reported
+    // and `Witnessed(OomKilled|EvictedEmptyDirSizeLimit)` heartbeat-
+    // sourced). `min_wall` guards trivially-short saturated runs (the
+    // inverse-cost bound); `TRUST_BAND_CORES` refuses forged-HIGH
+    // `cpu_seconds`.
     if let (Some(cpu), Some(wall)) = (peaks.cpu_seconds, peaks.wall)
         && last_cores > 0
-        && reason.hard_cores()
+        && reason.axis_hard(Axis::Cores)
     {
         let wall_s = wall.as_secs_f64();
         if wall_s >= cfg.compute_bound_min_wall_secs {
@@ -1702,38 +1770,126 @@ mod tests {
     /// over-fire on the cores axis.
     #[test]
     fn cores_hard_promote_gated_on_reason() {
+        use rio_proto::types::{AttemptTerminalReason as T, FailureClass as F};
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&recorder);
         let mut s = st();
-        s.sched.last_intent = Some(intent(0, 0, 4, 0));
+        s.sched.last_intent = Some(intent(0, 0, 4, 600));
         let saturated = ObservedPeaks {
             cpu_seconds: Some(2280.0),
             wall: Some(Duration::from_secs(600)),
             ..Default::default()
         };
-        for r in [
-            AttemptCloseReason::Other,
-            AttemptCloseReason::Timeout,
-            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
-        ] {
+        // sh-045: the negative arm is exactly {Other, Timeout} —
+        // Infra(CgroupOom) MOVED to the positive arm under the
+        // axis_hard widen. Timeout stays NEGATIVE (cpu_util cannot
+        // discriminate serial- from parallel-saturated; the deadline
+        // ratchet is the single-axis response).
+        for r in [AttemptCloseReason::Other, AttemptCloseReason::Timeout] {
             let mut s2 = s.clone();
             let o = observe(&mut s2, saturated, r);
             assert!(
-                !o.hard_promoted && s2.sched.resource_floor.cores == 0,
-                "{r:?} is not hard_cores(): cores untouched (got {o:?}, \
+                s2.sched.resource_floor.cores == 0 && !o.at_cap_axes.contains(Axis::Cores),
+                "{r:?} is not axis_hard(Cores): cores untouched (got {o:?}, \
                  cores={})",
                 s2.sched.resource_floor.cores
             );
         }
-        // ExecutorVariant / WorkerAbort ARE hard_cores().
+        // r[verify sched.floor.timeout-cores-suppressed-metric]
+        // The Timeout iteration above (cpu_util=0.95, wall=600≥60,
+        // wall≥assigned/2=300) is exactly the suppressed shape.
+        assert_eq!(
+            recorder.get("rio_scheduler_timeout_cores_suppressed_total{}"),
+            1,
+            "the suppressed counter increments on a CPU-saturated Timeout"
+        );
+        // sh-045: the positive arm is exactly the not-derivation-
+        // intrinsic closes (the I-170/I-199 boundary).
         for r in [
             AttemptCloseReason::ExecutorVariant,
             AttemptCloseReason::WorkerAbort,
+            AttemptCloseReason::Infra(F::CgroupOom),
+            AttemptCloseReason::Infra(F::DiskFull),
+            AttemptCloseReason::Witnessed(T::OomKilled),
+            AttemptCloseReason::Witnessed(T::EvictedEmptyDirSizeLimit),
         ] {
             let mut s2 = s.clone();
             let o = observe(&mut s2, saturated, r);
             assert!(
                 o.hard_promoted && s2.sched.resource_floor.cores == PROV_MAX,
-                "{r:?}"
+                "{r:?} is axis_hard(Cores): cores jumps to prov_max"
             );
+        }
+    }
+
+    // r[verify sched.floor.axis-trust]
+    /// sh-045 (e) — *the (AttemptCloseReason × Axis) product census.*
+    /// Enumerated via a no-`_` index match (the
+    /// `witnessed_disposition_product_census` form) so the test list is
+    /// compiler-pinned. The cores=true set is exactly the
+    /// not-derivation-intrinsic closes; Timeout is NOT in (the owner
+    /// decision pinned). A future widen is a deliberate test edit.
+    #[test]
+    fn axis_hard_exhaustive_product_census() {
+        use rio_proto::types::{AttemptTerminalReason as T, FailureClass as F};
+        // The reachable variant set (Infra(Unspecified) and
+        // Witnessed(non-promoting) are unreachable! arms — they panic
+        // by design and are excluded here; the no-`_` arm in axis_hard
+        // is the rustc-exhaustiveness pin).
+        const REASONS: [AttemptCloseReason; 8] = [
+            AttemptCloseReason::Infra(F::CgroupOom),
+            AttemptCloseReason::Infra(F::DiskFull),
+            AttemptCloseReason::Timeout,
+            AttemptCloseReason::ExecutorVariant,
+            AttemptCloseReason::WorkerAbort,
+            AttemptCloseReason::Witnessed(T::OomKilled),
+            AttemptCloseReason::Witnessed(T::EvictedEmptyDirSizeLimit),
+            AttemptCloseReason::Other,
+        ];
+        // Closure-set census: every reachable variant indexed by a
+        // no-`_` match (a new variant fails this match at compile
+        // time).
+        fn index(r: &AttemptCloseReason) -> usize {
+            match r {
+                AttemptCloseReason::Infra(F::CgroupOom) => 0,
+                AttemptCloseReason::Infra(F::DiskFull) => 1,
+                AttemptCloseReason::Infra(F::Unspecified) => {
+                    unreachable!("from_status routes Unspecified → Other")
+                }
+                AttemptCloseReason::Timeout => 2,
+                AttemptCloseReason::ExecutorVariant => 3,
+                AttemptCloseReason::WorkerAbort => 4,
+                AttemptCloseReason::Witnessed(T::OomKilled) => 5,
+                AttemptCloseReason::Witnessed(T::EvictedEmptyDirSizeLimit) => 6,
+                AttemptCloseReason::Witnessed(_) => {
+                    unreachable!("witnessed_disposition gates the alphabet")
+                }
+                AttemptCloseReason::Other => 7,
+            }
+        }
+        let mut seen = [0u8; REASONS.len()];
+        for r in &REASONS {
+            seen[index(r)] += 1;
+        }
+        assert_eq!(seen, [1; REASONS.len()], "REASONS is the alphabet");
+        // The cores=true set, pinned literal.
+        let cores_hard: Vec<_> = REASONS
+            .iter()
+            .filter(|r| r.axis_hard(Axis::Cores))
+            .map(index)
+            .collect();
+        assert_eq!(
+            cores_hard,
+            vec![0, 1, 3, 4, 5, 6],
+            "the cores-hard set is exactly the not-derivation-intrinsic \
+             closes; Timeout (idx 2) and Other (idx 7) are OUT"
+        );
+        // axis_hard returns a value for every (variant × axis) pair —
+        // no panics on the reachable set.
+        for r in &REASONS {
+            for a in [Axis::Mem, Axis::Disk, Axis::Deadline, Axis::Cores] {
+                let _ = r.axis_hard(a);
+            }
         }
     }
 

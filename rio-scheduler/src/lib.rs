@@ -392,6 +392,17 @@ pub fn describe_metrics() {
          Alert if rate > 0: a forged or misbehaving worker report."
     );
     describe_counter!(
+        "rio_scheduler_timeout_cores_suppressed_total",
+        "sh-045: a Timeout close carried cpu_util ≥ compute_bound_threshold ∧ \
+         wall ≥ min_wall — the cores-arm gate WOULD have fired had (Timeout, \
+         Cores) been hard. Timeout is NOT cores-hard (cpu_util cannot \
+         discriminate serial-saturated from parallel-saturated; the cores arm \
+         jumps to prov_max so a wrong promotion costs prov_max× capacity); \
+         this counter measures whether parallel-starved Timeout actually \
+         occurs in production before any future (Timeout, Cores) → true policy \
+         change once cpu.stat throttled_usec is gating. No labels."
+    );
+    describe_counter!(
         "rio_scheduler_poison_fleet_exhausted_total",
         "Derivations poisoned because failed_builders excluded every registered worker \
          of the matching kind (I-065). Nonzero rate with small fleet = poison threshold \
