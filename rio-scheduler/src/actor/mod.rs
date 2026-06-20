@@ -1941,6 +1941,25 @@ impl DagActor {
                     self.handle_report_outcome(exec_id, auth_intent, payload, reply)
                         .await;
                 }
+                ActorCommand::ReportRunningTelemetry {
+                    exec_id,
+                    auth_intent,
+                    peak_memory_bytes,
+                    resources,
+                    reply,
+                } => {
+                    // r[sched.lease.standby-drops-writes+4]: the handler
+                    // self-gates on is_leader(); its only write is the
+                    // in-memory heartbeat cache.
+                    self.handle_report_running_telemetry(
+                        exec_id,
+                        auth_intent,
+                        peak_memory_bytes,
+                        resources,
+                        reply,
+                    )
+                    .await;
+                }
                 ActorCommand::ReportAttemptOutcome {
                     identity,
                     reason,

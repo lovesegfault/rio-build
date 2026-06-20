@@ -1132,6 +1132,17 @@ pub struct SchedHint {
     /// precedence: the next mint overwrites it (the freshness law).
     /// In-memory only.
     pub last_intent: Option<SolvedIntent>,
+    /// sh-045: the builder's last `ReportRunningTelemetry` for the
+    /// CURRENT attempt — `(memory.peak, ResourceUsage snapshot)`. The
+    /// witnessed-close establishment reads it so a kubelet-SIGKILLed
+    /// build's `cpu_seconds` / `peak_disk_bytes` reach `observe_peaks`
+    /// (the witnessed lane otherwise has no `CompletionReport`).
+    /// Written by `handle_report_running_telemetry`; cleared in
+    /// lockstep with the `last_intent` restamp at the dispatch-mint
+    /// site (so a stale prior-attempt heartbeat cannot leak into a new
+    /// attempt's witnessed close). In-memory only — ephemeral evidence
+    /// consumed within `establishment_report_slack`.
+    pub last_reported_peaks: Option<(u64, rio_proto::types::ResourceUsage)>,
     /// Estimated build duration (from Estimator). Set at merge time;
     /// never updated after. The critical-path priority uses this;
     /// stale is fine (a build taking longer than estimated doesn't

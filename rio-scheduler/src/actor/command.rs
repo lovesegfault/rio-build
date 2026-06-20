@@ -348,6 +348,21 @@ pub enum ActorCommand {
         reply: oneshot::Sender<Result<(), super::pull::PullRejection>>,
     },
 
+    /// sh-045: the builder's periodic running-telemetry heartbeat
+    /// (`ExecutorService.ReportRunningTelemetry`). Best-effort,
+    /// idempotent by `exec_id`; the actor caches `(peak_memory_bytes,
+    /// resources)` on `SchedHint.last_reported_peaks` for the witnessed
+    /// close to consume. `send_unchecked`: a dropped heartbeat degrades
+    /// to the witnessed-axis-only fallback (today's behaviour).
+    ReportRunningTelemetry {
+        exec_id: uuid::Uuid,
+        /// HMAC-attested intent binding (None = dev mode, no key).
+        auth_intent: Option<String>,
+        peak_memory_bytes: u64,
+        resources: rio_proto::types::ResourceUsage,
+        reply: oneshot::Sender<Result<(), super::pull::PullRejection>>,
+    },
+
     /// The controller's unified pod-terminal classification for one
     /// pull-mode attempt (`AdminService.ReportAttemptOutcome`, the
     /// C4/C5 unification). Idempotent by attempt identity; a report
@@ -860,6 +875,8 @@ pub enum DebugCmd {
         est_deadline_secs: Option<u32>,
         est_cores: Option<u32>,
         floor: Option<crate::state::ResourceFloor>,
+        /// sh-045: seed `last_reported_peaks` (the heartbeat cache).
+        peaks: Option<(u64, rio_proto::types::ResourceUsage)>,
         reply: oneshot::Sender<bool>,
     },
     /// Arm a synthetic long Tick (round-9 B8 / W9-AG): the next
@@ -907,6 +924,7 @@ impl ActorCommand {
             Self::PullAssignment { .. } => "PullAssignment",
             Self::ListMaterializationJobs { .. } => "ListMaterializationJobs",
             Self::ReportPullOutcome { .. } => "ReportPullOutcome",
+            Self::ReportRunningTelemetry { .. } => "ReportRunningTelemetry",
             Self::ReportAttemptOutcome { .. } => "ReportAttemptOutcome",
             Self::AckSpawnedIntents { .. } => "AckSpawnedIntents",
             Self::Tick => "Tick",

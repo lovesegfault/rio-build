@@ -1226,6 +1226,11 @@ impl DagActor {
             if let Some(solve) = dispatch.stamp() {
                 state.sched.last_intent = Some(solve);
             }
+            // sh-045: the heartbeat cache shares lifecycle with
+            // `last_intent` — cleared at the dispatch-mint restamp so
+            // a stale prior-attempt's `cpu_seconds` cannot leak into a
+            // new attempt's witnessed close.
+            state.sched.last_reported_peaks = None;
             // rule-4b: mirror the persisted nonce (cleared in lockstep
             // with exec_id at every clear site).
             state.claim_nonce = claim_nonce;
@@ -2454,6 +2459,77 @@ impl DagActor {
     /// Ready so the next `GetSpawnIntents` re-emits it.
     // r[impl ctrl.report.attempt-outcome]
     // r[impl sched.attempt.no-attempt-no-op]
+    /// sh-045: cache the builder's periodic running-telemetry on
+    /// `SchedHint.last_reported_peaks`. The witnessed-close
+    /// establishment (`observe_witnessed_floor`) reads it so a
+    /// kubelet-SIGKILLed attempt's `cpu_seconds` / `peak_disk_bytes`
+    /// reach `observe_peaks`. Auth-before-side-effect: the token↔intent
+    /// binding (the same `auth != attempt.core().drv_hash` check
+    /// `report_outcome_inner` applies) runs BEFORE the cache write — a
+    /// builder holding a valid token for drv X that learns drv Y's
+    /// `exec_id` is rejected without touching Y's cache.
+    pub(super) async fn handle_report_running_telemetry(
+        &mut self,
+        exec_id: Uuid,
+        auth_intent: Option<String>,
+        peak_memory_bytes: u64,
+        resources: rio_proto::types::ResourceUsage,
+        reply: oneshot::Sender<Result<(), PullRejection>>,
+    ) {
+        let result = self
+            .report_running_telemetry_inner(
+                exec_id,
+                auth_intent.as_deref(),
+                peak_memory_bytes,
+                resources,
+            )
+            .await;
+        let _ = reply.send(result);
+    }
+
+    async fn report_running_telemetry_inner(
+        &mut self,
+        exec_id: Uuid,
+        auth_intent: Option<&str>,
+        peak_memory_bytes: u64,
+        resources: rio_proto::types::ResourceUsage,
+    ) -> Result<(), PullRejection> {
+        if !self.leader.is_leader() {
+            return Err(PullRejection::NotLeader);
+        }
+        let attempt = self
+            .db
+            .find_attempt_by_exec_id(exec_id)
+            .await
+            .map_err(|e| PullRejection::Internal(format!("attempt lookup failed: {e}")))?;
+        let Some(attempt) = attempt else {
+            // Never-pulled / superseded exec: ack-and-ignore (the
+            // heartbeat is best-effort; the next tick re-tries).
+            debug!(%exec_id, "ReportRunningTelemetry for unknown exec acknowledged-and-ignored");
+            return Ok(());
+        };
+        let drv_hash = attempt.core().drv_hash.as_str();
+        // r[impl sec.executor.identity-token+3]
+        // Token↔intent binding (per-unary, same as the pull/report):
+        // the attested intent must be the attempt's derivation. Runs
+        // BEFORE any cache write.
+        if let Some(auth) = auth_intent
+            && auth != drv_hash
+        {
+            warn!(%exec_id, "ReportRunningTelemetry rejected: executor token bound to a different intent");
+            return Err(PullRejection::TokenMismatch);
+        }
+        // The cache write: in-memory only, last-writer-wins (the
+        // builder's 5s ticker monotonically refreshes; a heartbeat for
+        // a closed attempt's exec_id finds no live node and no-ops).
+        if let Some(state) = self.dag.node_mut(drv_hash)
+            && state.exec_id == Some(exec_id)
+        {
+            state.sched.last_reported_peaks = Some((peak_memory_bytes, resources));
+        }
+        Ok(())
+    }
+
     pub(super) async fn handle_report_attempt_outcome(
         &mut self,
         identity: AttemptIdentity,

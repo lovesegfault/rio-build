@@ -155,6 +155,7 @@ impl DagActor {
                 est_deadline_secs,
                 est_cores,
                 floor,
+                peaks,
                 reply,
             } => {
                 let ok = self.dag.node_mut(&drv_hash).is_some_and(|s| {
@@ -181,6 +182,9 @@ impl DagActor {
                     }
                     if let Some(f) = floor {
                         s.sched.resource_floor = f;
+                    }
+                    if let Some(p) = peaks {
+                        s.sched.last_reported_peaks = Some(p);
                     }
                     true
                 });
