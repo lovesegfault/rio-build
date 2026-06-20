@@ -1225,7 +1225,7 @@ no-followups directive forbids.
   A controller-witnessed close MUST observe the attempt's last
   builder-reported running telemetry --- `(peak_memory_bytes,
   cpu_seconds_total, peak_disk_bytes)` from `last_reported_peaks` ---
-  when present, via the SAME `observe_peaks` consumer the
+  when present, via the same `observe_peaks` consumer the
   worker-reported lanes feed; absent telemetry MUST fall back to the
   witnessed-axis-only synthesis (`peak = last_intent.X` on the reason's
   named axis, every other axis explicit-zero). `ObservedPeaks` MUST have

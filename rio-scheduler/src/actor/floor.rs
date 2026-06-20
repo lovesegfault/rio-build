@@ -317,7 +317,7 @@ impl AttemptCloseReason {
     /// observe is NOT this chokepoint's concern — soft stays on
     /// sh-041u's `peaks.X.is_some()` → `observe_sizing_axis(..,
     /// hard_claim: bool, ..)` path; `axis_hard` decides hard-promotion
-    /// ONLY.
+    /// only.
     ///
     /// **The cores-hard boundary is the I-170/I-199 line**: closes
     /// where the build was running and the close is NOT

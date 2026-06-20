@@ -1197,7 +1197,7 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     spawn_build_task(*assignment, guard, &rt.build_ctx).await;
 
     // sh-045: the running-telemetry heartbeat. Spawned AFTER the build
-    // task (so the cgroup is populated) with the SAME authed transport
+    // task (so the cgroup is populated) with the same authed transport
     // as the pull/report unaries; aborted after `build_phase_with_abort`
     // returns (ticker lifetime is bounded by the assignment).
     let telemetry_ticker = spawn_running_telemetry_ticker(

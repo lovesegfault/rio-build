@@ -791,6 +791,10 @@ DURATION_CENSUS_ROWS = {
         "wall (unix-epoch seconds at the signer's own sample)",
         "WO-S8-6: the post-call re-sample law pin",
     ),
+    ("rio-builder/src/runtime/pull.rs", "TELEMETRY_TICK"): (
+        "beats (the running-telemetry ticker's tokio::time::interval cadence)",
+        "sh-045: 5s so the worst-case cpu_seconds under-read at SIGKILL is <=5s/60s ~ 8.3% against compute_bound_min_wall_secs=60 (HF-1 — the ticker reads cpu.stat fresh via final_sample, not the <=10s-stale snapshot)",
+    ),
     ("rio-scheduler/src/sla/cost.rs", "EPOCH_FUTURE_SLACK_SECS"): (
         "wall (the plausible value-time ceiling: stored PG stamps vs the loader's now_epoch sample)",
         "bw13 WO-S4-7: the absurdity-ceiling decode (stamp <= now + slack; W13-X corruption-class refusal, W13-X2 live-skew tolerance); ONE mint shared by the epoch decode, the four stamp-fence heal arms, and the repair predicates",

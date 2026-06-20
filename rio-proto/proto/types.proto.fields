@@ -52,6 +52,7 @@ optional double cpu_limit_cores = 9;
 optional double cpu_seconds_total = 10;
 optional double peak_io_pressure_pct = 11;
 optional uint32 grace_period_hours = 2;
+optional uint64 cpu_throttled_usec = 13;
 optional uint64 limit_bytes = 2;
 optional uint64 peak_disk_bytes = 12;
 repeated ChunkRef chunks = 2;
