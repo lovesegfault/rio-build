@@ -1927,12 +1927,20 @@ impl DagActor {
         }
     }
 
-    async fn report_outcome_inner(
-        &mut self,
+    // r[impl sec.executor.identity-token+3]
+    /// sh-045 r1 — the shared executor-report prologue: leader-gate →
+    /// `find_attempt_by_exec_id` → ack-unknown → token↔intent binding.
+    /// `Ok(None)` = unknown/superseded exec (acknowledged-and-ignored;
+    /// the caller returns `Ok(())`). Both `report_outcome_inner` and
+    /// the heartbeat cold-path call it so a future hardening (e.g.
+    /// reject when `auth_intent` is `None` under a non-dev key) edits
+    /// ONE body.
+    async fn resolve_authed_attempt(
+        &self,
         exec_id: Uuid,
         auth_intent: Option<&str>,
-        payload: PullReportPayload,
-    ) -> Result<(), PullRejection> {
+        rpc: &'static str,
+    ) -> Result<Option<crate::db::open_attempts::AttemptRef>, PullRejection> {
         if !self.leader.is_leader() {
             return Err(PullRejection::NotLeader);
         }
@@ -1941,22 +1949,35 @@ impl DagActor {
             .find_attempt_by_exec_id(exec_id)
             .await
             .map_err(|e| PullRejection::Internal(format!("attempt lookup failed: {e}")))?;
-
         let Some(attempt) = attempt else {
             // Never-pulled (or superseded) exec: acknowledged, nothing
             // written — the no-open-attempt arm of report idempotency.
-            debug!(%exec_id, "ReportOutcome for unknown/superseded exec acknowledged-and-ignored");
-            return Ok(());
+            debug!(%exec_id, "{rpc} for unknown/superseded exec acknowledged-and-ignored");
+            return Ok(None);
         };
         // Token↔intent binding (per-unary, same as the pull): the
         // attested intent must be the attempt's derivation.
         if let Some(auth) = auth_intent
             && auth != attempt.core().drv_hash
         {
-            // r[impl sec.executor.identity-token+3]
-            warn!(%exec_id, "ReportOutcome rejected: executor token bound to a different intent");
+            warn!(%exec_id, "{rpc} rejected: executor token bound to a different intent");
             return Err(PullRejection::TokenMismatch);
         }
+        Ok(Some(attempt))
+    }
+
+    async fn report_outcome_inner(
+        &mut self,
+        exec_id: Uuid,
+        auth_intent: Option<&str>,
+        payload: PullReportPayload,
+    ) -> Result<(), PullRejection> {
+        let Some(attempt) = self
+            .resolve_authed_attempt(exec_id, auth_intent, "ReportOutcome")
+            .await?
+        else {
+            return Ok(());
+        };
         // The kind witness (A2): materialization attempts route to
         // their own consumption transaction; the build arms below bind
         // `&BuildAttempt`, so a cross-kind close no longer typechecks.
@@ -2524,34 +2545,44 @@ impl DagActor {
         if !self.leader.is_leader() {
             return Err(PullRejection::NotLeader);
         }
-        let attempt = self
-            .db
-            .find_attempt_by_exec_id(exec_id)
-            .await
-            .map_err(|e| PullRejection::Internal(format!("attempt lookup failed: {e}")))?;
-        let Some(attempt) = attempt else {
-            // Never-pulled / superseded exec: ack-and-ignore (the
-            // heartbeat is best-effort; the next tick re-tries).
-            debug!(%exec_id, "ReportRunningTelemetry for unknown exec acknowledged-and-ignored");
+        // r[impl sec.executor.identity-token+3]
+        // sh-045 r1 hot path: `auth_intent` IS the dispatch intent's
+        // drv_hash (server-minted at pull, [`ExecutorClaims::intent_id`]).
+        // Resolve in-memory; the per-heartbeat 3-table PG JOIN
+        // (~200 qps at 1000 builders × 5 s tick, serialized on the
+        // actor loop) only runs on the cold path (dev-mode `None`, or
+        // the in-memory key disagrees — defensive). The token↔intent
+        // binding holds by construction: the cache write is keyed on
+        // the ATTESTED intent and gated on `state.exec_id == exec_id`,
+        // so a builder holding a token for drv X that learns drv Y's
+        // `exec_id` cannot touch Y.
+        if let Some(auth) = auth_intent
+            && let Some(state) = self.dag.node_mut(auth)
+            && state.exec_id == Some(exec_id)
+        {
+            merge_heartbeat_peaks(
+                &mut state.sched.last_reported_peaks,
+                wall_seconds,
+                peak_memory_bytes,
+                resources,
+            );
+            return Ok(());
+        }
+        // Cold path: same prologue as `report_outcome_inner` (PG
+        // resolve + token-binding); preserves `Err(TokenMismatch)` for
+        // a forged intent (test (i)).
+        let Some(attempt) = self
+            .resolve_authed_attempt(exec_id, auth_intent, "ReportRunningTelemetry")
+            .await?
+        else {
             return Ok(());
         };
-        let drv_hash = attempt.core().drv_hash.as_str();
-        // r[impl sec.executor.identity-token+3]
-        // Token↔intent binding (per-unary, same as the pull/report):
-        // the attested intent must be the attempt's derivation. Runs
-        // BEFORE any cache write.
-        if let Some(auth) = auth_intent
-            && auth != drv_hash
-        {
-            warn!(%exec_id, "ReportRunningTelemetry rejected: executor token bound to a different intent");
-            return Err(PullRejection::TokenMismatch);
-        }
         // The cache write: in-memory only, per-field max-merge (the
         // builder's ticker monotonically refreshes, so a stale RPC
         // landing after the final ship — `abort()` is fire-and-forget
         // — cannot regress monotone fields). A heartbeat for a closed
         // attempt's exec_id finds no live node and no-ops.
-        if let Some(state) = self.dag.node_mut(drv_hash)
+        if let Some(state) = self.dag.node_mut(attempt.core().drv_hash.as_str())
             && state.exec_id == Some(exec_id)
         {
             merge_heartbeat_peaks(

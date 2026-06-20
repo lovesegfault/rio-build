@@ -509,6 +509,23 @@ fn parse_own_cgroup(content: &str) -> io::Result<PathBuf> {
     Ok(PathBuf::from(CGROUP_ROOT).join(rel))
 }
 
+/// cgroup v2 key-value file parser: one `KEY VALUE` per line, first
+/// whitespace-separated token after the space-suffixed key. The
+/// trailing space in `key` is what makes `"usage_usec "` NOT match
+/// `"usage_usec_something_else"` — every caller MUST pass a
+/// space-suffixed key (pinned by `parse_cpu_stat_key_prefix_not_fooled`).
+fn parse_cgroup_kv_u64(content: &str, key: &str) -> Option<u64> {
+    debug_assert!(
+        key.ends_with(' '),
+        "key must be space-suffixed (prefix-safety)"
+    );
+    content
+        .lines()
+        .find(|l| l.starts_with(key))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+}
+
 /// Parse `cpu.stat` for the `usage_usec` line. First whitespace-
 /// separated token after the key.
 ///
@@ -517,11 +534,7 @@ fn parse_own_cgroup(content: &str) -> io::Result<PathBuf> {
 /// this to parse. It can't hold `&BuildCgroup` across the
 /// `run_daemon_build` await; exposing the parser is the simplest fix.
 pub(crate) fn parse_cpu_stat_usage_usec(content: &str) -> Option<u64> {
-    content
-        .lines()
-        .find(|l| l.starts_with("usage_usec "))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
+    parse_cgroup_kv_u64(content, "usage_usec ")
 }
 
 /// sh-045 (transport-only): cgroup v2 `cpu.stat` `throttled_usec` —
@@ -530,11 +543,7 @@ pub(crate) fn parse_cpu_stat_usage_usec(content: &str) -> Option<u64> {
 /// when `make -j1` saturates one core (the future `(Timeout, Cores)`
 /// discriminator). Same one-file-read as `usage_usec`.
 pub(crate) fn parse_cpu_stat_throttled_usec(content: &str) -> Option<u64> {
-    content
-        .lines()
-        .find(|l| l.starts_with("throttled_usec "))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
+    parse_cgroup_kv_u64(content, "throttled_usec ")
 }
 
 /// Read a single-line decimal u64 file. cgroup v2 `memory.peak`,
@@ -655,11 +664,7 @@ pub fn effective_cores(parent: &Path) -> u32 {
 /// ancestor) hit `memory.max`. Hierarchical — descendants' kills are
 /// included (vs `memory.events.local`).
 pub(crate) fn parse_memory_events_oom_kill(content: &str) -> Option<u64> {
-    content
-        .lines()
-        .find(|l| l.starts_with("oom_kill "))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
+    parse_cgroup_kv_u64(content, "oom_kill ")
 }
 
 // r[impl builder.oom.cgroup-watch+3]
@@ -741,6 +746,31 @@ pub fn final_sample(
     peak_disk_bytes: Option<u64>,
     prev: rio_proto::types::ResourceUsage,
 ) -> rio_proto::types::ResourceUsage {
+    let prev = fresh_cpu_stat(root, prev);
+    let peak_io_pressure_pct = fs::read_to_string(root.join("io.pressure"))
+        .ok()
+        .and_then(|s| parse_io_pressure_some_avg10(&s))
+        .map(|p| prev.peak_io_pressure_pct.map_or(p, |prev_p| prev_p.max(p)))
+        .or(prev.peak_io_pressure_pct);
+    let peak_disk_bytes = peak_disk_bytes
+        .map(|q| prev.peak_disk_bytes.map_or(q, |prev_q| prev_q.max(q)))
+        .or(prev.peak_disk_bytes);
+    rio_proto::types::ResourceUsage {
+        peak_io_pressure_pct,
+        peak_disk_bytes,
+        ..prev
+    }
+}
+
+/// Refresh `cpu_seconds_total` + `cpu_throttled_usec` from a fresh
+/// `cpu.stat` read (the heartbeat ticker's lightweight sampler — no
+/// `io.pressure` read; `peak_disk_bytes` propagates from `prev`, the
+/// snapshot loop's running-max). [`final_sample`] layers `io.pressure`
+/// + caller-supplied `peak_disk_bytes` on top.
+pub fn fresh_cpu_stat(
+    root: &Path,
+    prev: rio_proto::types::ResourceUsage,
+) -> rio_proto::types::ResourceUsage {
     let cpu_stat = fs::read_to_string(root.join("cpu.stat")).ok();
     let cpu_seconds_total = cpu_stat
         .as_deref()
@@ -751,19 +781,9 @@ pub fn final_sample(
         .as_deref()
         .and_then(parse_cpu_stat_throttled_usec)
         .or(prev.cpu_throttled_usec);
-    let peak_io_pressure_pct = fs::read_to_string(root.join("io.pressure"))
-        .ok()
-        .and_then(|s| parse_io_pressure_some_avg10(&s))
-        .map(|p| prev.peak_io_pressure_pct.map_or(p, |prev_p| prev_p.max(p)))
-        .or(prev.peak_io_pressure_pct);
-    let peak_disk_bytes = peak_disk_bytes
-        .map(|q| prev.peak_disk_bytes.map_or(q, |prev_q| prev_q.max(q)))
-        .or(prev.peak_disk_bytes);
     rio_proto::types::ResourceUsage {
         cpu_seconds_total,
         cpu_throttled_usec,
-        peak_io_pressure_pct,
-        peak_disk_bytes,
         ..prev
     }
 }

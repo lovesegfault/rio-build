@@ -878,8 +878,6 @@ pub enum DebugCmd {
         est_deadline_secs: Option<u32>,
         est_cores: Option<u32>,
         floor: Option<crate::state::ResourceFloor>,
-        /// sh-045: seed `last_reported_peaks` (the heartbeat cache).
-        peaks: Option<(f64, u64, rio_proto::types::ResourceUsage)>,
         reply: oneshot::Sender<bool>,
     },
     /// Arm a synthetic long Tick (round-9 B8 / W9-AG): the next

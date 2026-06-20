@@ -367,62 +367,77 @@ impl PullTransport for AuthedPullTransport {
 /// ≤5s/60s ≈ 8.3% against `compute_bound_min_wall_secs=60` (a 20s
 /// under-read at the old cadence is gate-defeating: a true-0.90 cpu_util
 /// reads ≈0.60 and fails the 0.80 threshold). Each tick reads `cpu.stat`
-/// FRESH via `final_sample` (HF-1: not the cached snapshot) — eliminates
-/// the snapshot-staleness term.
+/// FRESH via `fresh_cpu_stat` (HF-1: not the cached snapshot) —
+/// eliminates the snapshot-staleness term.
 const TELEMETRY_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 // r[impl sched.executor.running-telemetry]
 /// sh-045: spawn the periodic running-telemetry heartbeat. Each tick
-/// reads `(memory.peak, final_sample(cpu.stat fresh))` from the parent
-/// cgroup and best-effort ships it via `ReportRunningTelemetry`. RPC
-/// error → `debug!` + continue (a dropped heartbeat degrades to the
-/// witnessed-axis-only fallback). The returned `JoinHandle` is aborted
-/// by the caller after `build_phase_with_abort` returns; the caller
-/// also does ONE final fresh-read+ship at that point so the last
+/// is one [`TelemetryShip::ship_once`]. The returned `JoinHandle` is
+/// aborted by the caller after `build_phase_with_abort` returns; the
+/// caller also fires ONE detached final ship at that point so the last
 /// heartbeat is ≤0s stale at process exit.
-fn spawn_running_telemetry_ticker(
-    mut client: super::setup::WorkerClient,
+fn spawn_running_telemetry_ticker(ship: TelemetryShip) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // sh-045 r1: first tick at t=TELEMETRY_TICK (not t=0 — the
+        // immediate first tick was a guaranteed-wasted RPC + actor
+        // command + PG query carrying ~0 cpu_seconds/mem per build
+        // start).
+        let mut tick =
+            tokio::time::interval_at(tokio::time::Instant::now() + TELEMETRY_TICK, TELEMETRY_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            ship.ship_once().await;
+        }
+    })
+}
+
+/// sh-045 r1 — owned bundle for one heartbeat sample + ship.
+/// Ticker body and the post-build final ship both call
+/// [`TelemetryShip::ship_once`]; a future change to the ship shape
+/// (auth, error handling, a graduated request field) edits ONE body.
+#[derive(Clone)]
+struct TelemetryShip {
+    client: super::setup::WorkerClient,
     executor_token: String,
     exec_id: String,
     cgroup_parent: std::path::PathBuf,
     resources: crate::cgroup::ResourceSnapshotHandle,
     started: std::time::Instant,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(TELEMETRY_TICK);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            let (peak_mem, ru) = sample_running_telemetry(&cgroup_parent, &resources);
-            let req = rio_proto::types::ReportRunningTelemetryRequest {
-                exec_id: exec_id.clone(),
-                peak_memory_bytes: peak_mem,
-                resources: Some(ru),
-                wall_seconds: Some(started.elapsed().as_secs_f64()),
-            };
-            if let Err(e) = client
-                .report_running_telemetry(authed_request(req, &executor_token))
-                .await
-            {
-                tracing::debug!(error = %e, "ReportRunningTelemetry dropped (best-effort)");
-            }
-        }
-    })
 }
 
-/// One fresh `(memory.peak, ResourceUsage)` read from the parent cgroup.
-/// `final_sample` reads `cpu.stat` directly (HF-1: NOT the ≤10s-stale
-/// cached snapshot); `memory.peak` is the kernel's own running max
-/// (one-build-per-pod: the parent cgroup includes small rio-builder
-/// overhead, conservative).
-fn sample_running_telemetry(
-    cgroup_parent: &std::path::Path,
-    resources: &crate::cgroup::ResourceSnapshotHandle,
-) -> (u64, rio_proto::types::ResourceUsage) {
-    let peak_mem = crate::cgroup::read_single_u64(&cgroup_parent.join("memory.peak")).unwrap_or(0);
-    let prev = *resources.read().unwrap_or_else(|e| e.into_inner());
-    let ru = crate::cgroup::final_sample(cgroup_parent, None, prev);
-    (peak_mem, ru)
+impl TelemetryShip {
+    /// One fresh `(memory.peak, cpu.stat)` read from the parent
+    /// cgroup, then a best-effort RPC.
+    /// [`fresh_cpu_stat`](crate::cgroup::fresh_cpu_stat) reads
+    /// `cpu.stat` directly (HF-1: NOT the ≤10s-stale cached snapshot)
+    /// and skips `io.pressure` (no witnessed-floor consumer).
+    /// `memory.peak` is the kernel's own running max
+    /// (one-build-per-pod: the parent cgroup includes small
+    /// rio-builder overhead; `from_witnessed` clamps it). RPC error →
+    /// `debug!` + continue (a dropped heartbeat degrades to the
+    /// witnessed-axis-only fallback).
+    async fn ship_once(&self) {
+        let peak_mem =
+            crate::cgroup::read_single_u64(&self.cgroup_parent.join("memory.peak")).unwrap_or(0);
+        let prev = *self.resources.read().unwrap_or_else(|e| e.into_inner());
+        let ru = crate::cgroup::fresh_cpu_stat(&self.cgroup_parent, prev);
+        let req = rio_proto::types::ReportRunningTelemetryRequest {
+            exec_id: self.exec_id.clone(),
+            peak_memory_bytes: peak_mem,
+            resources: Some(ru),
+            wall_seconds: Some(self.started.elapsed().as_secs_f64()),
+        };
+        if let Err(e) = self
+            .client
+            .clone()
+            .report_running_telemetry(authed_request(req, &self.executor_token))
+            .await
+        {
+            tracing::debug!(error = %e, "ReportRunningTelemetry dropped (best-effort)");
+        }
+    }
 }
 
 /// Ask for the assignment until the question is resolved.
@@ -1204,42 +1219,31 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     // returns (ticker lifetime is bounded by the assignment). `started`
     // anchors `wall_seconds` so cpu and wall are sampled at the same
     // instant (sh-045 r1).
-    let started = std::time::Instant::now();
-    let telemetry_ticker = spawn_running_telemetry_ticker(
-        rt.scheduler_client.clone(),
-        executor_token.clone(),
-        exec_id.clone(),
-        rt.build_ctx.cgroup_parent.clone(),
-        rt.build_ctx.resources.clone(),
-        started,
-    );
+    let telemetry_ship = TelemetryShip {
+        client: rt.scheduler_client.clone(),
+        executor_token: executor_token.clone(),
+        exec_id: exec_id.clone(),
+        cgroup_parent: rt.build_ctx.cgroup_parent.clone(),
+        resources: rt.build_ctx.resources.clone(),
+        started: std::time::Instant::now(),
+    };
+    let telemetry_ticker = spawn_running_telemetry_ticker(telemetry_ship.clone());
 
     let mut sink_rx = rt
         .pull_sink_rx
         .take()
         .expect("pull mode always carries the sink receiver");
     let completion = build_phase_with_abort(&rt.slot, &drv_path, &mut sink_rx, &rt.shutdown).await;
-    // One final fresh-read + ship BEFORE aborting the ticker, so the
-    // last heartbeat is ≤0s stale at process exit (not ≤5s).
-    {
-        let (peak_mem, ru) =
-            sample_running_telemetry(&rt.build_ctx.cgroup_parent, &rt.build_ctx.resources);
-        let req = rio_proto::types::ReportRunningTelemetryRequest {
-            exec_id: exec_id.clone(),
-            peak_memory_bytes: peak_mem,
-            resources: Some(ru),
-            wall_seconds: Some(started.elapsed().as_secs_f64()),
-        };
-        if let Err(e) = rt
-            .scheduler_client
-            .clone()
-            .report_running_telemetry(authed_request(req, &executor_token))
-            .await
-        {
-            tracing::debug!(error = %e, "final ReportRunningTelemetry dropped (best-effort)");
-        }
-    }
+    // sh-045 r1: abort FIRST (so a 5 s boundary cannot fire a redundant
+    // RPC during the final ship's RTT), then fire-and-forget the final
+    // fresh-read + ship — the heartbeat is best-effort and the
+    // CompletionReport carries the same data, so the completion→
+    // outcome-report critical path doesn't block on it. The actor's
+    // per-field max-merge makes RPC ordering irrelevant (a still-in-
+    // flight ticker RPC carrying a pre-final sample cannot regress
+    // monotone fields).
     telemetry_ticker.abort();
+    tokio::spawn(async move { telemetry_ship.ship_once().await });
     let Some(completion) = completion else {
         // Cannot happen while build_ctx holds a sender; treat as a
         // builder bug and let the pod-terminal path classify it.

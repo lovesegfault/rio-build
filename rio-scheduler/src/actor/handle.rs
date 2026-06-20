@@ -447,29 +447,6 @@ impl ActorHandle {
             est_deadline_secs,
             est_cores: None,
             floor,
-            peaks: None,
-            reply,
-        })
-        .await
-    }
-
-    /// sh-045: seed `last_reported_peaks` (the heartbeat cache) for
-    /// witnessed-floor tests.
-    pub async fn debug_seed_running_peaks(
-        &self,
-        drv_hash: &str,
-        peak_memory_bytes: u64,
-        resources: rio_proto::types::ResourceUsage,
-    ) -> Result<bool, ActorError> {
-        let drv_hash = drv_hash.to_string();
-        self.debug(|reply| DebugCmd::SeedSchedHint {
-            drv_hash,
-            est_memory_bytes: None,
-            est_disk_bytes: None,
-            est_deadline_secs: None,
-            est_cores: None,
-            floor: None,
-            peaks: Some((0.0, peak_memory_bytes, resources)),
             reply,
         })
         .await
@@ -492,7 +469,6 @@ impl ActorHandle {
             est_deadline_secs: Some(deadline_secs),
             est_cores: Some(cores),
             floor: None,
-            peaks: None,
             reply,
         })
         .await
