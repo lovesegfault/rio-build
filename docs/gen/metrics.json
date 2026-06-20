@@ -57,6 +57,7 @@
     "rio_controller_nodeclaim_forecast_hit_ewma",
     "rio_controller_nodeclaim_ice_timeout_seconds",
     "rio_controller_nodeclaim_inflight_age_max_seconds",
+    "rio_controller_nodeclaim_inflight_tracked",
     "rio_controller_nodeclaim_intent_dropped_total",
     "rio_controller_nodeclaim_lead_time_q_at_cap",
     "rio_controller_nodeclaim_lead_time_seconds",
@@ -155,6 +156,7 @@
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_lease_rebound_total",
     "rio_scheduler_malformed_built_output_total",
+    "rio_scheduler_materialization_aged_out_total",
     "rio_scheduler_materialization_carrier_dropped_total",
     "rio_scheduler_materialization_claims_total",
     "rio_scheduler_materialization_converted_total",
@@ -525,7 +527,7 @@
       {
         "name": "rio_controller_ffd_unplaced_cores",
         "kind": "gauge",
-        "help": "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation at the last tick. cover_deficit's per-cell input. Non-zero with created_total flat = max_fleet_cores budget-brake throttling (the flat per-tick cap is retired — minting is bounded by demand and the fleet budget only)."
+        "help": "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation at the last tick. cover_deficit's per-cell input. Non-zero with created_total flat = max_fleet_cores budget-brake OR max_inflight_unlaunched headroom throttling (the flat per-tick cap stays retired — minting is bounded by demand, the fleet budget, and the sh-043 inflight-headroom)."
       },
       {
         "name": "rio_controller_ffd_window_remainder_cores",
@@ -606,6 +608,11 @@
         "name": "rio_controller_nodeclaim_inflight_age_max_seconds",
         "kind": "gauge",
         "help": "Oldest in-flight NodeClaim per `cell` (now − metadata.creationTimestamp; 0 when none in-flight). The per-claim age the StuckPending alert keys on — the inflight count never touches 0 under sustained scale-up, so count-based `for: 90s` fires on healthy bursts."
+      },
+      {
+        "name": "rio_controller_nodeclaim_inflight_tracked",
+        "kind": "gauge",
+        "help": "Entries in the controller's inflight_created ledger (created by cover_deficit, not yet observed Registered/terminating/absent). vanish_fold prunes it ⊆ live each tick, so a leak (this gauge climbing while nodeclaim_live{state=inflight} is flat) means the creationTimestamp-absent escape is firing. sh-043: lands the bug_020 deferred gauge half."
       },
       {
         "name": "rio_controller_nodeclaim_intent_dropped_total",
@@ -1112,6 +1119,11 @@
         "name": "rio_scheduler_malformed_built_output_total",
         "kind": "counter",
         "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_materialization_aged_out_total",
+        "kind": "counter",
+        "help": "Materialization jobs resolved from-source by the phase-15 unclaimed age-out arm (no holder, not currently parked, created_at past max_attempts × attempt_deadline_secs) — the executor-liveness backstop that re-admits the node to the phase-17 dispatch probe; discriminated by origin"
       },
       {
         "name": "rio_scheduler_materialization_carrier_dropped_total",
