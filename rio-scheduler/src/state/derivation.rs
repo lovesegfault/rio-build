@@ -1141,8 +1141,10 @@ pub struct SchedHint {
     /// lockstep with the `last_intent` restamp at the dispatch-mint
     /// site (so a stale prior-attempt heartbeat cannot leak into a new
     /// attempt's witnessed close). In-memory only — ephemeral evidence
-    /// consumed within `establishment_report_slack`.
-    pub last_reported_peaks: Option<(u64, rio_proto::types::ResourceUsage)>,
+    /// consumed within `establishment_report_slack`. The leading `f64`
+    /// is the heartbeat's `wall_seconds` (sampled with `cpu_seconds`;
+    /// sh-045 r1: makes cpu_util immune to observe-time slack).
+    pub last_reported_peaks: Option<(f64, u64, rio_proto::types::ResourceUsage)>,
     /// Estimated build duration (from Estimator). Set at merge time;
     /// never updated after. The critical-path priority uses this;
     /// stale is fine (a build taking longer than estimated doesn't

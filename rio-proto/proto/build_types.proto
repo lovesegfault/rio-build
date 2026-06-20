@@ -819,6 +819,13 @@ message ReportRunningTelemetryRequest {
   string exec_id = 1;
   uint64 peak_memory_bytes = 2;
   ResourceUsage resources = 3;
+  // sh-045 r1: builder-anchored wall-clock since spawn_build_task,
+  // sampled at the SAME instant as resources.cpu_seconds_total. The
+  // scheduler caps it at its own running_since anchor (forged-HIGH is
+  // a no-op; forged-LOW inflates cpu_util and is band-refused by
+  // TRUST_BAND_CORES). Carried so observe-time establishment slack
+  // (~120s on the housekeeping path) cannot deflate cpu_util.
+  optional double wall_seconds = 4;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

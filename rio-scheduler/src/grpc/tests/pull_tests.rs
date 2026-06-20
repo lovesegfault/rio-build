@@ -1694,6 +1694,7 @@ async fn every_executor_service_method_is_standby_gated() -> anyhow::Result<()> 
                         exec_id: uuid::Uuid::now_v7().to_string(),
                         peak_memory_bytes: 0,
                         resources: None,
+                        wall_seconds: None,
                     },
                 ))
                 .await

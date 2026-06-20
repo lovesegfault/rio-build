@@ -520,6 +520,30 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
     )
 }
 
+/// sh-045 r1: per-field max-merge of one heartbeat into the cache.
+/// `wall_seconds`, `peak_memory_bytes`, `cpu_seconds_total`,
+/// `cpu_throttled_usec`, `peak_disk_bytes` are all builder-monotone
+/// across one attempt; max-merging makes RPC ordering irrelevant (a
+/// stale ticker RPC landing after the final ship cannot regress them).
+fn merge_heartbeat_peaks(
+    slot: &mut Option<(f64, u64, rio_proto::types::ResourceUsage)>,
+    wall_seconds: f64,
+    peak_memory_bytes: u64,
+    mut resources: rio_proto::types::ResourceUsage,
+) {
+    if let Some((w, m, prev)) = slot.as_ref() {
+        resources.cpu_seconds_total = match (resources.cpu_seconds_total, prev.cpu_seconds_total) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        resources.cpu_throttled_usec = resources.cpu_throttled_usec.max(prev.cpu_throttled_usec);
+        resources.peak_disk_bytes = resources.peak_disk_bytes.max(prev.peak_disk_bytes);
+        *slot = Some((wall_seconds.max(*w), peak_memory_bytes.max(*m), resources));
+    } else {
+        *slot = Some((wall_seconds, peak_memory_bytes, resources));
+    }
+}
+
 /// `DerivationStatus` → kernel [`PullNodeStatus`]. The exhaustive
 /// `match` (no wildcard arm) pins the alphabets in lockstep: adding a
 /// scheduler variant the kernel lacks fails this compile.
@@ -2472,6 +2496,7 @@ impl DagActor {
         &mut self,
         exec_id: Uuid,
         auth_intent: Option<String>,
+        wall_seconds: f64,
         peak_memory_bytes: u64,
         resources: rio_proto::types::ResourceUsage,
         reply: oneshot::Sender<Result<(), PullRejection>>,
@@ -2480,6 +2505,7 @@ impl DagActor {
             .report_running_telemetry_inner(
                 exec_id,
                 auth_intent.as_deref(),
+                wall_seconds,
                 peak_memory_bytes,
                 resources,
             )
@@ -2491,6 +2517,7 @@ impl DagActor {
         &mut self,
         exec_id: Uuid,
         auth_intent: Option<&str>,
+        wall_seconds: f64,
         peak_memory_bytes: u64,
         resources: rio_proto::types::ResourceUsage,
     ) -> Result<(), PullRejection> {
@@ -2519,13 +2546,20 @@ impl DagActor {
             warn!(%exec_id, "ReportRunningTelemetry rejected: executor token bound to a different intent");
             return Err(PullRejection::TokenMismatch);
         }
-        // The cache write: in-memory only, last-writer-wins (the
-        // builder's 5s ticker monotonically refreshes; a heartbeat for
-        // a closed attempt's exec_id finds no live node and no-ops).
+        // The cache write: in-memory only, per-field max-merge (the
+        // builder's ticker monotonically refreshes, so a stale RPC
+        // landing after the final ship — `abort()` is fire-and-forget
+        // — cannot regress monotone fields). A heartbeat for a closed
+        // attempt's exec_id finds no live node and no-ops.
         if let Some(state) = self.dag.node_mut(drv_hash)
             && state.exec_id == Some(exec_id)
         {
-            state.sched.last_reported_peaks = Some((peak_memory_bytes, resources));
+            merge_heartbeat_peaks(
+                &mut state.sched.last_reported_peaks,
+                wall_seconds,
+                peak_memory_bytes,
+                resources,
+            );
         }
         Ok(())
     }

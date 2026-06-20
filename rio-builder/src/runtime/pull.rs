@@ -386,6 +386,7 @@ fn spawn_running_telemetry_ticker(
     exec_id: String,
     cgroup_parent: std::path::PathBuf,
     resources: crate::cgroup::ResourceSnapshotHandle,
+    started: std::time::Instant,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(TELEMETRY_TICK);
@@ -397,6 +398,7 @@ fn spawn_running_telemetry_ticker(
                 exec_id: exec_id.clone(),
                 peak_memory_bytes: peak_mem,
                 resources: Some(ru),
+                wall_seconds: Some(started.elapsed().as_secs_f64()),
             };
             if let Err(e) = client
                 .report_running_telemetry(authed_request(req, &executor_token))
@@ -1199,13 +1201,17 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     // sh-045: the running-telemetry heartbeat. Spawned AFTER the build
     // task (so the cgroup is populated) with the same authed transport
     // as the pull/report unaries; aborted after `build_phase_with_abort`
-    // returns (ticker lifetime is bounded by the assignment).
+    // returns (ticker lifetime is bounded by the assignment). `started`
+    // anchors `wall_seconds` so cpu and wall are sampled at the same
+    // instant (sh-045 r1).
+    let started = std::time::Instant::now();
     let telemetry_ticker = spawn_running_telemetry_ticker(
         rt.scheduler_client.clone(),
         executor_token.clone(),
         exec_id.clone(),
         rt.build_ctx.cgroup_parent.clone(),
         rt.build_ctx.resources.clone(),
+        started,
     );
 
     let mut sink_rx = rt
@@ -1222,6 +1228,7 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             exec_id: exec_id.clone(),
             peak_memory_bytes: peak_mem,
             resources: Some(ru),
+            wall_seconds: Some(started.elapsed().as_secs_f64()),
         };
         if let Err(e) = rt
             .scheduler_client

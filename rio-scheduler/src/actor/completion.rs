@@ -1337,11 +1337,23 @@ impl DagActor {
             return super::floor::FloorOutcome::default();
         };
         let reason_label = reason.label();
-        // sh-041u r1: `wall` is the SCHEDULER's own `running_since`
-        // anchor — derived HERE, never caller-supplied, so a
-        // worker-minted duration cannot reach the trust gate by
-        // construction (no `from_report` parameter to misuse).
-        peaks.wall = state.running_since.map(|since| since.elapsed());
+        // sh-041u r1 + sh-045 r1: `wall` is anchored by the
+        // SCHEDULER's `running_since` (stamped at the Running
+        // transition; a worker cannot mint it). The witnessed lane MAY
+        // supply a heartbeat `wall` sampled at the same instant as
+        // `cpu_seconds` — preferred for cpu_util consistency (the
+        // housekeeping caller observes after `establishment_report_slack`
+        // ≈ 120s, so `running_since.elapsed()` alone is `runtime +
+        // slack` and deflates cpu_util by `runtime/(runtime+slack)`).
+        // The heartbeat wall is CAPPED at the scheduler anchor: a
+        // forged-HIGH wall reduces to the anchor (today's behaviour,
+        // no regression); a forged-LOW wall inflates cpu_util and is
+        // band-refused by [`TRUST_BAND_CORES`].
+        let anchored = state.running_since.map(|since| since.elapsed());
+        peaks.wall = match (peaks.wall, anchored) {
+            (Some(hb), Some(a)) => Some(hb.min(a)),
+            (hb, a) => hb.or(a),
+        };
         // r[impl sched.floor.compute-bound-provisionable]
         // sh-031b: the cores axis caps at the partition-aware
         // provisionable max — feature/arch-routed AND non-ICE-exhausted
@@ -1473,36 +1485,15 @@ impl DagActor {
         let Some(last) = state.sched.last_intent.as_ref() else {
             return;
         };
-        let peaks = match state.sched.last_reported_peaks {
-            Some((peak_mem, ru)) => super::floor::ObservedPeaks::from_report(
-                // The witnessed axis carries `Some(last.X)` regardless
-                // of heartbeat (kubelet killed AT the limit; the
-                // heartbeat's last-sample may be ≤5s under-read).
-                if reason.axis_hard(Axis::Mem) {
-                    last.mem_bytes.max(peak_mem)
-                } else {
-                    peak_mem
-                },
-                ru.cpu_seconds_total,
-                Some(if reason.axis_hard(Axis::Disk) {
-                    last.disk_bytes.max(ru.peak_disk_bytes.unwrap_or(0))
-                } else {
-                    ru.peak_disk_bytes.unwrap_or(0)
-                }),
-            ),
-            // No heartbeat: the witnessed-axis-only synthesis (the
-            // pre-sh-045 behaviour). Explicit `0`/`None` on every
-            // off-axis so the soft-observe arms short-circuit.
-            None => super::floor::ObservedPeaks::from_report(
-                if reason.axis_hard(Axis::Mem) {
-                    last.mem_bytes
-                } else {
-                    0
-                },
-                None,
-                reason.axis_hard(Axis::Disk).then_some(last.disk_bytes),
-            ),
-        };
+        // sh-045 r1: the per-axis "which input do I trust on a
+        // witnessed close" policy lives in floor.rs (the chokepoint
+        // module) beside `axis_hard` — no open-coded `axis_hard` calls
+        // remain here.
+        let peaks = super::floor::ObservedPeaks::from_witnessed(
+            last,
+            state.sched.last_reported_peaks.as_ref(),
+            &reason,
+        );
         let _ = self.observe_resource_floor(drv_hash, peaks, reason).await;
     }
 

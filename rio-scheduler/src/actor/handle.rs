@@ -469,7 +469,7 @@ impl ActorHandle {
             est_deadline_secs: None,
             est_cores: None,
             floor: None,
-            peaks: Some((peak_memory_bytes, resources)),
+            peaks: Some((0.0, peak_memory_bytes, resources)),
             reply,
         })
         .await

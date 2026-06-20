@@ -1321,6 +1321,7 @@ async fn report_running_telemetry(
     handle: &ActorHandle,
     exec_id: uuid::Uuid,
     auth_intent: &str,
+    wall_seconds: f64,
     peak_memory_bytes: u64,
     resources: rio_proto::types::ResourceUsage,
 ) -> Result<(), crate::actor::pull::PullRejection> {
@@ -1328,6 +1329,7 @@ async fn report_running_telemetry(
         .query_unchecked(|reply| ActorCommand::ReportRunningTelemetry {
             exec_id,
             auth_intent: Some(auth_intent.into()),
+            wall_seconds,
             peak_memory_bytes,
             resources,
             reply,
@@ -1364,6 +1366,7 @@ async fn witnessed_emptydir_with_heartbeat_cpu_saturated_jumps_cores() -> TestRe
         &handle,
         exec_id,
         drv,
+        1800.0,
         512 << 20,
         rio_proto::types::ResourceUsage {
             cpu_seconds_total: Some(6480.0),
@@ -1438,6 +1441,7 @@ async fn witnessed_oom_with_heartbeat_cpu_saturated_jumps_cores_and_mem() -> Tes
         &handle,
         exec_id,
         drv,
+        1800.0,
         1 << 28,
         rio_proto::types::ResourceUsage {
             cpu_seconds_total: Some(6480.0),
@@ -1479,6 +1483,144 @@ async fn witnessed_oom_with_heartbeat_cpu_saturated_jumps_cores_and_mem() -> Tes
         s.sched.resource_floor.disk_bytes > 0 && s.sched.resource_floor.disk_bytes < (1 << 30),
         "disk soft-observes (heartbeat peak_disk × 1.2 — \
          Witnessed(OomKilled) is NOT disk-hard)"
+    );
+    Ok(())
+}
+
+// r[verify sched.floor.witnessed-peaks]
+/// **sh-045 r1 red-first (b2) — the parent-cgroup overhead
+/// regression.** *Proposition: a witnessed OOM whose heartbeat
+/// `memory.peak` exceeds `last.mem × TRUST_BAND_MEM` (parent cgroup
+/// includes ~100-300 MiB rio-builder overhead) STILL hard-doubles the
+/// mem floor.* RED at r0: `max(last, hb) = 556 MiB > 256 MiB × 1.05`
+/// → `count_refusal("mem")` → `floor.mem_bytes = 0` → re-OOM at the
+/// same size (the regression vs the retired `ObservedPeaks::witnessed`
+/// which passed exactly `last.mem_bytes`).
+#[tokio::test]
+async fn witnessed_oom_heartbeat_mem_overhead_still_hard_doubles() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh045-r1-mem";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, drv).await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    assert!(handle.debug_backdate_running(drv, 1800).await?);
+    handle.debug_seed_intent_cores(drv, 4, 3600).await?;
+    handle
+        .debug_seed_sched_hint(drv, Some(1 << 28), Some(1 << 30), None, None)
+        .await?;
+    // Heartbeat `memory.peak` = assigned + 300 MiB worker overhead
+    // (parent cgroup includes the rio-builder process).
+    report_running_telemetry(
+        &handle,
+        exec_id,
+        drv,
+        1800.0,
+        (1 << 28) + (300 << 20),
+        rio_proto::types::ResourceUsage {
+            cpu_seconds_total: Some(6480.0),
+            peak_disk_bytes: Some(512 << 20),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("heartbeat acked");
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("witnessed report acked");
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("synthesized Reaped acked");
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.mem_bytes,
+        1 << 29,
+        "the witnessed-HARD axis carries `last.mem_bytes` (kubelet killed \
+         AT the limit) — parent-cgroup overhead in the heartbeat cannot \
+         trip the trust-band ceiling and suppress the hard-doubling \
+         (RED at r0: 0 — `max(last, hb)` selected hb=556 MiB > \
+         256 MiB × 1.05 → count_refusal(\"mem\"))"
+    );
+    assert_eq!(
+        s.sched.resource_floor.cores, 16,
+        "cores still promotes (cpu_util = 0.90)"
+    );
+    Ok(())
+}
+
+// r[verify sched.floor.witnessed-peaks]
+/// **sh-045 r1 red-first (j) — heartbeat wall immune to observe-time
+/// slack.** *Proposition: a 120 s CPU-saturated build OOM-killed,
+/// observed 120 s LATER (the housekeeping `establishment_report_slack`
+/// path), still promotes cores.* RED at r0: `wall =
+/// running_since.elapsed() ≈ 240 s` (runtime + slack) while heartbeat
+/// `cpu_seconds = 432` was sampled at death-time → `cpu_util =
+/// 432/(240×4) = 0.45 < 0.80` → cores NOT promoted (the sh-045 headline
+/// feature silently no-ops on the housekeeping path).
+#[tokio::test]
+async fn witnessed_oom_heartbeat_wall_immune_to_slack() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "sh045-r1-wall";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, drv).await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    // Scheduler-anchored wall = 240 s (real runtime 120 s + slack 120 s
+    // — the housekeeping caller observes after `establishment_report_slack`).
+    assert!(handle.debug_backdate_running(drv, 240).await?);
+    handle.debug_seed_intent_cores(drv, 4, 3600).await?;
+    handle
+        .debug_seed_sched_hint(drv, Some(1 << 28), Some(1 << 30), None, None)
+        .await?;
+    // Heartbeat: wall = 120 s (sampled WITH cpu_seconds = 432 at death).
+    // True cpu_util = 432/(120×4) = 0.90.
+    report_running_telemetry(
+        &handle,
+        exec_id,
+        drv,
+        120.0,
+        1 << 28,
+        rio_proto::types::ResourceUsage {
+            cpu_seconds_total: Some(432.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("heartbeat acked");
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("witnessed report acked");
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("synthesized Reaped acked");
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.cores, 16,
+        "heartbeat wall (sampled with cpu_seconds, capped at the scheduler \
+         anchor) drives cpu_util — observe-time establishment slack cannot \
+         deflate it (RED at r0: 0 — running_since.elapsed()=240 s gave \
+         cpu_util=0.45 < 0.80)"
+    );
+    assert_eq!(
+        s.sched.resource_floor.mem_bytes,
+        1 << 29,
+        "mem hard-doubles regardless of slack"
     );
     Ok(())
 }
@@ -1551,6 +1693,7 @@ async fn heartbeat_cleared_on_redispatch() -> TestResult {
         &handle,
         exec_a,
         drv,
+        1.0,
         1 << 30,
         rio_proto::types::ResourceUsage {
             cpu_seconds_total: Some(9999.0),
@@ -1617,6 +1760,7 @@ async fn heartbeat_wrong_intent_rejected() -> TestResult {
         &handle,
         exec_id,
         "some-other-drv-hash",
+        1.0,
         1 << 30,
         rio_proto::types::ResourceUsage {
             cpu_seconds_total: Some(9999.0),

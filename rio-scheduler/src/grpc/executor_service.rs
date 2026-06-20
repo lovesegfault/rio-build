@@ -1079,17 +1079,20 @@ impl ExecutorService for SchedulerGrpc {
             .parse()
             .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
         // r[impl sched.executor.input-bounds+2]
-        // proto3 `double` admits ±Inf/NaN; bound at intake (the same
-        // filter `ObservedPeaks::from_report` applies, defence in depth).
+        // proto3 `double` admits ±Inf/NaN; bound at intake — the SAME
+        // [`sanitize_cpu_seconds`] filter `ObservedPeaks::from_report`
+        // applies (defence in depth, one shared predicate).
         let mut resources = req.resources.unwrap_or_default();
-        resources.cpu_seconds_total = resources
-            .cpu_seconds_total
-            .filter(|c| c.is_finite() && *c >= 0.0);
+        resources.cpu_seconds_total =
+            crate::actor::floor::sanitize_cpu_seconds(resources.cpu_seconds_total);
+        let wall_seconds =
+            crate::actor::floor::sanitize_cpu_seconds(req.wall_seconds).unwrap_or(0.0);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.actor
             .send_unchecked(ActorCommand::ReportRunningTelemetry {
                 exec_id,
                 auth_intent,
+                wall_seconds,
                 peak_memory_bytes: req.peak_memory_bytes,
                 resources,
                 reply: reply_tx,

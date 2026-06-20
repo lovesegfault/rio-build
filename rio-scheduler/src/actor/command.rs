@@ -358,6 +358,9 @@ pub enum ActorCommand {
         exec_id: uuid::Uuid,
         /// HMAC-attested intent binding (None = dev mode, no key).
         auth_intent: Option<String>,
+        /// Builder-anchored wall since `spawn_build_task`, sampled
+        /// with `resources.cpu_seconds_total` (sh-045 r1).
+        wall_seconds: f64,
         peak_memory_bytes: u64,
         resources: rio_proto::types::ResourceUsage,
         reply: oneshot::Sender<Result<(), super::pull::PullRejection>>,
@@ -876,7 +879,7 @@ pub enum DebugCmd {
         est_cores: Option<u32>,
         floor: Option<crate::state::ResourceFloor>,
         /// sh-045: seed `last_reported_peaks` (the heartbeat cache).
-        peaks: Option<(u64, rio_proto::types::ResourceUsage)>,
+        peaks: Option<(f64, u64, rio_proto::types::ResourceUsage)>,
         reply: oneshot::Sender<bool>,
     },
     /// Arm a synthetic long Tick (round-9 B8 / W9-AG): the next

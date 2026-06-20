@@ -1944,6 +1944,7 @@ impl DagActor {
                 ActorCommand::ReportRunningTelemetry {
                     exec_id,
                     auth_intent,
+                    wall_seconds,
                     peak_memory_bytes,
                     resources,
                     reply,
@@ -1954,6 +1955,7 @@ impl DagActor {
                     self.handle_report_running_telemetry(
                         exec_id,
                         auth_intent,
+                        wall_seconds,
                         peak_memory_bytes,
                         resources,
                         reply,
