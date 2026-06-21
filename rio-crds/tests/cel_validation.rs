@@ -270,22 +270,13 @@ fn pool_fetcher_forbids_fuse_cache_bytes() {
     );
 }
 
-// ── nodeSelector rules: kube-cel parity gap ───────────────────────
+// ── nodeSelector rules ────────────────────────────────────────────
 //
-// kube-cel 0.7's `json_to_cel_with_schema` applies K8s field-name
-// escaping (`.`→`__dot__`, `/`→`__slash__`) to EVERY object key,
-// including `additionalProperties` map keys. The apiserver only
-// escapes declared `properties` (struct field-access); map keys are
-// literal (`'rio.build/fetcher' in self.nodeSelector`). So the
-// `!('rio.build/fetcher' in self.nodeSelector)` disjunct is
-// vacuously true client-side and the rule never fires.
-//
-// Tracked upstream as kube-rs/kube-cel#8. The asserts below pin
-// the current (wrong) behavior so that when kube-cel fixes the gap
-// the test FAILS and prompts swapping to the real negative-case
-// assertions kept inline. The string-grep test
-// `pool::tests::cel_rules_in_schema` and `vm-*-k3s` apiserver
-// admission remain the coverage for these two rules until then.
+// kube-cel 0.7.1+ (kube-rs/kube-cel#8) leaves `additionalProperties`
+// map keys literal — matching apiserver semantics — so
+// `'rio.build/fetcher' in self.nodeSelector` evaluates correctly
+// client-side. These are real negative tests now; the old tripwire
+// asserts that pinned the pre-0.7.1 escaping bug are gone.
 // r[verify fetcher.node.dedicated+4]
 #[test]
 fn pool_fetcher_node_selector_reconciler_owned() {
@@ -294,15 +285,9 @@ fn pool_fetcher_node_selector_reconciler_owned() {
         "rio.build/fetcher".into(),
         "false".into(),
     )]));
-    let res = validate_cel(&Pool::new("p", s));
-    // TODO(kube-rs/kube-cel#8): once kube-cel stops escaping
-    // additionalProperties keys, replace with:
-    //   assert_one(expect_err(res, "Fetcher nodeSelector"),
-    //     "kind=Fetcher: nodeSelector['rio.build/fetcher'] is reconciler-owned");
-    assert!(
-        res.is_ok(),
-        "kube-cel additionalProperties-key escaping fixed — \
-         swap this for the real negative assertion (see comment)",
+    assert_one(
+        expect_err(validate_cel(&Pool::new("p", s)), "Fetcher nodeSelector"),
+        "kind=Fetcher: nodeSelector['rio.build/fetcher'] is reconciler-owned",
     );
 }
 
@@ -313,15 +298,9 @@ fn pool_builder_forbids_fetcher_node_selector() {
         "rio.build/fetcher".into(),
         "true".into(),
     )]));
-    let res = validate_cel(&Pool::new("p", s));
-    // TODO(kube-rs/kube-cel#8): once kube-cel stops escaping
-    // additionalProperties keys, replace with:
-    //   assert_one(expect_err(res, "Builder nodeSelector"),
-    //     "kind=Builder forbids nodeSelector['rio.build/fetcher']");
-    assert!(
-        res.is_ok(),
-        "kube-cel additionalProperties-key escaping fixed — \
-         swap this for the real negative assertion (see comment)",
+    assert_one(
+        expect_err(validate_cel(&Pool::new("p", s)), "Builder nodeSelector"),
+        "kind=Builder forbids nodeSelector['rio.build/fetcher']",
     );
 }
 
