@@ -658,9 +658,9 @@
     },
     "arrayvec": {
       "crateName": "arrayvec",
-      "version": "0.7.6",
+      "version": "0.7.7",
       "edition": "2018",
-      "sha256": "0l1fz4ccgv6pm609rif37sl5nv5k6lbzi7kkppgzqzh1vwix20kw",
+      "sha256": "1zjxk501fc4lnkzkdicqsk7y3l3agw89ziqjzcjca6ry9n484a7h",
       "source": {
         "type": "crates-io"
       },
@@ -3522,7 +3522,25 @@
         "Alexis Beingessner <a.beingessner@gmail.com>"
       ]
     },
-    "bitflags": {
+    "bitflags 1.3.2": {
+      "crateName": "bitflags",
+      "version": "1.3.2",
+      "edition": "2018",
+      "sha256": "12ki6w8gn1ldq7yz9y680llwk5gmrhrzszaa17g1sbrw2r2qvwxy",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The Rust Project Developers"
+      ]
+    },
+    "bitflags 2.13.0": {
       "crateName": "bitflags",
       "version": "2.13.0",
       "edition": "2021",
@@ -4035,9 +4053,9 @@
     },
     "cc": {
       "crateName": "cc",
-      "version": "1.2.64",
+      "version": "1.2.65",
       "edition": "2018",
-      "sha256": "07shcd8faxw7csz13m3cg2mj6i8z07pqs960k181pscbjpyqgn6s",
+      "sha256": "15iv1nizwngnq9if3id4cjjs4pl0rnjkd6xm82vcq5vwpv4ywa72",
       "source": {
         "type": "crates-io"
       },
@@ -5736,9 +5754,9 @@
     },
     "dashu-base": {
       "crateName": "dashu-base",
-      "version": "0.4.2",
+      "version": "0.4.3",
       "edition": "2021",
-      "sha256": "135k714n87zxxhj63rh0ddnxdfr8rn2b70dxh193k1c5disz1czs",
+      "sha256": "1r6szy6mnz2kgm7m1r2y5qx8axbf3nj1gc6w8xbkz3i43gf9afwr",
       "source": {
         "type": "crates-io"
       },
@@ -5754,9 +5772,9 @@
     },
     "dashu-int": {
       "crateName": "dashu-int",
-      "version": "0.4.2",
+      "version": "0.4.3",
       "edition": "2021",
-      "sha256": "04y7sfq5473fafy3f43s6ls8n7j4hgw2mjvf3q3rmjiavj9kvafn",
+      "sha256": "1ij27ky4zglqnzvcfmwq4g70vf94mkyk4r64hz69zcxhbh6mmh29",
       "source": {
         "type": "crates-io"
       },
@@ -5822,6 +5840,91 @@
       ],
       "authors": [
         "Julien Cretin <git@ia0.eu>"
+      ]
+    },
+    "defmt": {
+      "crateName": "defmt",
+      "version": "1.1.0",
+      "edition": "2021",
+      "sha256": "0zvzzimxq1zmw3gj42pi326ghihyzhf7pf3w4cyrb8chci829rd6",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags 1.3.2"
+        },
+        {
+          "name": "defmt-macros",
+          "packageId": "defmt-macros"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "links": "defmt",
+      "authors": [
+        "The Knurling-rs developers"
+      ]
+    },
+    "defmt-macros": {
+      "crateName": "defmt-macros",
+      "version": "1.1.0",
+      "edition": "2021",
+      "sha256": "02vaaxgbifai8kchn7nnixyzfa6qyj0q4qwbknkikxy8x5q7g8ph",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "defmt-parser",
+          "packageId": "defmt-parser"
+        },
+        {
+          "name": "proc-macro-error2",
+          "packageId": "proc-macro-error2"
+        },
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "The Knurling-rs developers"
+      ]
+    },
+    "defmt-parser": {
+      "crateName": "defmt-parser",
+      "version": "1.0.0",
+      "edition": "2021",
+      "sha256": "0gpfky9sssil5qfaix5wxcwiqk7snszhl5gq3vcwkrxjncs07mhh",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The Knurling-rs developers"
       ]
     },
     "delegate": {
@@ -7383,7 +7486,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "libc",
@@ -8626,7 +8729,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "bstr",
@@ -9107,7 +9210,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "bstr",
@@ -9272,7 +9375,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "bstr",
@@ -9665,7 +9768,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "bstr",
@@ -9914,7 +10017,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "bstr",
@@ -10028,7 +10131,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "gix-path",
@@ -10340,7 +10443,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "gix-commitgraph",
@@ -10801,11 +10904,39 @@
         "Andreas Fuchs <asf@boinkor.net>"
       ]
     },
-    "granit-parser": {
+    "granit-parser 0.0.3": {
       "crateName": "granit-parser",
       "version": "0.0.3",
       "edition": "2021",
       "sha256": "14bwwc8swz8h0v8d7qybmmq25czv5aipd1v1vbariq7rchhs62zm",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "arraydeque",
+          "packageId": "arraydeque"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Ethiraric <ethiraric@gmail.com>",
+        "David Aguilar <davvid@gmail.com>",
+        "Yuheng Chen <yuhengchen@sensetime.com>",
+        "Bourumir Wyngs <bourumir-wyngs@gmail.com>"
+      ]
+    },
+    "granit-parser 0.0.6": {
+      "crateName": "granit-parser",
+      "version": "0.0.6",
+      "edition": "2021",
+      "sha256": "18g6grvs0ya17hz2fmdhshkr6s37f106i4hx302cp4hcf52q6rhl",
       "source": {
         "type": "crates-io"
       },
@@ -12691,7 +12822,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "console",
@@ -12877,9 +13008,9 @@
     },
     "jiff": {
       "crateName": "jiff",
-      "version": "0.2.28",
+      "version": "0.2.29",
       "edition": "2021",
-      "sha256": "00lixngcc7amh2fcsxfr0z38j06lllhapz192biv1qj97q1x60s6",
+      "sha256": "0ipb184wk3hhs02hyxwcrs2c9rhwlp34rmwq8rkgplknhslpgy1l",
       "source": {
         "type": "crates-io"
       },
@@ -12935,9 +13066,9 @@
     },
     "jiff-static": {
       "crateName": "jiff-static",
-      "version": "0.2.28",
+      "version": "0.2.29",
       "edition": "2021",
-      "sha256": "0irbhfh2f4i9w5l53jcmh6ssnhdd92wfy76978chgwnxilvk4bbq",
+      "sha256": "0pzjhq4zbahp01z9lprdxs24w06rhc08qnx8q8zj3jnabsmvarh6",
       "source": {
         "type": "crates-io"
       },
@@ -13534,9 +13665,9 @@
     },
     "kube-cel": {
       "crateName": "kube-cel",
-      "version": "0.7.0",
+      "version": "0.7.1",
       "edition": "2024",
-      "sha256": "06lyqvzsmcvnajc1dij60pkqhj862kqbsj4x6ahwjnbi19b6ksr8",
+      "sha256": "1dm08l42b50f7awm30q9457g3rsy7s526ih0axf1mzmzhr9za8wp",
       "source": {
         "type": "crates-io"
       },
@@ -13686,7 +13817,7 @@
         },
         {
           "name": "serde-saphyr",
-          "packageId": "serde-saphyr"
+          "packageId": "serde-saphyr 0.0.27"
         },
         {
           "name": "serde_json",
@@ -14216,9 +14347,9 @@
     },
     "log": {
       "crateName": "log",
-      "version": "0.4.32",
+      "version": "0.4.33",
       "edition": "2021",
-      "sha256": "0fmdg0cxig7i4fwf1sw7fmg4d1gdbfzniawcfpwydy1q7320fgwm",
+      "sha256": "1bd9dmk22pxgnf0h0slba6rz99zb0a0b2mdhpk8p92bp26ycbvhc",
       "source": {
         "type": "crates-io"
       },
@@ -15118,7 +15249,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "cfg-if",
@@ -15170,7 +15301,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "cfg-if",
@@ -15615,7 +15746,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -17467,6 +17598,68 @@
         "Bastian Köcher <git@kchr.de>"
       ]
     },
+    "proc-macro-error-attr2": {
+      "crateName": "proc-macro-error-attr2",
+      "version": "2.0.0",
+      "edition": "2021",
+      "sha256": "1ifzi763l7swl258d8ar4wbpxj4c9c2im7zy89avm6xv6vgl5pln",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "CreepySkeleton <creepy-skeleton@yandex.ru>",
+        "GnomedDev <david2005thomas@gmail.com>"
+      ]
+    },
+    "proc-macro-error2": {
+      "crateName": "proc-macro-error2",
+      "version": "2.0.1",
+      "edition": "2021",
+      "sha256": "00lq21vgh7mvyx51nwxwf822w2fpww1x0z8z0q47p8705g2hbv0i",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "proc-macro-error-attr2",
+          "packageId": "proc-macro-error-attr2"
+        },
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "syn-error"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "CreepySkeleton <creepy-skeleton@yandex.ru>",
+        "GnomedDev <david2005thomas@gmail.com>"
+      ]
+    },
     "proc-macro2": {
       "crateName": "proc-macro2",
       "version": "1.0.106",
@@ -17539,7 +17732,7 @@
         },
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "num-traits",
@@ -17778,7 +17971,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "memchr",
@@ -18500,7 +18693,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         }
       ],
       "libCrateTypes": [
@@ -18581,7 +18774,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -19905,7 +20098,7 @@
         },
         {
           "name": "serde-saphyr",
-          "packageId": "serde-saphyr"
+          "packageId": "serde-saphyr 0.0.28"
         },
         {
           "name": "serde_json",
@@ -20763,7 +20956,7 @@
         },
         {
           "name": "serde-saphyr",
-          "packageId": "serde-saphyr"
+          "packageId": "serde-saphyr 0.0.28"
         },
         {
           "name": "tokio",
@@ -21438,7 +21631,7 @@
         },
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "block-padding",
@@ -21846,7 +22039,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "errno",
@@ -22620,7 +22813,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "core-foundation",
@@ -22751,7 +22944,7 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
-    "serde-saphyr": {
+    "serde-saphyr 0.0.27": {
       "crateName": "serde-saphyr",
       "version": "0.0.27",
       "edition": "2024",
@@ -22783,7 +22976,7 @@
         },
         {
           "name": "granit-parser",
-          "packageId": "granit-parser"
+          "packageId": "granit-parser 0.0.3"
         },
         {
           "name": "nohash-hasher",
@@ -22796,6 +22989,70 @@
         {
           "name": "serde",
           "packageId": "serde"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "zmij",
+          "packageId": "zmij"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "deserialize",
+        "serialize"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "serde-saphyr 0.0.28": {
+      "crateName": "serde-saphyr",
+      "version": "0.0.28",
+      "edition": "2024",
+      "sha256": "1v75md6hgcvjypr09m5ary394yhn55priw5w4v2wj39pjz13npm1",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "ahash",
+          "packageId": "ahash"
+        },
+        {
+          "name": "annotate-snippets",
+          "packageId": "annotate-snippets"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64 0.22.1"
+        },
+        {
+          "name": "encoding_rs_io",
+          "packageId": "encoding_rs_io"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "granit-parser",
+          "packageId": "granit-parser 0.0.6"
+        },
+        {
+          "name": "nohash-hasher",
+          "packageId": "nohash-hasher"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
         },
         {
           "name": "smallvec",
@@ -24260,7 +24517,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "byteorder",
@@ -24371,7 +24628,7 @@
         },
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "byteorder",
@@ -26391,7 +26648,7 @@
         },
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "bytes",
@@ -26470,7 +26727,7 @@
       "dependencies": [
         {
           "name": "bitflags",
-          "packageId": "bitflags"
+          "packageId": "bitflags 2.13.0"
         },
         {
           "name": "bytes",
@@ -28877,12 +29134,12 @@
         },
         {
           "name": "bitflags",
-          "packageId": "bitflags",
+          "packageId": "bitflags 2.13.0",
           "target": "aarch64-unknown-linux-gnu"
         },
         {
           "name": "bitflags",
-          "packageId": "bitflags",
+          "packageId": "bitflags 2.13.0",
           "target": "x86_64-unknown-linux-gnu"
         },
         {
@@ -29445,12 +29702,12 @@
         },
         {
           "name": "bitflags",
-          "packageId": "bitflags",
+          "packageId": "bitflags 2.13.0",
           "target": "aarch64-unknown-linux-gnu"
         },
         {
           "name": "bitflags",
-          "packageId": "bitflags",
+          "packageId": "bitflags 2.13.0",
           "target": "x86_64-unknown-linux-gnu"
         },
         {
@@ -30233,7 +30490,7 @@
         },
         {
           "name": "serde-saphyr",
-          "packageId": "serde-saphyr"
+          "packageId": "serde-saphyr 0.0.28"
         },
         {
           "name": "serde_json",

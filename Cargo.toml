@@ -314,7 +314,7 @@ schemars = "1"
 # kubeconfig parsing to serde-saphyr too, so the tree converges on one
 # YAML stack once that lands; until then kube still pulls serde_yaml
 # transitively.
-serde-saphyr = "0.0.27"
+serde-saphyr = "0.0.28"
 
 # --- phase3a: health + streaming ---
 # grpc.health.v1.Health service. K8s readiness probes hit this.
