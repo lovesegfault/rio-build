@@ -83,6 +83,19 @@ let
     TYPST_FONT_PATHS = lib.concatStringsSep ":" (map toString fonts);
   };
 
+  # Retired-pipeline artifact dirs. Forward-dead (the wrapper that
+  # wrote there is deleted) but NOT backward-dead: existing checkouts
+  # may still carry ~230 vendored .typ under docs/.cache/typst-xdg/,
+  # and non-flake `nix-build` from such a tree would compile/lint them.
+  # .gitignore covers `git add`; this covers the dirty-tree path.
+  # Exported (as `docsLib.docsRetiredArtifacts`) so misc-checks.nix's
+  # `docs-lint` typSrc subtracts the SAME set — the two filesets had
+  # already drifted once when typSrc dropped this guard.
+  docsRetiredArtifacts = lib.fileset.unions [
+    (lib.fileset.maybeMissing ../docs/.cache)
+    (lib.fileset.maybeMissing ../docs/dist)
+  ];
+
   # Typst sources only. docs/gen/ is excluded — compileRoot overlays
   # the hermetic docsData there. docs/assets/ is excluded from the
   # shared compile root and overlaid only in mkDocs (the HTML build)
@@ -98,12 +111,7 @@ let
         # literal path; not book content. Excluded so editing it doesn't
         # rebuild docs-pdf/docs-html.
         (lib.fileset.maybeMissing ../docs/REVIEW.md)
-        # Retired-pipeline artifacts: existing checkouts may still carry
-        # vendored .typ under docs/.cache/typst-xdg/ from the deleted
-        # wrapper. .gitignore covers `git add`; this covers non-flake
-        # `nix-build` from a dirty tree.
-        (lib.fileset.maybeMissing ../docs/.cache)
-        (lib.fileset.maybeMissing ../docs/dist)
+        docsRetiredArtifacts
       ]
     );
   };
@@ -373,7 +381,12 @@ let
   docsPdfCheck = mkDocsPdf placeholderSha;
 in
 rec {
-  inherit rioTypst typstEnv docsData;
+  inherit
+    rioTypst
+    typstEnv
+    docsData
+    docsRetiredArtifacts
+    ;
 
   # Real-SHA builds for `packages.{docs,docs-pdf}` — the deployed
   # artifacts whose refs.gh() permalinks readers actually click.

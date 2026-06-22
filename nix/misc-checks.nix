@@ -2179,21 +2179,17 @@ in
     pkgs.runCommand "rio-docs-lint"
       {
         nativeBuildInputs = [ pkgs.jq ];
-        # docs/**/*.typ. The `difference docs/.cache + docs/dist` guard
-        # is forward-dead (the wrapper that wrote there is deleted) but
-        # NOT backward-dead: existing checkouts that ever ran the old
-        # wrapper still carry ~230 vendored .typ under
-        # docs/.cache/typst-xdg/, and non-flake `nix-build` from such a
-        # tree would lint them against deny_shared. .gitignore covers
-        # `git add`; this covers the dirty-tree path.
+        # docs/**/*.typ. NOT derived from docsLib's docsSrc — that
+        # narrowing also drops docs/gen + docs/assets, which this lint
+        # MUST see. The retired-pipeline `.cache`/`dist` guard is the
+        # one piece both filesets must subtract in lockstep, so it's
+        # single-sourced from `docsLib.docsRetiredArtifacts` (the two
+        # had already drifted once when this side dropped it).
         typSrc = pkgs.lib.fileset.toSource {
           root = ../docs;
-          fileset = pkgs.lib.fileset.difference (pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs) (
-            pkgs.lib.fileset.unions [
-              (pkgs.lib.fileset.maybeMissing ../docs/.cache)
-              (pkgs.lib.fileset.maybeMissing ../docs/dist)
-            ]
-          );
+          fileset = pkgs.lib.fileset.difference (pkgs.lib.fileset.fileFilter (
+            f: f.hasExt "typ"
+          ) ../docs) docsLib.docsRetiredArtifacts;
         };
         # Non-.typ files that reference docs by path — rust comments +
         # warn! bodies, nix comments, github workflows, shell scripts,
