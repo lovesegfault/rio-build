@@ -191,8 +191,8 @@ let
   # project-site URL (lovesegfault.github.io/rio-build/) would NOT — it
   # serves under a `/<repo>/` subpath that root-relative links escape.
   # If the custom domain is ever dropped, hrefs need a base-path prefix
-  # (shiroa's `x-url-base` mechanism, not ported to the native bundle).
-  # Verified: `gh api repos/lovesegfault/rio-build/pages | jq .cname`.
+  # (the prior HTML pipeline threaded one via a typst input; the native
+  # bundle does not). Verified: `gh api repos/.../pages | jq .cname`.
   siteUrl = "https://docs.rio-build.com";
   mkInputArgs =
     ghSha:
