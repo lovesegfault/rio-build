@@ -150,7 +150,11 @@
     }
 
     // ─── on-this-page scroll-spy ────────────────────────────────────
-    const tocLinks = [...document.querySelectorAll(".rio-toc a")];
+    // Selector restricted to fragment links: `.rio-toc a` alone matches
+    // an `<a>` with no href (or a non-fragment href), and
+    // `getAttribute("href")` is then null → `.slice(1)` throws and
+    // takes the whole DOMContentLoaded handler down with it.
+    const tocLinks = [...document.querySelectorAll(".rio-toc a[href^='#']")];
     if (tocLinks.length > 0) {
       const byId = new Map(
         tocLinks.map((a) => [a.getAttribute("href").slice(1), a]),
