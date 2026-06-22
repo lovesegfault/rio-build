@@ -2806,13 +2806,13 @@ in
           echo "FAIL: indented '= ' parsed as heading — escape as '\= ' or rewrap" >&2
           fail=1
         fi
-        # QA4-#1: CSS-presence in source (base64-decode in docs-html-smoke
-        # is fragile; source-grep is robust). Native-bundle: CSS lives in
-        # docs/assets/style.css, not inlined in lib/rio.typ. QA4-#5
-        # (scrollbar-width: thin) dropped — the native-bundle stylesheet
-        # does not carry that rule.
+        # QA4-#1/#5: CSS-presence in source (base64-decode in docs-
+        # html-smoke is fragile; source-grep is robust). Native-bundle:
+        # CSS lives in docs/assets/style.css, not inlined in lib/rio.typ.
         grep -q '\.rio-frame svg' $styleCss \
           || { echo "FAIL: assets/style.css missing '.rio-frame svg' (QA4-#1 invert scope)" >&2; fail=1; }
+        grep -q 'scrollbar-width: thin' $styleCss \
+          || { echo "FAIL: assets/style.css missing 'scrollbar-width: thin' (QA4-#5 wide-table affordance)" >&2; fail=1; }
         [[ $fail -eq 0 ]]
         touch $out
       '';
