@@ -40,6 +40,12 @@ serde_json = { workspace = true }
 # Write-only for crdgen (and the crd_serializes test).
 serde-saphyr = { workspace = true }
 
+[features]
+# Gates `PoolSpec::test_fixture` (and any future test-only constructor)
+# so prod callers can't reach for a constructor with hardcoded
+# `"rio-builder:test"`. Same convention as rio-store/rio-nix.
+test-utils = []
+
 [dev-dependencies]
 # `cel` feature pulls kube-cel (pure-Rust CEL interpreter) so unit
 # tests can EVALUATE x-kubernetes-validations against test instances
@@ -47,3 +53,7 @@ serde-saphyr = { workspace = true }
 # don't link the CEL interpreter; the apiserver evaluates rules
 # server-side.
 kube = { workspace = true, features = ["cel"] }
+# Self-reference to enable `test-utils` for integration tests under
+# tests/ (cfg(test) is NOT set when the lib is compiled for an
+# integration test). Same pattern as rio-store.
+rio-crds = { path = ".", features = ["test-utils"] }

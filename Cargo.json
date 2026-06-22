@@ -20018,6 +20018,10 @@
           "packageId": "prost"
         },
         {
+          "name": "rio-crds",
+          "packageId": "rio-crds"
+        },
+        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
         },
@@ -20081,7 +20085,14 @@
         {
           "name": "kube",
           "packageId": "kube"
+        },
+        {
+          "name": "rio-crds",
+          "packageId": "rio-crds"
         }
+      ],
+      "resolvedDefaultFeatures": [
+        "test-utils"
       ],
       "crateBin": [
         {

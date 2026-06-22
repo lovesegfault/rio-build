@@ -305,7 +305,7 @@ impl PoolSpec {
     /// so adding a `PoolSpec` field hits exactly one struct
     /// literal. CEL-exhaustiveness is the point — don't
     /// `#[derive(Default)]` on `PoolSpec`.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn test_fixture(kind: ExecutorKind) -> Self {
         Self {
             kind,

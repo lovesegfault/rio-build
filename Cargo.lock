@@ -6349,6 +6349,7 @@ version = "0.1.0"
 dependencies = [
  "k8s-openapi",
  "kube",
+ "rio-crds",
  "schemars 1.2.1",
  "serde",
  "serde-saphyr",

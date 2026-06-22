@@ -80,6 +80,8 @@ rand = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+# `PoolSpec::test_fixture` for fixtures.rs (cfg-gated in rio-crds).
+rio-crds = { workspace = true, features = ["test-utils"] }
 # ApiServerVerifier + Scenario (tower-test mock apiserver).
 rio-test-support = { workspace = true }
 http = { workspace = true }
