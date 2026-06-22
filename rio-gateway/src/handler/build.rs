@@ -2048,9 +2048,15 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
         .await
         {
             Ok(r) => break r,
+            // RESOURCE_EXHAUSTED: scheduler's cost-axis backpressure
+            // gate (scheduler_service.rs) — same idempotency proof as
+            // UNAVAILABLE applies (no build_id ⇒ MergeDag rolled back).
+            // The 0.5/1/2/4s backoff covers the observed flap window.
             Err(st)
-                if st.code() == tonic::Code::Unavailable
-                    && st.metadata().get(rio_proto::BUILD_ID_HEADER).is_none()
+                if matches!(
+                    st.code(),
+                    tonic::Code::Unavailable | tonic::Code::ResourceExhausted
+                ) && st.metadata().get(rio_proto::BUILD_ID_HEADER).is_none()
                     && attempt < SUBMIT_RETRIES =>
             {
                 let delay = SUBMIT_RETRY_BACKOFF.duration(attempt);
@@ -2058,8 +2064,9 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
                 tracing::debug!(
                     attempt,
                     delay_ms = delay.as_millis() as u64,
+                    code = ?st.code(),
                     error = %st,
-                    "SubmitBuild refused as retryable (UNAVAILABLE, pre-build_id); retrying"
+                    "SubmitBuild refused as retryable (pre-build_id); retrying"
                 );
                 tokio::time::sleep(delay).await;
             }
