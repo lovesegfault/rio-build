@@ -64,6 +64,11 @@ fn cscaler_spec() -> ComponentScalerSpec {
 
 /// Unwrap-err helper that names which rule under test passed when it
 /// should have failed.
+///
+/// Not `Result::expect_err`: this interpolates `which` into a uniform
+/// "CEL rule `{which}` accepted an invalid instance" message at 18
+/// callsites; std's would need that boilerplate repeated each time.
+/// `()`'s Debug impl (what std would print) carries no signal.
 #[track_caller]
 fn expect_err<T>(res: Result<T, ValidationErrors>, which: &str) -> ValidationErrors {
     match res {
