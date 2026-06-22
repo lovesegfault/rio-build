@@ -78,9 +78,10 @@ pub async fn run(tag: &str) -> Result<()> {
     // and vendors it back; the in-tree path moved. Older tags (the
     // //provenance baseline records v27.5.1) still have the profile at
     // `profiles/seccomp/default.json` — try the vendored path first
-    // and fall back on any non-2xx so `xtask regen seccomp <old-tag>`
-    // (the diff-against-recorded-baseline workflow) keeps working
-    // through a transient CDN 5xx on the first URL.
+    // and fall back on any non-2xx OR transport error (timeout /
+    // connect-reset / DNS — a CDN blip surfaces as `reqwest::Error`,
+    // not a served 5xx) so `xtask regen seccomp <old-tag>` keeps
+    // working through a transient outage on the first URL.
     let base = format!("https://raw.githubusercontent.com/moby/moby/{tag}");
     let urls = [
         format!("{base}/vendor/github.com/moby/profiles/seccomp/default.json"),
@@ -91,7 +92,13 @@ pub async fn run(tag: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let mut v: Value = 'fetch: {
         for url in &urls {
-            let resp = client.get(url).send().await?;
+            let resp = match client.get(url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    info!("  {url} → transport error ({e}), trying fallback");
+                    continue;
+                }
+            };
             let status = resp.status();
             if !status.is_success() {
                 info!("  {url} → {status}, trying fallback");
