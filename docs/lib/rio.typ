@@ -25,7 +25,7 @@
 // - `is-html()`/`is-paged()` wrap typst's native contextual `target()`.
 
 // ─── package imports ────────────────────────────────────────────────
-#import "/lib/html/meta.typ": chapters, flatten-chapters, label-for, route-for
+#import "/lib/html/meta.typ": flat-chapters, href-for, label-for, route-for
 
 #let is-html() = target() == "html"
 #let is-paged() = target() == "paged"
@@ -50,7 +50,7 @@
 #let cross-link(path, body) = context {
   let p = if path.starts-with("/") { path.slice(1) } else { path }
   if is-html() {
-    html.elem("a", attrs: (href: "/" + route-for(p) + ".html"))[#body]
+    html.elem("a", attrs: (href: href-for(p)))[#body]
   } else {
     let lbl = label-for(p)
     if query(lbl).len() > 0 { link(lbl, body) } else { body }
@@ -170,14 +170,15 @@
 // an argument, so it is NOT threaded through here. Must be called from
 // `context`.
 #let _chapter-nav() = {
-  let flat = flatten-chapters(chapters).filter(c => c.path != none)
   let cur = _current-route.get()
   if cur == none { return (prev: none, next: none) }
-  let idx = flat.position(c => route-for(c.path) == cur)
+  let idx = flat-chapters.position(c => route-for(c.path) == cur)
   if idx == none { return (prev: none, next: none) }
   (
-    prev: if idx > 0 { flat.at(idx - 1) } else { none },
-    next: if idx + 1 < flat.len() { flat.at(idx + 1) } else { none },
+    prev: if idx > 0 { flat-chapters.at(idx - 1) } else { none },
+    next: if idx + 1 < flat-chapters.len() { flat-chapters.at(idx + 1) } else {
+      none
+    },
   )
 }
 
@@ -792,7 +793,7 @@
               attrs: (
                 class: cls,
                 rel: rel,
-                href: "/" + route-for(ch.path) + ".html",
+                href: href-for(ch.path),
                 aria-label: rel + ": " + ch.title,
               ),
               if rel == "prev" [#arrow #ch.title] else [#ch.title #arrow],

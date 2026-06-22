@@ -132,6 +132,11 @@
   out
 }
 
+// The flat page list — every node with a `path`. Derived once so the
+// three consumers (book.typ's per-page document() loop + sitemap,
+// rio.typ's prev/next nav) can't disagree on which routes exist.
+#let flat-chapters = flatten-chapters(chapters).filter(c => c.path != none)
+
 // Ancestor chain root→leaf for breadcrumbs. Returns an array of
 // `(title, path|none)` pairs including the leaf itself; section-heading
 // nodes (path: none) keep their `none` so the caller renders them
@@ -150,6 +155,13 @@
   if path == "intro.typ" { "index" } else { path.slice(0, path.len() - 4) }
 }
 
+// Root-relative href for internal links (`<a href="…">`). Single
+// source for the `/route.html` shape so a base-path prefix or
+// extension change (nix/docs.nix warns the GH-Pages-subpath case
+// needs threading one) hits one fn — not the four destructure-and-
+// concat sites that existed before.
+#let href-for(path) = "/" + route-for(path) + ".html"
+
 // Deploy base for canonical/OG/sitemap URLs. nix/docs.nix passes this
 // unconditionally; only out-of-band `typst compile` hits the empty
 // default (which then omits canonical/OG meta + sitemap).
@@ -165,3 +177,9 @@
 }
 
 #let label-for(path) = label("chapter:" + route-for(path))
+
+// Ayu accent hex pair. Typst-side single source for theme-color,
+// favicon, and the og-image card; docs/assets/style.css's `--accent`
+// MUST match (CSS can't read typst — keep the two in step by hand;
+// the docs-html-smoke palette grep is the tripwire).
+#let accent = (light: "#f29718", dark: "#e6b450")

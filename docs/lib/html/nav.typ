@@ -7,7 +7,7 @@
 // Nodes with children render as `<details>` accordions; the `open`
 // attribute is set on the path from root to the current page so the
 // active leaf is visible on load without JS.
-#import "meta.typ": chapters, route-for
+#import "meta.typ": chapters, href-for, route-for
 
 // True if `current` is the route of any descendant of `children`.
 #let _contains(current, children) = children.any(
@@ -21,7 +21,7 @@
   let label = if path == none {
     html.elem("span", attrs: (class: "section"))[#title]
   } else {
-    let attrs = (href: "/" + route-for(path) + ".html")
+    let attrs = (href: href-for(path))
     if is-current { attrs.insert("aria-current", "page") }
     html.elem("a", attrs: attrs)[#title]
   }

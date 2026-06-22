@@ -4,21 +4,28 @@
 // content block and no `attrs:`, so the document root goes through
 // `html.elem("html", attrs: ...)` instead.
 #import "meta.typ": (
-  canonical-url, chapters, crumb-trail, descriptions, repo-edit-base, route-for,
-  site-url,
+  accent, canonical-url, chapters, crumb-trail, descriptions, href-for,
+  repo-edit-base, site-url,
 )
 #import "nav.typ": nav-tree
 #import "/lib/rio.typ": _current-route, _page-toc
 
 // Ayu accent — keeps the mobile-chrome tint in step with style.css.
-// Light/dark pair mirrors `--accent` in style.css; the dark entry
-// carries `media` so a dark-OS user gets the dark tint regardless of
-// the in-page data-theme toggle (browsers only read the meta, not the
+// Light/dark pair from meta.typ `accent`; the dark entry carries
+// `media` so a dark-OS user gets the dark tint regardless of the
+// in-page data-theme toggle (browsers only read the meta, not the
 // stylesheet).
 #let _theme-color = (
-  (media: none, content: "#f29718"),
-  (media: "(prefers-color-scheme: dark)", content: "#e6b450"),
+  (media: none, content: accent.light),
+  (media: "(prefers-color-scheme: dark)", content: accent.dark),
 )
+
+// `<meta {kind}="k" content="v">` for each pair. The og:* block was
+// ~40 lines of triple-nested `html.elem` copy-paste; one helper, one
+// tuple per tag.
+#let _meta-tags(kind, pairs) = for (k, v) in pairs {
+  html.elem("meta", attrs: ((kind): k, content: v))
+}
 
 #let page-shell(route, title, src-path, body) = {
   _current-route.update(route)
@@ -61,31 +68,18 @@
       }
       #if page-url != none {
         html.elem("link", attrs: (rel: "canonical", href: page-url))
-        html.elem("meta", attrs: (property: "og:title", content: title))
-        html.elem("meta", attrs: (property: "og:type", content: "article"))
-        html.elem("meta", attrs: (property: "og:url", content: page-url))
-        html.elem("meta", attrs: (
-          property: "og:description",
-          content: meta-desc,
-        ))
-        // PNG, not SVG: OG scrapers (Slack/LinkedIn/Twitter/Facebook)
-        // require raster. nix/docs.nix rasterizes book.typ's
-        // og-image.svg via resvg.
-        html.elem("meta", attrs: (
-          property: "og:image",
-          content: site-url + "/og-image.png",
-        ))
-        html.elem("meta", attrs: (
-          property: "og:image:type",
-          content: "image/png",
-        ))
-        html.elem("meta", attrs: (
-          property: "og:image:width",
-          content: "1200",
-        ))
-        html.elem("meta", attrs: (
-          property: "og:image:height",
-          content: "630",
+        _meta-tags("property", (
+          ("og:title", title),
+          ("og:type", "article"),
+          ("og:url", page-url),
+          ("og:description", meta-desc),
+          // PNG, not SVG: OG scrapers (Slack/LinkedIn/Twitter/
+          // Facebook) require raster. nix/docs.nix rasterizes
+          // book.typ's og-image.svg via resvg.
+          ("og:image", site-url + "/og-image.png"),
+          ("og:image:type", "image/png"),
+          ("og:image:width", "1200"),
+          ("og:image:height", "630"),
         ))
       }
       #for tc in _theme-color {
@@ -96,9 +90,12 @@
       #html.title[#title — rio-build design book]
       // Inline SVG favicon (Ayu accent disc + "r" glyph). data: URI so
       // it ships with every page — no /favicon.ico round-trip.
+      // `accent.light` minus its leading `#` (URL-encoded as `%23`).
       #html.elem("link", attrs: (
         rel: "icon",
-        href: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23f29718'/><text x='16' y='22' text-anchor='middle' font-size='18' font-weight='bold' fill='%2310141c'>r</text></svg>",
+        href: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23"
+          + accent.light.slice(1)
+          + "'/><text x='16' y='22' text-anchor='middle' font-size='18' font-weight='bold' fill='%2310141c'>r</text></svg>",
       ))
       // Preload the three above-the-fold faces so font-display:swap's
       // fallback window closes before first paint (FOUT layout-shift).
@@ -205,9 +202,7 @@
                   if p == none or leaf {
                     [#t]
                   } else {
-                    html.elem("a", attrs: (
-                      href: "/" + route-for(p) + ".html",
-                    ))[#t]
+                    html.elem("a", attrs: (href: href-for(p)))[#t]
                   },
                 )
               }),

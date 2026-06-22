@@ -5,7 +5,7 @@
 // so this file only routes + wraps in the page shell. PDF stitching
 // is `book-pdf.typ`.
 #import "/lib/html/meta.typ": (
-  canonical-url, chapters, flatten-chapters, route-for, site-url,
+  accent, canonical-url, flat-chapters, route-for, site-url,
 )
 #import "/lib/html/page.typ": page-shell
 #import "/lib/rio.typ": bundle-mode
@@ -15,7 +15,7 @@
 // glossary.typ's `print-glossary` is the sole `<key>` emitter.
 #bundle-mode()
 
-#for c in flatten-chapters(chapters).filter(c => c.path != none) {
+#for c in flat-chapters {
   let route = route-for(c.path)
   document(
     route + ".html",
@@ -48,7 +48,9 @@
 // Facebook) do not render SVG; page.typ points og:image at the PNG.
 #asset("og-image.svg", bytes(
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 630'>\n"
-    + "  <rect width='1200' height='630' fill='#f29718'/>\n"
+    + "  <rect width='1200' height='630' fill='"
+    + accent.light
+    + "'/>\n"
     + "  <text x='600' y='360' text-anchor='middle'\n"
     + "    font-family='NewComputerModernSans10, sans-serif'\n"
     + "    font-size='140' font-weight='700' fill='#ffffff'>rio-build</text>\n"
@@ -59,11 +61,7 @@
 // `packages.docs` build); a relative-only sitemap is invalid per the
 // sitemaps.org schema.
 #if site-url != "" {
-  let routes = flatten-chapters(chapters)
-    .filter(c => (
-      c.path != none
-    ))
-    .map(c => route-for(c.path))
+  let routes = flat-chapters.map(c => route-for(c.path))
   asset("robots.txt", bytes(
     "User-agent: *\nAllow: /\nSitemap: " + site-url + "/sitemap.xml\n",
   ))
