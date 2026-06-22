@@ -2059,10 +2059,8 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
             //   pre-merge here; the build_id-header gate is the law,
             //   the code pair is its narrow trigger set)
             Err(st)
-                if matches!(
-                    st.code(),
-                    tonic::Code::Unavailable | tonic::Code::ResourceExhausted
-                ) && st.metadata().get(rio_proto::BUILD_ID_HEADER).is_none()
+                if rio_proto::is_retryable_refusal_code(st.code())
+                    && st.metadata().get(rio_proto::BUILD_ID_HEADER).is_none()
                     && attempt < SUBMIT_RETRIES =>
             {
                 let delay = SUBMIT_RETRY_BACKOFF.duration(attempt);

@@ -27,6 +27,22 @@ pub use rio_common::grpc::{
 /// can't drift again.
 pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 
+/// True for gRPC status codes the scheduler emits as a RETRYABLE
+/// refusal (`r[sched.grpc.fence-retryable]`): UNAVAILABLE
+/// (fence/not-leader/actor-dead) and RESOURCE_EXHAUSTED (cost-axis
+/// backpressure). The gateway's bounded SubmitBuild retry loop and
+/// the scheduler's `actor_error_to_status`/`pull_rejection_to_status`
+/// `RetryClass`-consistency assertions all key on this pair — one
+/// predicate so a third retryable refusal class (or a remap) lands in
+/// one place instead of four.
+// r[impl sched.grpc.fence-retryable]
+pub fn is_retryable_refusal_code(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable | tonic::Code::ResourceExhausted
+    )
+}
+
 /// The `build_types.proto` SOURCE TEXT, embedded from this crate's own
 /// proto dir (bug_090): the worker→scheduler completion-report
 /// boundary's schema, exported so rio-scheduler's schema-derived

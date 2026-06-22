@@ -185,7 +185,6 @@ async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
 #[test]
 fn retry_class_code_consistency() {
     use crate::actor::{PullRejection, RetryClass};
-    use tonic::Code;
     let actor_errors: Vec<ActorError> = vec![
         ActorError::BuildNotFound(Uuid::nil()),
         ActorError::Backpressure,
@@ -215,7 +214,7 @@ fn retry_class_code_consistency() {
         let code = crate::grpc::actor_guards::actor_error_to_status(err).code();
         assert_eq!(
             class == RetryClass::Retryable,
-            matches!(code, Code::Unavailable | Code::ResourceExhausted),
+            rio_proto::is_retryable_refusal_code(code),
             "class/code divergence: {class:?} vs {code:?}"
         );
     }
@@ -230,7 +229,7 @@ fn retry_class_code_consistency() {
         let code = crate::grpc::actor_guards::pull_rejection_to_status(&r).code();
         assert_eq!(
             class == RetryClass::Retryable,
-            matches!(code, Code::Unavailable | Code::ResourceExhausted),
+            rio_proto::is_retryable_refusal_code(code),
             "pull class/code divergence: {class:?} vs {code:?}"
         );
     }

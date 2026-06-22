@@ -86,8 +86,9 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // window and the request is perfectly valid on the live
         // leader — it must surface as a retryable refusal. No client
         // retries FAILED_PRECONDITION (the gateway's bounded
-        // SubmitBuild retry keys on UNAVAILABLE only), so the previous
-        // mapping turned every fence trip into a user-visible failure.
+        // SubmitBuild retry keys on `is_retryable_refusal_code`), so
+        // the previous mapping turned every fence trip into a
+        // user-visible failure.
         ActorError::StaleGeneration { .. } => Status::unavailable(err.to_string()),
     };
     // The code DERIVES from the retry class
@@ -98,10 +99,7 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
     // retry_class_code_consistency census pins — not an adjudication site)
     debug_assert_eq!(
         err.retry_class() == crate::actor::RetryClass::Retryable,
-        matches!(
-            status.code(),
-            tonic::Code::Unavailable | tonic::Code::ResourceExhausted
-        ),
+        rio_proto::is_retryable_refusal_code(status.code()),
         "actor_error_to_status: code/class divergence for {err:?}"
     );
     status
@@ -148,10 +146,7 @@ pub(crate) fn pull_rejection_to_status(rejection: &crate::actor::PullRejection) 
     // retry_class_code_consistency census pins — not an adjudication site)
     debug_assert_eq!(
         rejection.retry_class() == crate::actor::RetryClass::Retryable,
-        matches!(
-            status.code(),
-            tonic::Code::Unavailable | tonic::Code::ResourceExhausted
-        ),
+        rio_proto::is_retryable_refusal_code(status.code()),
         "pull_rejection_to_status: code/class divergence for {rejection:?}"
     );
     status
