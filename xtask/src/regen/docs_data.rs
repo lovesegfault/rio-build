@@ -1220,15 +1220,7 @@ fn helm_ns() -> Result<serde_json::Value> {
     struct Values {
         namespaces: BTreeMap<String, serde_json::Value>,
     }
-    // serde-saphyr 0.0.28 switched to granit-parser, which hard-caps
-    // consecutive buffered comment lines at 32; values.yaml has 40-48
-    // line rationale blocks. docs-data only needs the namespaces map,
-    // so strip comments before parsing.
-    let body = fs::read_to_string(repo_root().join("infra/helm/rio-build/values.yaml"))?
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let body = fs::read_to_string(repo_root().join("infra/helm/rio-build/values.yaml"))?;
     let v: Values = serde_saphyr::from_str(&body)?;
     let mut out = serde_json::Map::new();
     for (role, raw) in v.namespaces {

@@ -10904,39 +10904,11 @@
         "Andreas Fuchs <asf@boinkor.net>"
       ]
     },
-    "granit-parser 0.0.3": {
+    "granit-parser": {
       "crateName": "granit-parser",
       "version": "0.0.3",
       "edition": "2021",
       "sha256": "14bwwc8swz8h0v8d7qybmmq25czv5aipd1v1vbariq7rchhs62zm",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "arraydeque",
-          "packageId": "arraydeque"
-        },
-        {
-          "name": "smallvec",
-          "packageId": "smallvec"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Ethiraric <ethiraric@gmail.com>",
-        "David Aguilar <davvid@gmail.com>",
-        "Yuheng Chen <yuhengchen@sensetime.com>",
-        "Bourumir Wyngs <bourumir-wyngs@gmail.com>"
-      ]
-    },
-    "granit-parser 0.0.6": {
-      "crateName": "granit-parser",
-      "version": "0.0.6",
-      "edition": "2021",
-      "sha256": "18g6grvs0ya17hz2fmdhshkr6s37f106i4hx302cp4hcf52q6rhl",
       "source": {
         "type": "crates-io"
       },
@@ -13817,7 +13789,7 @@
         },
         {
           "name": "serde-saphyr",
-          "packageId": "serde-saphyr 0.0.27"
+          "packageId": "serde-saphyr"
         },
         {
           "name": "serde_json",
@@ -20098,7 +20070,7 @@
         },
         {
           "name": "serde-saphyr",
-          "packageId": "serde-saphyr 0.0.28"
+          "packageId": "serde-saphyr"
         },
         {
           "name": "serde_json",
@@ -20956,7 +20928,7 @@
         },
         {
           "name": "serde-saphyr",
-          "packageId": "serde-saphyr 0.0.28"
+          "packageId": "serde-saphyr"
         },
         {
           "name": "tokio",
@@ -22944,7 +22916,7 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
-    "serde-saphyr 0.0.27": {
+    "serde-saphyr": {
       "crateName": "serde-saphyr",
       "version": "0.0.27",
       "edition": "2024",
@@ -22963,7 +22935,7 @@
         },
         {
           "name": "base64",
-          "packageId": "base64 0.22.1"
+          "packageId": "base64 0.21.7"
         },
         {
           "name": "encoding_rs_io",
@@ -22976,7 +22948,7 @@
         },
         {
           "name": "granit-parser",
-          "packageId": "granit-parser 0.0.3"
+          "packageId": "granit-parser"
         },
         {
           "name": "nohash-hasher",
@@ -22989,70 +22961,6 @@
         {
           "name": "serde",
           "packageId": "serde"
-        },
-        {
-          "name": "smallvec",
-          "packageId": "smallvec"
-        },
-        {
-          "name": "zmij",
-          "packageId": "zmij"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "deserialize",
-        "serialize"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "serde-saphyr 0.0.28": {
-      "crateName": "serde-saphyr",
-      "version": "0.0.28",
-      "edition": "2024",
-      "sha256": "1v75md6hgcvjypr09m5ary394yhn55priw5w4v2wj39pjz13npm1",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "ahash",
-          "packageId": "ahash"
-        },
-        {
-          "name": "annotate-snippets",
-          "packageId": "annotate-snippets"
-        },
-        {
-          "name": "base64",
-          "packageId": "base64 0.22.1"
-        },
-        {
-          "name": "encoding_rs_io",
-          "packageId": "encoding_rs_io"
-        },
-        {
-          "name": "getrandom",
-          "packageId": "getrandom 0.3.4",
-          "target": "cfg(target_arch = \"wasm32\")"
-        },
-        {
-          "name": "granit-parser",
-          "packageId": "granit-parser 0.0.6"
-        },
-        {
-          "name": "nohash-hasher",
-          "packageId": "nohash-hasher"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "serde_core",
-          "packageId": "serde_core"
         },
         {
           "name": "smallvec",
@@ -30490,7 +30398,7 @@
         },
         {
           "name": "serde-saphyr",
-          "packageId": "serde-saphyr 0.0.28"
+          "packageId": "serde-saphyr"
         },
         {
           "name": "serde_json",
