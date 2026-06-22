@@ -4602,7 +4602,7 @@
       "dependencies": [
         {
           "name": "thiserror",
-          "packageId": "thiserror"
+          "packageId": "thiserror 2.0.18"
         }
       ],
       "libCrateTypes": [

@@ -38,8 +38,6 @@ fn pool_spec(kind: ExecutorKind) -> PoolSpec {
         tolerations: None,
         host_users: None,
         fuse_threads: None,
-        fuse_passthrough: None,
-        fuse_cache_bytes: None,
         features: vec![],
         image_pull_policy: None,
         privileged: None,
@@ -96,7 +94,7 @@ fn assert_one(errs: ValidationErrors, needle: &str) {
 
 // ── PoolSpec ──────────────────────────────────────────────────────
 //
-// 11 spec-level rules + 2 nested SeccompProfileKind rules. The two
+// 9 spec-level rules + 2 nested SeccompProfileKind rules. The two
 // baselines are the positive cases for the cluster of rules gated on
 // that kind; per-rule positive coverage is implicit (every other
 // rule passes when the negative case for one rule is tested in
@@ -104,7 +102,7 @@ fn assert_one(errs: ValidationErrors, needle: &str) {
 
 /// Baseline Builder + Fetcher specs are accepted. This is the
 /// positive case for every Pool CEL rule at once.
-// r[verify ctrl.crd.pool]
+// r[verify ctrl.crd.pool+2]
 #[test]
 fn pool_baselines_valid() {
     validate_cel(&Pool::new("b", pool_spec(ExecutorKind::Builder)))
@@ -117,7 +115,6 @@ fn pool_baselines_valid() {
     full.privileged = Some(true);
     full.host_network = Some(true);
     full.fuse_threads = Some(8);
-    full.fuse_passthrough = Some(false);
     full.features = vec!["kvm".into()];
     full.seccomp_profile = Some(SeccompProfileKind {
         type_: "RuntimeDefault".into(),
@@ -219,24 +216,13 @@ fn pool_fetcher_forbids_seccomp_profile() {
 }
 
 #[test]
-fn pool_fetcher_forbids_fuse_knobs() {
-    for (field, mutate) in [
-        (
-            "fuseThreads",
-            (|s: &mut PoolSpec| s.fuse_threads = Some(8)) as fn(&mut PoolSpec),
-        ),
-        ("fusePassthrough", |s| s.fuse_passthrough = Some(true)),
-    ] {
-        let mut s = pool_spec(ExecutorKind::Fetcher);
-        mutate(&mut s);
-        assert_one(
-            expect_err(
-                validate_cel(&Pool::new("p", s)),
-                &format!("Fetcher {field}"),
-            ),
-            "kind=Fetcher forbids FUSE tuning knobs",
-        );
-    }
+fn pool_fetcher_forbids_fuse_threads() {
+    let mut s = pool_spec(ExecutorKind::Fetcher);
+    s.fuse_threads = Some(8);
+    assert_one(
+        expect_err(validate_cel(&Pool::new("p", s)), "Fetcher fuseThreads"),
+        "kind=Fetcher forbids fuseThreads",
+    );
 }
 
 // r[verify ctrl.crd.fetcher-no-features+2]
@@ -247,26 +233,6 @@ fn pool_fetcher_forbids_features() {
     assert_one(
         expect_err(validate_cel(&Pool::new("p", s)), "Fetcher features"),
         "kind=Fetcher forbids spec.features",
-    );
-}
-
-#[test]
-fn pool_builder_forbids_fuse_cache_bytes() {
-    let mut s = pool_spec(ExecutorKind::Builder);
-    s.fuse_cache_bytes = Some(1 << 30);
-    assert_one(
-        expect_err(validate_cel(&Pool::new("p", s)), "Builder fuseCacheBytes"),
-        "kind=Builder forbids fuseCacheBytes",
-    );
-}
-
-#[test]
-fn pool_fetcher_forbids_fuse_cache_bytes() {
-    let mut s = pool_spec(ExecutorKind::Fetcher);
-    s.fuse_cache_bytes = Some(1 << 30);
-    assert_one(
-        expect_err(validate_cel(&Pool::new("p", s)), "Fetcher fuseCacheBytes"),
-        "kind=Fetcher forbids fuseCacheBytes",
     );
 }
 
