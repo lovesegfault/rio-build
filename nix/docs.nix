@@ -426,9 +426,10 @@ rec {
         # (no value) when a link attr is none/unset; (c) checks one
         # specific link, this is the negative tripwire over every
         # html.elem("a", attrs:(href:…)) call site.
-        if grep -rqE '<a [^>]*\bhref(\s|>)' ${html}; then
+        bare=$(grep -rlE '<a [^>]*\bhref(\s|>)' ${html} || true)
+        if [ -n "$bare" ]; then
           echo "FAIL: bare-href link (QA #3 — html.elem href: none/unset)"
-          grep -rlE '<a [^>]*\bhref(\s|>)' ${html}
+          echo "$bare"
           exit 1
         fi
         # (c2) QA4-#3/#6: output-level heading guards. misc-checks
