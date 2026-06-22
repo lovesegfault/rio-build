@@ -2016,16 +2016,18 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     active_build_ids: &mut HashSet<String>,
 ) -> anyhow::Result<(String, tonic::codec::Streaming<types::BuildEvent>)> {
     // r[impl sched.grpc.fence-retryable]
-    // Bounded pre-build_id retry on UNAVAILABLE only (the fence /
-    // not-leader / actor-dead refusal class — sched.grpc.fence-
-    // retryable maps every retryable scheduler refusal there). Safe
-    // because no build_id metadata has been received: the scheduler
-    // sets the header only AFTER MergeDag commits, and a refused/
-    // fenced merge rolls back — re-submitting is idempotent. Any
-    // other code, a timeout (DEADLINE_EXCEEDED — not provably
-    // pre-merge), or an UNAVAILABLE that somehow carries the build-id
-    // header propagates unchanged. Budget mirrors the deposed-believer
-    // window: 4 retries at 0.5/1/2/4s under the per-attempt timeout.
+    // Bounded pre-build_id retry on UNAVAILABLE | RESOURCE_EXHAUSTED
+    // (fence / not-leader / actor-dead → UNAVAILABLE; cost-axis
+    // backpressure gate → RESOURCE_EXHAUSTED — sched.grpc.fence-
+    // retryable maps every retryable scheduler refusal to one of the
+    // two). Safe because no build_id metadata has been received: the
+    // scheduler sets the header only AFTER MergeDag commits, and a
+    // refused/fenced merge rolls back — re-submitting is idempotent.
+    // Any other code, a timeout (DEADLINE_EXCEEDED — not provably
+    // pre-merge), or a retryable code that somehow carries the
+    // build-id header propagates unchanged. Budget mirrors the
+    // deposed-believer window: 4 retries at 0.5/1/2/4s under the
+    // per-attempt timeout.
     const SUBMIT_RETRIES: u32 = 4;
     const SUBMIT_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
         base: std::time::Duration::from_millis(500),
