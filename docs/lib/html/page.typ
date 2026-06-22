@@ -25,24 +25,26 @@
 
 #let page-shell(route, title, src-path, body) = {
   _current-route.update(route)
-  // src-path is none for synthesized pages (404) — no description,
-  // breadcrumb, or edit link in that case.
-  let desc = if src-path != none { descriptions.at(src-path, default: none) }
+  // Synthesized pages (404) have no source file — book.typ passes
+  // `src-path: none`. No description lookup, no breadcrumb trail, no
+  // canonical/OG meta, no edit link, not pagefind-indexed. Named once
+  // so the half-dozen gates below read as "is-error-page", not
+  // "src-path is none".
+  let is-error-page = src-path == none
+  let desc = if not is-error-page { descriptions.at(src-path, default: none) }
   // QA N3: always emit description/og:description; fall back to a
   // title-derived blurb when meta.typ has no per-page summary.
   let meta-desc = if desc != none { desc } else {
     "rio-build design book — " + title
   }
-  let trail = if src-path != none { crumb-trail(chapters, src-path) } else {
-    ()
-  }
+  let trail = if is-error-page { () } else { crumb-trail(chapters, src-path) }
   // Directory form for the root: search engines and OG scrapers treat
   // `/` and `/index.html` as distinct URLs, so canonical/og:url for the
   // home page must be `<site>/`, not `<site>/index.html`.
-  // src-path == none (the 404 shell) → no canonical/OG: a not-found
-  // page has no canonical URL and isn't an `og:type=article`. Mirrors
-  // the data-pagefind-body gate further down.
-  let page-url = if site-url != "" and src-path != none {
+  // The 404 shell → no canonical/OG: a not-found page has no canonical
+  // URL and isn't an `og:type=article`. Mirrors the data-pagefind-body
+  // gate further down.
+  let page-url = if site-url != "" and not is-error-page {
     if route == "index" { site-url + "/" } else {
       site-url + "/" + route + ".html"
     }
@@ -58,7 +60,7 @@
         ),
       )
       #html.elem("meta", attrs: (name: "description", content: meta-desc))
-      #if src-path == none {
+      #if is-error-page {
         // 404: tell crawlers not to index. GH Pages serves 404.html
         // with status 200 for soft-404 detection, so the meta tag is
         // the only signal.
@@ -185,9 +187,9 @@
           "main",
           // QA S1: scope pagefind indexing to the chapter body only —
           // sidebar/TOC/dialog chrome outside <main> are excluded.
-          // Synthesized pages (404, src-path: none) are NOT indexed.
+          // Synthesized pages (404) are NOT indexed.
           attrs: (class: "rio-main", id: "main")
-            + if src-path != none { (data-pagefind-body: "") } else { (:) },
+            + if is-error-page { (:) } else { (data-pagefind-body: "") },
         )[
           #if trail.len() > 1 {
             // Breadcrumbs: ancestor chain root→leaf. Leaf (= this page,
@@ -220,7 +222,7 @@
           }
           #html.elem("h1")[#title]
           #body
-          #if src-path != none {
+          #if not is-error-page {
             html.elem("footer", attrs: (
               class: "rio-edit",
               data-pagefind-ignore: "",
