@@ -310,10 +310,10 @@ k8s-openapi = { version = "0.28", features = ["v1_36"] }
 schemars = "1"
 # CRD YAML emission (crdgen → infra/helm/crds/) + xtask kubeconfig/values
 # parsing. Replaces serde_yml (RUSTSEC-2025-0068, unsound + unmaintained —
-# its deny.toml exception went with it). kube's next release moves its
-# kubeconfig parsing to serde-saphyr too, so the tree converges on one
-# YAML stack once that lands; until then kube still pulls serde_yaml
-# transitively.
+# its deny.toml exception went with it). kube 4.0 moved its kubeconfig
+# parsing to serde-saphyr (=0.0.27 exactly), so the tree carries one
+# YAML stack — pin matches kube-client's exact-version dep to avoid a
+# second copy. Verified: `cargo tree -i serde_yaml` → no match.
 serde-saphyr = "0.0.27"
 
 # --- phase3a: health + streaming ---
