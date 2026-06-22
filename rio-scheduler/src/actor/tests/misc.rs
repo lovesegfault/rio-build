@@ -889,6 +889,29 @@ async fn backpressure_engages_on_work_cost_while_depth_low() -> TestResult {
     Ok(())
 }
 
+/// Rising-edge counter for the backpressure flag — shared between the
+/// cost-axis flap tests below so the next backpressure-flap regression
+/// test doesn't copy a third hand-rolled `was_active`/`observe` pair.
+struct RisingEdges {
+    count: u32,
+    was_active: bool,
+}
+impl RisingEdges {
+    fn new(initial: bool) -> Self {
+        Self {
+            count: 0,
+            was_active: initial,
+        }
+    }
+    fn observe(&mut self, r: &crate::actor::command::BackpressureReader) {
+        let now = r.is_active();
+        if now && !self.was_active {
+            self.count += 1;
+        }
+        self.was_active = now;
+    }
+}
+
 // r[verify sched.admission.work-per-turn]
 /// **sh-024 §S2 — RED-FIRST.** A SINGLE 1.3 s turn at 1 % depth must
 /// not flap the cost-axis backpressure: the EWMA is FED at fast-lane
@@ -914,22 +937,14 @@ async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> Tes
     let mut actor = bare_actor(db.pool.clone());
     let reader = actor.backpressure_flag();
 
-    let mut rising_edges = 0u32;
-    let mut was_active = reader.is_active();
-    let mut observe = |reader: &crate::actor::command::BackpressureReader| {
-        let now = reader.is_active();
-        if now && !was_active {
-            rising_edges += 1;
-        }
-        was_active = now;
-    };
+    let mut edges = RisingEdges::new(reader.is_active());
     for _ in 0..24 {
         // The sh-024 trace: ONE 1.3 s ReportPullOutcome spike (sh-024
         // §S3) lands, the very next main-loop `update_backpressure`
         // observes it…
         actor.note_turn_cost(std::time::Duration::from_millis(1300));
         actor.update_backpressure(114, 10_000);
-        observe(&reader);
+        edges.observe(&reader);
         // …then the biased-select fast lane drains up to QUOTA=16
         // handlers. note_turn_cost now floors at 1ms (sub-ms turns are
         // noise that flapped the gate — see the fn doc), so model the
@@ -941,17 +956,18 @@ async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> Tes
         // …and the NEXT main-loop evaluation re-reads the now-decayed
         // EWMA.
         actor.update_backpressure(114, 10_000);
-        observe(&reader);
+        edges.observe(&reader);
     }
     assert!(
-        rising_edges <= 1 && !reader.is_active(),
-        "left: cost-axis backpressure flapped {rising_edges}× over 24 \
+        edges.count <= 1 && !reader.is_active(),
+        "left: cost-axis backpressure flapped {}× over 24 \
          single-1.3s-spike cycles (the sh-024 §S2 +24-in-120s flap: at \
          α=0.3 every spike activates and the 16-feed × 0.7¹⁶ fast-lane \
          decay releases it 80 µs later — the EWMA is FED at fast-lane \
          rate but EVALUATED at main-loop rate) / right: at α=0.05 a \
          1.3 s spike → ewma=0.066 → drain=7.5 s @ q=114, never ≥ HIGH=30 \
-         → 0 rising edges, inactive at loop end"
+         → 0 rising edges, inactive at loop end",
+        edges.count
     );
     Ok(())
 }
@@ -1029,34 +1045,27 @@ async fn backpressure_cost_axis_bimodal_mix_does_not_flap() -> TestResult {
     for _ in 0..8 {
         actor.note_turn_cost(std::time::Duration::from_millis(303));
     }
-    let mut rising_edges = 0u32;
-    let mut was_active = false;
-    let mut observe = |r: &crate::actor::command::BackpressureReader| {
-        let now = r.is_active();
-        if now && !was_active {
-            rising_edges += 1;
-        }
-        was_active = now;
-    };
+    let mut edges = RisingEdges::new(false);
     // The diagnosed trace, 5 cycles: one 3.3s Tick spike @ q≈1484,
     // then ~60 SubstituteProgress 4µs feeds, evaluating after each.
     for _ in 0..5 {
         actor.note_turn_cost(std::time::Duration::from_millis(3300));
         actor.update_backpressure(1484, 10_000);
-        observe(&reader);
+        edges.observe(&reader);
         for _ in 0..60 {
             actor.note_turn_cost(std::time::Duration::from_micros(4));
             actor.update_backpressure(1422, 10_000);
-            observe(&reader);
+            edges.observe(&reader);
         }
     }
     assert!(
-        rising_edges <= 1,
-        "bimodal mix flapped {rising_edges}× (pre-1ms-floor: every 3.3s \
+        edges.count <= 1,
+        "bimodal mix flapped {}× (pre-1ms-floor: every 3.3s \
          spike activated and 60×4µs feeds at α=0.05 decayed it below \
          LOW within the same evaluation window — the live 11-flaps-in-\
          5min trace). With the floor the µs feeds are no-ops; the gate \
-         engages once and holds."
+         engages once and holds.",
+        edges.count
     );
     Ok(())
 }
