@@ -36,9 +36,9 @@
 // `--input x-target=` CLI input (nix/docs.nix passes `x-target=html`
 // for the bundle build), so it evaluates the same inside
 // `html.frame()`'s paged sub-context as outside it.
-#let is-html-target() = (
-  sys.inputs.at("x-target", default: "pdf") not in ("pdf", "book-pdf")
-)
+#let _x-target = sys.inputs.at("x-target", default: "pdf")
+#let _is-pdf-target = _x-target in ("pdf", "book-pdf")
+#let is-html-target() = not _is-pdf-target
 
 // cross-link: resolve a docs-relative .typ path to either a
 // PDF-internal label or an HTML href. Call sites in
@@ -429,13 +429,15 @@
 #let rio(domains: none, paper: none, body) = {
   // `x-target` (NOT `target` — that would shadow typst's builtin
   // `target()` which the show-rules below need to detect
-  // `html.frame()`'s paged sub-context).
-  let x-target = sys.inputs.at("x-target", default: "pdf")
+  // `html.frame()`'s paged sub-context). Single-sourced from the
+  // module-level `_x-target` / `_is-pdf-target` so `is-html-target()`
+  // and `is-pdf` can never disagree on the x-target value set.
+  let x-target = _x-target
   // is-pdf — direct `typst compile` (pdf / book-pdf). The html/paged
   // split is handled per-site via the contextual `is-html()`/
   // `is-paged()` predicates above; gate html.elem/html.frame on
   // `is-html()` ONLY.
-  let is-pdf = x-target in ("pdf", "book-pdf")
+  let is-pdf = _is-pdf-target
   _domains.update(domains)
 
   // common typography (target-neutral)
