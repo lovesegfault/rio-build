@@ -170,24 +170,32 @@ in
         '';
       }
       # kubelet > apiserver is the one skew direction the upstream
-      # version-skew policy hard-forbids. The two pins agree today
-      # only because flake.lock and nix/pins.toml were bumped
-      # together; a future `nix flake update nixpkgs` that moves
-      # pkgs.kubernetes ahead while pins.toml stays put would ship a
-      # kubelet newer than the EKS control plane. node-ami-eval
-      # instantiates this config in the CI gate, so the divergence
-      # surfaces as an eval failure instead of a registered AMI.
-      {
-        assertion =
-          lib.versions.majorMinor cfg.kubernetesPackage.version == pins.cluster.kubernetes_version;
-        message = ''
-          kubelet ${cfg.kubernetesPackage.version} minor must match the
-          control-plane pin ${pins.cluster.kubernetes_version} (nix/pins.toml
-          [cluster].kubernetes_version). Skew policy: kubelet ≤ apiserver,
-          ≥ apiserver−3. Pin services.rio.eksNode.kubernetesPackage to a
-          matching kubernetes derivation, or bump pins.toml.
-        '';
-      }
+      # version-skew policy hard-forbids; kubelet may lag the control
+      # plane by up to 3 minors. node-ami-eval instantiates this
+      # config in the CI gate, so an out-of-policy skew surfaces as
+      # an eval failure instead of a registered AMI. The standard EKS
+      # upgrade order is control-plane first → bump pins.toml, then
+      # nodes → bump nixpkgs; an exact-match assertion would turn the
+      # gate red on every legitimate control-plane bump while
+      # pkgs.kubernetes catches up.
+      (
+        let
+          kubeletMinor = lib.toInt (lib.versions.minor cfg.kubernetesPackage.version);
+          cpMinor = lib.toInt (lib.versions.minor pins.cluster.kubernetes_version);
+        in
+        {
+          assertion = kubeletMinor <= cpMinor && kubeletMinor >= cpMinor - 3;
+          message = ''
+            kubelet ${cfg.kubernetesPackage.version} is outside the upstream
+            version-skew window of control-plane pin
+            ${pins.cluster.kubernetes_version} (nix/pins.toml
+            [cluster].kubernetes_version). Policy: kubelet minor ≤
+            apiserver, ≥ apiserver−3. Pin
+            services.rio.eksNode.kubernetesPackage to an in-window
+            kubernetes derivation, or bump pins.toml.
+          '';
+        }
+      )
     ];
 
     # Cilium WireGuard transparent encryption (encryption.type=
