@@ -668,34 +668,41 @@
       show heading: it => context if target() == "html" {
         let base = _slug(it.body)
         let route = _current-route-or-empty()
+        let has-label = it.has("label") and it.label != none
+        // honour an explicit `= Title <slug>` so cross-link and
+        // #fragment agree; otherwise the kebab-slug.
+        let id-want = if has-label { str(it.label) } else { base }
         // `_heading-slugs` is internal-only (read below, never emitted)
         // — the standalone-compile route="" yields `"::<base>"`, still
-        // a valid unique key; no special-case needed.
-        let key = route + "::" + base
-        let has-label = it.has("label") and it.label != none
+        // a valid unique key; no special-case needed. Keyed on the
+        // EMITTED id (id-want, not base) so an explicit `<foo>` label
+        // is recorded for a later auto-slug `= Foo` to dedup against,
+        // and a later explicit `<foo>` colliding with a prior
+        // auto-slug `= Foo` panics here (docs-html-smoke (c3)'s
+        // dup-id grep would catch the output, but the assert names the
+        // route + label at the source seam).
+        let key = route + "::" + id-want
         let n = _heading-slugs.get().at(key, default: 0)
-        let id = if has-label {
-          // honour an explicit `= Title <slug>` so cross-link and
-          // #fragment agree.
-          str(it.label)
-        } else if n == 0 { base } else { base + "-" + str(n + 1) }
+        assert(
+          not (has-label and n > 0),
+          message: "heading label <"
+            + id-want
+            + "> collides with a prior heading id on route '"
+            + route
+            + "' — pick a different explicit <label>",
+        )
+        let id = if n == 0 { id-want } else { id-want + "-" + str(n + 1) }
         // state.update() yields placeable content (not a side-effect),
         // so it must sit in the output sequence — NOT inside the
         // `let id = …` block, where it would join into the binding and
-        // turn `id` into content. Bump the dedup count whenever this
-        // heading EMITTED `base` as its id: that's every unlabelled
-        // heading, AND a labelled heading whose explicit `<label>`
-        // happens to equal `_slug(body)` (seven such headings exist in
-        // ops/sla-model.typ). Skipping the bump only when a DIFFERENT
-        // label overrode the id keeps a later unlabelled `= <same
-        // text>` at `base` (not a gapped `base-2`) without letting the
-        // label==auto-slug case collide.
-        if not has-label or str(it.label) == base {
-          _heading-slugs.update(d => {
-            d.insert(key, d.at(key, default: 0) + 1)
-            d
-          })
-        }
+        // turn `id` into content. Bump unconditionally: every emission
+        // records id-want (labelled and auto-slug alike), so the
+        // ops/sla-model.typ label==auto-slug headings and the
+        // `<label>`-then-auto-slug order both dedup correctly.
+        _heading-slugs.update(d => {
+          d.insert(key, d.at(key, default: 0) + 1)
+          d
+        })
         // Record (id, text, level) for the on-this-page TOC. text is
         // pre-flattened so page-shell doesn't need _to-string.
         let toc-text = _to-string(it.body)
@@ -859,9 +866,15 @@
 
   // Per-chapter bibliography for every target except book-pdf (the
   // stitched aggregate supplies one bibliography at the end; typst
-  // forbids more than one per document). The html build compiles each
-  // chapter standalone, so omitting it there leaves @cite labels
-  // unresolved.
+  // forbids more than one per document). The native HTML bundle is
+  // ONE typst compile across all `document()` calls (shared label/
+  // state space — see book.typ), NOT one compile per chapter; this
+  // emits one `bibliography()` per chapter that sets `paper.bib` and
+  // relies on typst-0.15 scoping each to its `document()` call. Only
+  // sla-sizing.typ sets `paper.bib` today, so only one bibliography
+  // is emitted bundle-wide; a SECOND chapter setting `paper.bib` is
+  // the test for whether per-document() scoping holds — verify
+  // docs-html before landing one.
   context if (
     paper != none
       and not in-book
