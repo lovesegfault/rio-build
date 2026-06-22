@@ -668,7 +668,10 @@
       show heading: it => context if target() == "html" {
         let base = _slug(it.body)
         let route = _current-route-or-empty()
-        let key = if route == "" { base } else { route + "::" + base }
+        // `_heading-slugs` is internal-only (read below, never emitted)
+        // — the standalone-compile route="" yields `"::<base>"`, still
+        // a valid unique key; no special-case needed.
+        let key = route + "::" + base
         let has-label = it.has("label") and it.label != none
         let n = _heading-slugs.get().at(key, default: 0)
         let id = if has-label {
