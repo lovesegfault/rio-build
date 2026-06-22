@@ -132,12 +132,16 @@ pkgs.runCommand "cilium-rendered"
     mkdir -p $out
 
     ${pkgs.lib.optionalString gatewayEnabled ''
-      # Drop TLSRoute: gateway-api v1.5 standard ships TLSRoute at v1 only,
-      # but cilium-operator 1.19.x hard-codes a v1alpha2 field indexer when
-      # ANY tlsroutes CRD is present → fatal "no matches for kind TLSRoute
-      # in version v1alpha2" → CrashLoopBackOff (cilium/cilium#45139, fixed
-      # in cilium 1.20 via #45251). We don't use TLSRoute. Remove this
-      # filter once pins.addons.cilium.version >= 1.20.
+      # Drop TLSRoute: gateway-api v1.5.1 standard-install.yaml ships
+      # tlsroutes at v1 (served:true) / v1alpha2 (served:false) — verified
+      # against pins.addons.gateway_api.crds_hash. cilium-operator 1.19.x
+      # hard-codes a v1alpha2 field indexer when ANY tlsroutes CRD is
+      # present → fatal "no matches for kind TLSRoute in version v1alpha2"
+      # → CrashLoopBackOff (cilium/cilium#45139, fixed in 1.20 via #45251).
+      # We don't use TLSRoute. Remove once pins.addons.cilium.version
+      # >= 1.20. MIRRORS infra/eks/addons.tf strcontains filter — same
+      # crds_hash, same premise; if this filter goes but addons.tf's
+      # stays (or vice versa) the VM gate and prod diverge.
       yq 'select(.metadata.name != "tlsroutes.gateway.networking.k8s.io")' \
         ${gatewayApiCrds} > $out/00-gateway-api-crds.yaml
       cp ${lbIpamPool} $out/03-cilium-lbipam-pool.yaml
