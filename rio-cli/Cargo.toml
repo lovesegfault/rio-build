@@ -36,9 +36,10 @@ kube = { workspace = true }
 # Version-feature activation only — no code references it, and
 # cargo-machete will flag it as unused. k8s-openapi's build.rs requires
 # exactly one v1_NN feature to be enabled by SOME crate in the build
-# graph; kube deliberately enables none. The workspace dep carries
-# v1_35, so this edge is what makes `cargo build -p rio-cli` (the
-# per-member CI builds) compile.
+# graph; kube deliberately enables none. The workspace dep carries the
+# v1_NN feature (root Cargo.toml `[workspace.dependencies]`), so this
+# edge is what makes `cargo build -p rio-cli` (the per-member CI
+# builds) compile.
 k8s-openapi = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
