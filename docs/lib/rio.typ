@@ -673,8 +673,9 @@
         let base = _slug(it.body)
         let route = _current-route-or-empty()
         let key = if route == "" { base } else { route + "::" + base }
+        let has-label = it.has("label") and it.label != none
         let n = _heading-slugs.get().at(key, default: 0)
-        let id = if it.has("label") and it.label != none {
+        let id = if has-label {
           // honour an explicit `= Title <slug>` so cross-link and
           // #fragment agree.
           str(it.label)
@@ -682,11 +683,16 @@
         // state.update() yields placeable content (not a side-effect),
         // so it must sit in the output sequence — NOT inside the
         // `let id = …` block, where it would join into the binding and
-        // turn `id` into content.
-        _heading-slugs.update(d => {
-          d.insert(key, d.at(key, default: 0) + 1)
-          d
-        })
+        // turn `id` into content. Skip the bump when an explicit label
+        // overrode the id — `base` was never emitted in that case, so
+        // counting it would make the next unlabelled `= <same text>`
+        // emit `base-2` with no element ever holding `base`.
+        if not has-label {
+          _heading-slugs.update(d => {
+            d.insert(key, d.at(key, default: 0) + 1)
+            d
+          })
+        }
         // Record (id, text, level) for the on-this-page TOC. text is
         // pre-flattened so page-shell doesn't need _to-string.
         let toc-text = _to-string(it.body)
