@@ -43,6 +43,13 @@ fn manifest_platforms() -> String {
 /// (local nix store), dest is our own ECR — no signatures to verify.
 const POLICY_JSON: &str = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
 
+/// skopeo 1.23+ rejects v1-format `/etc/containers/registries.conf`
+/// with no fallback; ECR push needs no registry config (auth is
+/// explicit via `--authfile`), so every skopeo invocation in this
+/// module points the env var at /dev/null to bypass whatever the host
+/// has. Centralised so a future host-config dependency is one edit.
+const SKOPEO_REGISTRIES_CONF: (&str, &str) = ("CONTAINERS_REGISTRIES_CONF", "/dev/null");
+
 /// `skopeo copy` flags for the docker-archive → OCI transcode.
 ///
 /// **MUST match `ociSkopeoCopyArgs` in `nix/docker.nix`.** The NixOS
@@ -136,7 +143,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
                 format!("rio-{name}:{tag}-{arch}"),
                 async move {
                     let out = tokio::process::Command::new("skopeo")
-                        .env("CONTAINERS_REGISTRIES_CONF", "/dev/null")
+                        .env(SKOPEO_REGISTRIES_CONF.0, SKOPEO_REGISTRIES_CONF.1)
                         .args(["--policy", &policy, "copy", "--retry-times", "3"])
                         .args(["--authfile", &authfile])
                         .args(SKOPEO_OCI_ZSTD_ARGS)
@@ -327,11 +334,7 @@ async fn ecr_login(registry: &str, region: &str, authfile: &str) -> Result<()> {
     // which run_inner nulls. Capture stdio so "Login Succeeded!" doesn't
     // land on the spinner line.
     let mut child = std::process::Command::new("skopeo")
-        // skopeo 1.23+ rejects v1-format /etc/containers/registries.conf
-        // with no fallback; ECR push needs no registry config (auth is
-        // explicit via --authfile), so point at /dev/null to bypass
-        // whatever the host has.
-        .env("CONTAINERS_REGISTRIES_CONF", "/dev/null")
+        .env(SKOPEO_REGISTRIES_CONF.0, SKOPEO_REGISTRIES_CONF.1)
         .args(["login", "--authfile", authfile])
         .args(["--username", user, "--password-stdin", registry])
         .stdin(std::process::Stdio::piped())
