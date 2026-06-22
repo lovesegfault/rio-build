@@ -1034,7 +1034,6 @@ async fn read_nar_capped(
     upstream_base: &str,
     reservation: &NarBudgetReservation,
 ) -> Result<(Vec<u8>, [u8; 32]), SubstituteError> {
-    use tokio::runtime::{Handle, RuntimeFlavor};
     let stalled = || SubstituteError::Stalled { window: stall };
     let envelope = reservation.envelope();
     let deadline_exceeded = || SubstituteError::HoldDeadlineExceeded {
@@ -1048,21 +1047,19 @@ async fn read_nar_capped(
     let mut hasher = sha2::Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut last_progress = 0u64;
-    // opt-04(yield): on multi_thread (production — `main.rs` is bare
-    // `#[tokio::main]`), shed the tokio worker for the xz/zstd decode
-    // inside `capped.read()` via `block_in_place(|| block_on(…))`. The
-    // per-read `timeout` MUST live INSIDE `block_on` — a `timeout`
-    // outside `block_in_place` cannot preempt the synchronous wrap, so
-    // the Stalled/HoldDeadlineExceeded discrimination would never
-    // fire on a wedged read. On current_thread / no-runtime keep the
-    // plain `.await` verbatim: `block_in_place` panics there, and
-    // `block_on` from inside an already-driven runtime panics
-    // independently — `cas::cpu_bound` cannot host this because its
-    // inline fallback would still hit the second panic.
-    let shed_decode = matches!(
-        Handle::try_current().map(|h| h.runtime_flavor()),
-        Ok(f) if f != RuntimeFlavor::CurrentThread
-    );
+    // opt-04(yield): the xz/zstd decode inside `capped.read()` is
+    // CPU-bound per 64 KiB. The original opt-04 wrapped each read in
+    // `block_in_place(|| block_on(…))` to shed the tokio worker, but
+    // `materialize::executor` drives up to 4 `resolve_path` futures
+    // through ONE `FuturesUnordered` (Box::pin, not spawn) — they
+    // share ONE task, and `block_in_place` parks the task, so one
+    // path's NAR loop serialized the other 3 (substitutions showed
+    // 100% download but couldn't advance until the monopolizing
+    // sibling finished). The plain `.await` already yields at the
+    // network read; an explicit `yield_now()` every 16 reads covers
+    // the fast-network/decode-bound case so siblings get poll time.
+    // Per-64KiB decode is tens of µs — not worth parking a worker for.
+    let mut reads_since_yield = 0u32;
     loop {
         // r[impl store.substitute.stall-abort+2]
         // Per-read stall clock: each successful read restarts it, so a
@@ -1075,12 +1072,7 @@ async fn read_nar_capped(
         // deadline can never preempt a single healthy read's window
         // until integral slowness has already burned the grace.
         let per_read = stall.min(envelope.remaining());
-        let read_once = tokio::time::timeout(per_read, capped.read(&mut buf));
-        let n = match if shed_decode {
-            tokio::task::block_in_place(|| Handle::current().block_on(read_once))
-        } else {
-            read_once.await
-        } {
+        let n = match tokio::time::timeout(per_read, capped.read(&mut buf)).await {
             Ok(r) => r.map_err(|e| SubstituteError::Fetch(format!("{nar_url} body: {e}")))?,
             // Which clock fired? If the hold deadline has passed, this
             // is the envelope abort (typed; credits the budget back by
@@ -1102,9 +1094,13 @@ async fn read_nar_capped(
         }
         out.extend_from_slice(&buf[..n]);
         // Incremental digest, post-re-adoption: 64 KiB sha256 ≈ tens
-        // of µs — negligible on the worker, so only the decode is
-        // shed.
+        // of µs — negligible on the worker.
         hasher.update(&buf[..n]);
+        reads_since_yield += 1;
+        if reads_since_yield >= 16 {
+            reads_since_yield = 0;
+            tokio::task::yield_now().await;
+        }
         if out.len() as u64 > declared {
             // Over-delivery against the declaration: fail DURING the
             // read (pre-fix this was caught only after full buffering).
