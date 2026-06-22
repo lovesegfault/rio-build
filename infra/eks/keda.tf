@@ -17,11 +17,16 @@
 # nix/pins.toml) — same as kube-prometheus-stack/external-secrets: not
 # exercised by VM tests, so no nix↔tofu pin to keep in sync. The pin
 # IS coupled to pins.toml [cluster].kubernetes_version, just not
-# mechanically: KEDA supports a 3-minor k8s window (2.20.x = 1.33-1.35,
-# the first train supporting our 1.35 control plane; 2.19 topped out
-# at 1.34). Re-check https://keda.sh/docs/<ver>/operate/cluster/ on
-# every kubernetes_version bump, same as the chart-version comment in
-# monitoring.tf.
+# mechanically: KEDA tests against a 3-minor k8s window per release
+# (https://keda.sh/docs/<ver>/operate/cluster/ compat matrix —
+# re-check on every kubernetes_version bump, same as monitoring.tf).
+# 2.20.x = 1.33-1.35 tested; the 1.36 control plane is one minor past
+# that window. 2.20.1 is the latest release (2.21 = TBD upstream as of
+# 2026-06) and the chart's kubeVersion floor is `>=1.23`, no ceiling —
+# KEDA's surface here (external.metrics.k8s.io v1beta1, ScaledObject
+# CRD, prometheus scaler) has no 1.36 removal that touches it.
+# TODO: bump to 2.21.x (expected 1.34-1.36 tested) once kedacore cuts
+# the release.
 
 resource "helm_release" "keda" {
   name             = "keda"
