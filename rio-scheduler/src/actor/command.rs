@@ -960,6 +960,29 @@ impl ActorCommand {
             Self::Debug(_) => "Debug",
         }
     }
+
+    /// True for variants whose handler cost is folded into the
+    /// per-turn cost EWMA ([`super::DagActor::note_turn_cost`]).
+    ///
+    /// Only `MergeDag` and `Tick` price into projected drain: the
+    /// estimator the cost-axis backpressure law gates on is "how long
+    /// until the queued MergeDag work clears", and those two are the
+    /// commands that actually compete for that drain budget (303ms
+    /// avg, 65% PG persist; Tick is the periodic dispatch sweep that
+    /// blocks the queue at the same scale). Everything else is µs-
+    /// to-low-ms class and either contributes nothing material (65k ×
+    /// 4µs = 0.26s total) or — the post-P1 re-diagnosis case — sits
+    /// at a mid-cost rate (8.8k × 12ms PullAssignment) that kept the
+    /// 1ms-floored EWMA pinned in the 30s/10s hysteresis band for 89s
+    /// after the actual MergeDag work had cleared.
+    ///
+    /// A NEW command variant whose handler is 100ms+ and runs at
+    /// MergeDag-like cadence MUST be added here (the
+    /// `prices_into_drain_is_exhaustive` test pins this list). A new
+    /// µs/ms-class variant stays out.
+    pub(super) fn prices_into_drain(&self) -> bool {
+        matches!(self, Self::MergeDag { .. } | Self::Tick)
+    }
 }
 
 /// Server-side filter for [`AdminQuery::GetSpawnIntents`]. Mirrors the

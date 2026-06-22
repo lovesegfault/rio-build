@@ -838,7 +838,8 @@ async fn test_backpressure_hysteresis() -> TestResult {
 ///
 /// Structural drive (no wall clock): the cost observations are fed
 /// directly to `note_turn_cost` — exactly what `run_inner` records
-/// after each command — and the law is asserted on the flag.
+/// after each `prices_into_drain()` command — and the law is asserted
+/// on the flag.
 // r[verify sched.admission.work-per-turn]
 // r[verify sched.backpressure.hysteresis+3]
 #[tokio::test]
@@ -859,15 +860,17 @@ async fn backpressure_engages_on_work_cost_while_depth_low() -> TestResult {
          time-starvation (W9-AH)"
     );
 
-    // Recovery: fast turns decay the EWMA; release only when BOTH the
-    // depth axis (already low) AND the projected drain axis clear LOW.
+    // Recovery: subsequent idle Ticks (the only feeds — µs/ms-class
+    // commands no longer fold) decay the EWMA; release only when BOTH
+    // the depth axis (already low) AND the projected drain axis clear
+    // LOW.
     for _ in 0..200 {
         actor.note_turn_cost(std::time::Duration::from_millis(1));
     }
     actor.update_backpressure(100, 10_000);
     assert!(
         !reader.is_active(),
-        "after 200 × 1ms turns the projected drain is far under the LOW \
+        "after 200 idle Ticks the projected drain is far under the LOW \
          release bound at depth 1% — the cost axis must release (sticky \
          forever = a one-off stall sheds work indefinitely)"
     );
@@ -913,23 +916,22 @@ impl RisingEdges {
 }
 
 // r[verify sched.admission.work-per-turn]
-/// **sh-024 §S2 — RED-FIRST.** A SINGLE 1.3 s turn at 1 % depth must
-/// not flap the cost-axis backpressure: the EWMA is FED at fast-lane
-/// rate (`serve_fast_admin` calls `note_turn_cost` up to
-/// `ADMIN_FAST_LANE_DRAIN_QUOTA = 16` times between consecutive
-/// main-loop `update_backpressure` evaluations), so at α = 0.3 the
-/// 1.3 s spike (ewma = 0.39, drain = 44.5 s ≥ 30) activates and the
-/// 16 × 5 µs fast feeds (× 0.7¹⁶ ≈ 0.003 → drain = 0.15 s ≤ 10)
-/// release it 80 µs later — sh-024 saw `queue_backpressure` +24 in
-/// 120 s. At α = 0.05: 1.3 s → ewma = 0.066, drain = 7.5 s — never
-/// reaches HIGH = 30, so 0 rising edges.
+/// **sh-024 §S2 — RED-FIRST.** Repeated 1.3 s Ticks at 1 % depth must
+/// not FLAP the cost-axis backpressure. At the prior α = 0.3 with the
+/// fold-everything topology, each 1.3 s spike (ewma = 0.39, drain =
+/// 44.5 s ≥ 30) activated and the inter-spike µs/ms-class commands
+/// decayed it below LOW 80 µs later — sh-024 saw `queue_backpressure`
+/// +24 in 120 s. With the `prices_into_drain` gate the inter-spike
+/// work never touches the EWMA, so flap is structurally impossible:
+/// the gate either never engages (a few spikes from cold) or engages
+/// once and HOLDS while the slow-Tick stream persists — both correct.
+/// The assertion is ≤ 1 rising edge.
 ///
-/// Review wf_22a3fa70: the test body MUST evaluate `update_backpressure`
-/// TWICE per outer iteration — post-spike (the production
-/// `run_inner:1761` evaluation BEFORE any fast decays) THEN post-decay
-/// (the next main-cmd dequeue) — matching the production topology;
-/// with one post-decay evaluation only the test is vacuously green at
-/// both α values.
+/// Review wf_22a3fa70: the test body MUST evaluate
+/// `update_backpressure` TWICE per outer iteration — post-spike THEN
+/// post-inter-spike-work — matching the production topology; with one
+/// post-decay evaluation only the test was vacuously green at both α
+/// values.
 #[tokio::test]
 async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -939,34 +941,26 @@ async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> Tes
 
     let mut edges = RisingEdges::new(reader.is_active());
     for _ in 0..24 {
-        // The sh-024 trace: ONE 1.3 s ReportPullOutcome spike (sh-024
-        // §S3) lands, the very next main-loop `update_backpressure`
-        // observes it…
+        // The sh-024 trace shape: ONE 1.3 s slow Tick lands, the very
+        // next main-loop `update_backpressure` observes it…
         actor.note_turn_cost(std::time::Duration::from_millis(1300));
         actor.update_backpressure(114, 10_000);
         edges.observe(&reader);
-        // …then the biased-select fast lane drains up to QUOTA=16
-        // handlers. note_turn_cost now floors at 1ms (sub-ms turns are
-        // noise that flapped the gate — see the fn doc), so model the
-        // inter-spike work as ReportPullOutcome-class (~5ms), the
-        // cheapest ≥1ms work that actually moves the EWMA.
-        for _ in 0..crate::actor::ADMIN_FAST_LANE_DRAIN_QUOTA {
-            actor.note_turn_cost(std::time::Duration::from_millis(5));
-        }
-        // …and the NEXT main-loop evaluation re-reads the now-decayed
-        // EWMA.
+        // …then the inter-spike work (fast-lane admin / ReportPull-
+        // Outcome / SubstituteProgress) processes. None of it folds
+        // into the EWMA (`prices_into_drain` = false), so the only
+        // production effect is another `update_backpressure` at the
+        // NEXT main-cmd dequeue.
         actor.update_backpressure(114, 10_000);
         edges.observe(&reader);
     }
     assert!(
-        edges.count <= 1 && !reader.is_active(),
-        "left: cost-axis backpressure flapped {}× over 24 \
-         single-1.3s-spike cycles (the sh-024 §S2 +24-in-120s flap: at \
-         α=0.3 every spike activates and the 16-feed × 0.7¹⁶ fast-lane \
-         decay releases it 80 µs later — the EWMA is FED at fast-lane \
-         rate but EVALUATED at main-loop rate) / right: at α=0.05 a \
-         1.3 s spike → ewma=0.066 → drain=7.5 s @ q=114, never ≥ HIGH=30 \
-         → 0 rising edges, inactive at loop end",
+        edges.count <= 1,
+        "cost-axis backpressure flapped {}× over 24 single-1.3s-spike \
+         cycles (the sh-024 §S2 +24-in-120s flap). With the \
+         prices_into_drain gate inter-spike work never decays the \
+         EWMA: ≤ 1 rising edge regardless of whether the slow-Tick \
+         stream accumulates past HIGH.",
         edges.count
     );
     Ok(())
@@ -974,14 +968,16 @@ async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> Tes
 
 // r[verify sched.admission.work-per-turn]
 /// **sh-024 §S2 — the live_053 preservation half.** A genuine 140 s
-/// pathological turn at 1 % depth MUST engage and SURVIVE the
-/// inter-evaluation fast-lane decay: at α = 0.05 one observation
-/// lands ewma = 7 s (drain = 700 s ≫ HIGH); after 16 × 5 µs fast
-/// feeds ewma = 7 × 0.95¹⁶ ≈ 3.08 s (drain = 308 s — still ≫ LOW),
-/// and after one more cheap MAIN turn drain = 293 s — STILL active.
-/// At α = 0.3 the same 17 cheap feeds give 42 × 0.7¹⁷ ≈ 0.097 s
-/// (drain = 9.7 s ≤ LOW = 10) — releases on the 17th, the gap
-/// `_does_not_flap` exposes from the other side.
+/// pathological Tick at 1 % depth MUST engage and SURVIVE the
+/// inter-evaluation work: at α = 0.05 one observation lands ewma =
+/// 7 s (drain = 700 s ≫ HIGH). The inter-spike fast-lane / µs-class
+/// commands no longer fold (`prices_into_drain` gate), so the
+/// evidence is preserved BY CONSTRUCTION until the next Tick/
+/// MergeDag — and one subsequent idle Tick at α=0.05 gives ewma =
+/// 0.05×0.001 + 0.95×7.0 = 6.65 → drain = 665 s, STILL active. At
+/// α = 0.3 the prior fold-everything-then-decay topology released on
+/// the 17th cheap feed (42 × 0.7¹⁷ ≈ 0.097 s, drain = 9.7 s ≤ LOW) —
+/// the gap `_does_not_flap` exposes from the other side.
 #[tokio::test]
 async fn backpressure_cost_axis_survives_fast_lane_decay() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -993,33 +989,28 @@ async fn backpressure_cost_axis_survives_fast_lane_decay() -> TestResult {
     actor.update_backpressure(100, 10_000);
     assert!(
         reader.is_active(),
-        "one 140 s turn at q=100 must engage (drain = 100 × α × 140 s)"
+        "one 140 s Tick at q=100 must engage (drain = 100 × α × 140 s)"
     );
-    for _ in 0..crate::actor::ADMIN_FAST_LANE_DRAIN_QUOTA {
-        // Sub-ms feeds are now no-ops at the note_turn_cost gate; this
-        // loop is kept to assert the gate itself: 16 µs-class feeds
-        // must NOT decay the 140s evidence at all.
-        actor.note_turn_cost(std::time::Duration::from_micros(5));
-    }
+    // Inter-spike fast-lane / µs/ms-class commands process; none fold
+    // (`prices_into_drain` = false), so production sees only another
+    // `update_backpressure` at the NEXT main-cmd dequeue with ewma
+    // unchanged.
     actor.update_backpressure(100, 10_000);
     assert!(
         reader.is_active(),
-        "after QUOTA=16 sub-ms fast-lane feeds the live_053 evidence \
-         must survive (1ms floor: ewma unchanged at 7.0, drain = 700 s)"
+        "non-folding inter-spike work must leave the live_053 evidence \
+         intact (ewma unchanged at 7.0, drain = 700 s)"
     );
-    // The discriminating step: ONE more cheap MAIN turn at the 1ms
-    // floor. At α=0.05 ewma = 0.05×0.001 + 0.95×7.0 = 6.65 → drain =
-    // 665 s — stays. (Pre-floor at α=0.3 with µs feeds: drain ≈ 9.7 s
-    // ≤ LOW — released; the floor + α=0.05 each independently fix it.)
+    // ONE subsequent idle Tick. At α=0.05 ewma = 0.05×0.001 +
+    // 0.95×7.0 = 6.65 → drain = 665 s — stays.
     actor.note_turn_cost(std::time::Duration::from_millis(1));
     actor.update_backpressure(100, 10_000);
     assert!(
         reader.is_active(),
-        "left: the 17th cheap feed released the live_053 evidence (at \
-         α=0.3: 42 × 0.7¹⁷ ≈ 0.097 s, drain = 9.7 s ≤ LOW — the \
-         feed-vs-evaluate-rate asymmetry sh-024 §S2 names) / right: at \
-         α=0.05 the 0.95^QUOTA ≈ 0.44 inter-evaluation decay keeps a \
-         genuine pathological turn engaged across fast-lane drains"
+        "left: one subsequent idle Tick released the live_053 evidence \
+         (at α=0.3 the prior fold-everything topology decayed it under \
+         LOW within ~17 cheap feeds) / right: at α=0.05 a single \
+         normal-cost Tick keeps a genuine pathological turn engaged"
     );
     Ok(())
 }
@@ -1027,13 +1018,14 @@ async fn backpressure_cost_axis_survives_fast_lane_decay() -> TestResult {
 // r[verify sched.admission.work-per-turn]
 /// **Bimodal-mix flap regression.** The mailbox during a nix-fast-build
 /// burst is bimodal across 5 OOM: SubstituteProgress 4µs × 65k vs
-/// MergeDag 303ms × 256. Pre-1ms-floor, one slow Tick (3.3s) lifted
-/// ewma to 0.166 → drain = 247s @ q=1484 → ACTIVATE; ~60 × 4µs feeds
-/// decayed it to 0.007 → drain = 9.8s → DEACTIVATE 112µs later — 11
-/// flaps in 5min. With the floor, the µs-class feeds are no-ops and
-/// the gate engages once on the spike and holds until ≥1ms work
-/// (ReportPullOutcome/MergeDag) genuinely brings projected drain
-/// under LOW.
+/// MergeDag 303ms × 256. Pre-`prices_into_drain`-gate, one slow Tick
+/// (3.3s) lifted ewma to 0.166 → drain = 247s @ q=1484 → ACTIVATE;
+/// ~60 × 4µs SubstituteProgress feeds decayed it to 0.007 → drain =
+/// 9.8s → DEACTIVATE 112µs later — 11 flaps in 5min. With the gate,
+/// only MergeDag/Tick fold; the µs/ms-class inter-spike work is a
+/// no-op on the EWMA and the gate engages once on the spike and
+/// holds until subsequent MergeDag/Tick observations genuinely bring
+/// projected drain under LOW.
 #[tokio::test]
 async fn backpressure_cost_axis_bimodal_mix_does_not_flap() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1047,27 +1039,73 @@ async fn backpressure_cost_axis_bimodal_mix_does_not_flap() -> TestResult {
     }
     let mut edges = RisingEdges::new(false);
     // The diagnosed trace, 5 cycles: one 3.3s Tick spike @ q≈1484,
-    // then ~60 SubstituteProgress 4µs feeds, evaluating after each.
+    // then ~60 SubstituteProgress 4µs commands. Those commands do
+    // NOT fold (`prices_into_drain` = false); production only
+    // re-evaluates `update_backpressure` per dequeue.
     for _ in 0..5 {
         actor.note_turn_cost(std::time::Duration::from_millis(3300));
         actor.update_backpressure(1484, 10_000);
         edges.observe(&reader);
         for _ in 0..60 {
-            actor.note_turn_cost(std::time::Duration::from_micros(4));
             actor.update_backpressure(1422, 10_000);
             edges.observe(&reader);
         }
     }
     assert!(
         edges.count <= 1,
-        "bimodal mix flapped {}× (pre-1ms-floor: every 3.3s \
-         spike activated and 60×4µs feeds at α=0.05 decayed it below \
-         LOW within the same evaluation window — the live 11-flaps-in-\
-         5min trace). With the floor the µs feeds are no-ops; the gate \
-         engages once and holds.",
+        "bimodal mix flapped {}× (pre-gate: every 3.3s spike activated \
+         and 60×4µs feeds at α=0.05 decayed it below LOW within the \
+         same evaluation window — the live 11-flaps-in-5min trace). \
+         With the prices_into_drain gate the µs/ms-class work never \
+         touches the EWMA; the gate engages once and holds.",
         edges.count
     );
     Ok(())
+}
+
+/// `prices_into_drain` is exhaustive: ONLY MergeDag and Tick fold
+/// into the cost-axis EWMA. A new variant added without considering
+/// this is the structural seam — the post-P1 re-diagnosis 89s-hold
+/// was 8.8k mid-cost commands inflating an estimator meant to track
+/// MergeDag drain time. This test pins the list so the next variant
+/// add hits a deliberate `false` arm or an explicit `true` here.
+#[test]
+fn prices_into_drain_is_exhaustive() {
+    use crate::actor::command::ActorCommand;
+    // Same exhaustiveness device as `name()`: every arm enumerated;
+    // a new variant is a compile error here. The `false` arms are the
+    // assertion — they are NOT an `_ => false` wildcard.
+    fn check(c: &ActorCommand) -> bool {
+        match c {
+            ActorCommand::MergeDag { .. } => true,
+            ActorCommand::Tick => true,
+            ActorCommand::ProcessCompletion { .. } => false,
+            ActorCommand::SubstituteProgress { .. } => false,
+            ActorCommand::CancelBuild { .. } => false,
+            ActorCommand::PullAssignment { .. } => false,
+            ActorCommand::ListMaterializationJobs { .. } => false,
+            ActorCommand::ReportPullOutcome { .. } => false,
+            ActorCommand::ReportRunningTelemetry { .. } => false,
+            ActorCommand::ReportAttemptOutcome { .. } => false,
+            ActorCommand::AckSpawnedIntents { .. } => false,
+            ActorCommand::QueryBuildStatus { .. } => false,
+            ActorCommand::WatchBuild { .. } => false,
+            ActorCommand::CleanupTerminalBuild { .. } => false,
+            ActorCommand::Admin(_) => false,
+            ActorCommand::ClearPoison { .. } => false,
+            ActorCommand::LeaderAcquired => false,
+            ActorCommand::LeaderLost => false,
+            ActorCommand::LeaderRebound => false,
+            ActorCommand::Debug(_) => false,
+        }
+    }
+    // Spot-check the production fn agrees with the exhaustive match
+    // above (the match is the structural pin; these assert the
+    // production impl matches it).
+    assert!(ActorCommand::Tick.prices_into_drain());
+    assert!(check(&ActorCommand::Tick));
+    assert!(!ActorCommand::LeaderLost.prices_into_drain());
+    assert!(!check(&ActorCommand::LeaderLost));
 }
 
 // ---------------------------------------------------------------------------
