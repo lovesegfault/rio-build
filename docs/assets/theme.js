@@ -87,6 +87,12 @@
 
     // ─── keyboard nav: ←/→ chapter, S to focus search, ? for help ───
     const shortcuts = document.querySelector("dialog.rio-shortcuts");
+    // Native <dialog>.showModal() does NOT close on backdrop click. A
+    // click whose target is the <dialog> element itself (not a
+    // descendant) landed on the ::backdrop — treat as dismiss.
+    shortcuts?.addEventListener("click", (ev) => {
+      if (ev.target === shortcuts) shortcuts.close();
+    });
     addEventListener("keydown", (ev) => {
       if (ev.altKey || ev.ctrlKey || ev.metaKey) return;
       // Escape is meaningful from inside the search input (clear+blur),
