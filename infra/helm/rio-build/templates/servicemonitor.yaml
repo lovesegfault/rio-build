@@ -59,7 +59,7 @@ spec:
 # off. PodMonitor scrapes pods directly by label. The controller stamps
 # rio.build/role + rio.build/pool on every executor pod (reconcilers/
 # common/pod.rs ROLE_LABEL/POOL_LABEL); matching on `pool` existence
-# covers all pools without enumerating them. portName resolves against
+# covers all pools without enumerating them. `port:` resolves by name against
 # the pod's containerPort name ("metrics" → 9093, set in pod.rs).
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
@@ -75,6 +75,6 @@ spec:
     matchExpressions:
       - {key: rio.build/pool, operator: Exists}
   podMetricsEndpoints:
-    - portName: metrics
+    - port: metrics
       interval: {{ .Values.monitoring.scrapeInterval }}
 {{- end }}

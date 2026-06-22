@@ -168,7 +168,7 @@ spec:
     matchLabels:
       {{- include "rio.selectorLabels" "rio-mountd" | nindent 6 }}
   podMetricsEndpoints:
-    - portName: metrics
+    - port: metrics
       interval: {{ .Values.monitoring.scrapeInterval }}
 {{- end }}
 {{- end }}
