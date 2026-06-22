@@ -2333,12 +2333,11 @@ in
         done <<<"$fencehits"
         # Stale `<chapter>.md` reference in non-typ sources — the
         # chapter was migrated to typst. Stem alternation derived from
-        # lib/html/meta.typ's chapters table (the canonical chapter
-        # set; same path-regex as docs-html-smoke assertion (a)) so a
-        # new chapter auto-extends and lib/manifest stems are excluded
-        # by construction.
-        stems=$(grep -oE '"[a-z][a-z0-9/-]*\.typ"' $typSrc/lib/html/meta.typ \
-          | sed 's/"//g;s/\.typ$//' \
+        # docsLib.metaChapters (the single meta.typ scrape; same source
+        # as docs-html-smoke assertion (a)) so a new chapter
+        # auto-extends and lib/manifest stems are excluded by
+        # construction.
+        stems=$(sed 's/\.typ$//' ${docsLib.metaChapters}/paths \
           | xargs -n1 basename | sort -u | paste -sd'|')
         # Folded chapters: existed in docs/src/*.md, merged into other
         # .typ files during the migration (no 1:1 .typ). Frozen
@@ -2784,10 +2783,10 @@ in
         # (a) duplicates it (now that the QA3 show-rule is gone), or
         # (b) was previously suppressed leaving an H1→H3 skip /
         # §-starts-at-2. Heuristic matches the QA3 rule's three forms
-        # (exact / `rio-<title>` / `<title> *` prefix). Limitation:
-        # path:title extraction flattens meta.typ then matches the
-        # `("Title", "path.typ"` tuple shape (single- or multi-line);
-        # a `"` inside a title would break it (none currently exist).
+        # (exact / `rio-<title>` / `<title> *` prefix). path:title
+        # entries from docsLib.metaChapters (scoped to the
+        # `#let chapters = (` block, so the descriptions dict's
+        # `"…store.", "architecture.typ"` shape can't false-match).
         while IFS=: read -r ch title; do
           # `|| true`: chapters with no `^= ` (post-migration glossary)
           # make grep exit 1; under set -e that's fatal before the
@@ -2800,9 +2799,7 @@ in
             echo "FAIL: $ch first heading '= $first' duplicates manifest title '$title'" >&2
             fail=1
           fi
-        done < <(tr '\n' ' ' < $typSrc/lib/html/meta.typ | tr -s ' ' \
-          | grep -oE '"[^"]+", "[a-z][a-z0-9/-]*\.typ"' \
-          | sed -E 's/"([^"]+)", "([^"]+)"/\2:\1/')
+        done < ${docsLib.metaChapters}/entries
         # QA4-#2: stray `=` at (post-indent) line-start — typst parses as
         # heading inside content blocks. book*.typ's `summary:[...]` part
         # markers (`= Guide`, `= Spec`) are intentional.

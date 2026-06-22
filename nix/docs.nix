@@ -116,6 +116,30 @@ let
     );
   };
 
+  # Chapter manifest scrape: lib/html/meta.typ's `#let chapters = (...)`
+  # is the bundle's source of truth for the page set. Three nix-side
+  # consumers (docs-html-smoke route check; misc-checks docs-lint
+  # stale-.md-ref + QA4-B title-dup) each open-coded a regex against
+  # the whole file; the char-class drift (`[a-z0-9/-]` rejected `_` and
+  # uppercase) and the descriptions-dict false-match (the `"…store.",
+  # "architecture.typ"` shape after flattening) were already in. Single
+  # source: scoped to the chapters block, broadened char-class, with
+  # the `n ≥ 30` floor that was previously only in docs-html-smoke.
+  # `$out/paths` = one chapter path per line; `$out/entries` =
+  # `path:title` per line for the QA4-B first-heading check.
+  metaChapters = pkgs.runCommand "rio-meta-chapters" { } ''
+    mkdir -p $out
+    sed -n '/^#let chapters = ($/,/^)$/p' ${docsSrc}/lib/html/meta.typ > scoped
+    grep -oE '"[A-Za-z0-9_][A-Za-z0-9_/-]*\.typ"' scoped \
+      | tr -d '"' > $out/paths
+    tr '\n' ' ' < scoped | tr -s ' ' \
+      | grep -oE '"[^"]+", "[A-Za-z0-9_][A-Za-z0-9_/-]*\.typ"' \
+      | sed -E 's/"([^"]+)", "([^"]+)"/\2:\1/' > $out/entries
+    n=$(wc -l < $out/paths)
+    echo "metaChapters: $n paths"
+    test "$n" -ge 30
+  '';
+
   # HTML-only assets (style.css, theme.js). book.typ `read()`s these at
   # compile time, book-pdf.typ does not.
   docsAssets = lib.fileset.toSource {
@@ -386,6 +410,7 @@ rec {
     typstEnv
     docsData
     docsRetiredArtifacts
+    metaChapters
     ;
 
   # Real-SHA builds for `packages.{docs,docs-pdf}` — the deployed
@@ -412,18 +437,14 @@ rec {
         html = docsCheck;
       in
       pkgs.runCommand "rio-docs-html-smoke" { } ''
-        # (a) every chapter route has a file. Route list is scraped
-        # from meta.typ (the `chapters` table is the bundle's source of
-        # truth) — `typst query` is deprecated in 0.15, so grep is the
-        # primary path. `intro.typ` → index per meta.typ's route-for.
-        routes=$(grep -oE '"[a-z][a-z0-9/-]*\.typ"' \
-            ${compileRoot}/lib/html/meta.typ \
-          | tr -d '"' | sed 's/\.typ$//; s/^intro$/index/' | sort -u)
-        n=$(printf '%s\n' "$routes" | wc -l)
-        echo "docs-html-smoke: $n routes from meta.typ"
-        # Floor guards the regex: a meta.typ reformat that breaks the
-        # scrape would otherwise pass on zero routes.
-        test "$n" -ge 30
+        # (a) every chapter route has a file. Route list from
+        # docsLib.metaChapters (the single meta.typ scrape — `typst
+        # query` is deprecated in 0.15). `intro.typ` → index per
+        # meta.typ's route-for. The `n ≥ 30` floor is enforced inside
+        # metaChapters.
+        routes=$(sed 's/\.typ$//; s/^intro$/index/' \
+          ${metaChapters}/paths | sort -u)
+        echo "docs-html-smoke: $(wc -l < ${metaChapters}/paths) routes"
         for r in $routes; do
           test -f ${html}/$r.html || { echo "missing: $r.html"; exit 1; }
         done
