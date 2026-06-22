@@ -302,10 +302,25 @@ let
         # --page404 with a real 404 status (miniserve can't — its --spa
         # would return 200 + index.html). QA H3.
         mkdir -p $bin/bin
+        # SWS has no `--header` flag (miniserve did); custom headers go
+        # via config.toml only. `--cache-control-headers=false` would
+        # suppress SWS's default max-age=86400 but then browsers fall
+        # back to heuristic freshness — and nix-store files have mtime
+        # epoch-1, so heuristic = 10% × (now − 1970) ≈ years of cache.
+        # Force no-cache so the browser revalidates every request
+        # (parity with the prior miniserve `--header Cache-Control:
+        # no-cache`).
+        cat > $bin/sws.toml <<'EOF'
+        [advanced]
+        [[advanced.headers]]
+        source = "**"
+        [advanced.headers.headers]
+        Cache-Control = "no-cache"
+        EOF
         makeWrapper ${pkgs.static-web-server}/bin/static-web-server $bin/bin/rio-docs \
           --add-flags "--root $out" \
           --add-flags "--page404 404.html" \
-          --add-flags "--cache-control-headers false" \
+          --add-flags "--config-file $bin/sws.toml" \
           --add-flags "--port 8080" \
           --add-flags "--host 127.0.0.1"
       '';
