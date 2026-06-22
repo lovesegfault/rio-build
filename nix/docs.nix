@@ -442,6 +442,18 @@ rec {
           ${html}/spec/system/deployment.html
         grep -q '<h2 id="responsibilities"' \
           ${html}/spec/components/gateway.html
+        # (c3) per-file duplicate heading ids. -H prefixes each match
+        # with its path, so `sort | uniq -d` is per-file (the same
+        # heading text in two CHAPTERS yields the same id in distinct
+        # files — fine; a repeat WITHIN one file is the bug). Guards
+        # the `_heading-slugs` bump condition in lib/rio.typ — the
+        # `<label>` == auto-slug case (ops/sla-model.typ has seven).
+        dup=$(grep -roHE '<h[2-6] id="[^"]+"' ${html} | sort | uniq -d)
+        if [ -n "$dup" ]; then
+          echo "FAIL: duplicate heading id within a single page:"
+          echo "$dup"
+          exit 1
+        fi
         # (d) fletcher diagram survived html-target as inline SVG
         grep -q '<svg' ${html}/architecture.html
         # (e) pagefind indexed ≥30 docs (one fragment per indexed page;

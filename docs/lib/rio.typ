@@ -682,11 +682,15 @@
         // state.update() yields placeable content (not a side-effect),
         // so it must sit in the output sequence — NOT inside the
         // `let id = …` block, where it would join into the binding and
-        // turn `id` into content. Skip the bump when an explicit label
-        // overrode the id — `base` was never emitted in that case, so
-        // counting it would make the next unlabelled `= <same text>`
-        // emit `base-2` with no element ever holding `base`.
-        if not has-label {
+        // turn `id` into content. Bump the dedup count whenever this
+        // heading EMITTED `base` as its id: that's every unlabelled
+        // heading, AND a labelled heading whose explicit `<label>`
+        // happens to equal `_slug(body)` (seven such headings exist in
+        // ops/sla-model.typ). Skipping the bump only when a DIFFERENT
+        // label overrode the id keeps a later unlabelled `= <same
+        // text>` at `base` (not a gapped `base-2`) without letting the
+        // label==auto-slug case collide.
+        if not has-label or str(it.label) == base {
           _heading-slugs.update(d => {
             d.insert(key, d.at(key, default: 0) + 1)
             d
