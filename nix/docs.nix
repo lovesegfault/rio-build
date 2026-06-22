@@ -201,6 +201,43 @@ let
       "site-url=${siteUrl}"
     ];
 
+  # Webfonts: ship the NCM faces style.css references — body text
+  # (NewCMSans10 regular/bold/oblique/bold-oblique — the sans family
+  # uses Oblique, not Italic), mono (NewCMMono10 regular/bold), and
+  # math (NewCMMath-Regular for the Plane-1 glyphs typst emits,
+  # U+1D400–, which need an OpenType MATH table). Matches the
+  # @font-face set in docs/assets/style.css. OTF→WOFF2 via pyftsubset:
+  # Chrome's OTS sanitizer rejects the upstream .otf ("CFF: Failed
+  # validating CharStrings INDEX" — the autohinter-generated hint
+  # programs are malformed per OTS), so body text fell back to generic
+  # serif in Chromium. A bare woff2_compress is NOT enough (it wraps
+  # the CFF table verbatim and OTS still rejects it); --no-hinting
+  # --desubroutinize rewrites the CharStrings into a form OTS accepts.
+  # --unicodes=* keeps every glyph; pyftsubset preserves the MATH
+  # table. Own derivation: only input is pkgs.newcomputermodern, so
+  # .typ/.css edits don't re-run the seven subsetting passes.
+  webfonts =
+    pkgs.runCommand "rio-docs-webfonts"
+      {
+        nativeBuildInputs = [
+          (pkgs.python3.withPackages (ps: [
+            ps.fonttools
+            ps.brotli
+          ]))
+        ];
+      }
+      ''
+        mkdir -p $out
+        for f in NewCMSans10-Regular NewCMSans10-Bold NewCMSans10-Oblique NewCMSans10-BoldOblique \
+                 NewCMMono10-Regular NewCMMono10-Bold NewCMMath-Regular; do
+          pyftsubset \
+            ${pkgs.newcomputermodern}/share/fonts/opentype/public/$f.otf \
+            --output-file=$out/$f.woff2 --flavor=woff2 \
+            '--unicodes=*' '--layout-features=*' \
+            --no-hinting --desubroutinize
+        done
+      '';
+
   # Compile root: docs sources + generated data, fused into one tree
   # so typst's `--root` sees `/lib`, `/spec`, and `/gen` together.
   compileRoot = pkgs.runCommand "rio-docs-root" { } ''
@@ -247,10 +284,6 @@ let
             pkgs.pagefind
             pkgs.makeWrapper
             pkgs.resvg
-            (pkgs.python3.withPackages (ps: [
-              ps.fonttools
-              ps.brotli
-            ]))
           ];
         }
       )
@@ -273,29 +306,11 @@ let
         resvg --width 1200 --height 630 --skip-system-fonts \
           --use-fonts-dir ${pkgs.newcomputermodern}/share/fonts/opentype/public \
           $out/og-image.svg $out/og-image.png
-        # Webfonts: ship the NCM faces style.css references — body text
-        # (NewCMSans10 regular/bold/oblique/bold-oblique — the sans
-        # family uses Oblique, not Italic), mono (NewCMMono10
-        # regular/bold), and math (NewCMMath-Regular for the Plane-1
-        # glyphs typst emits, U+1D400–, which need an OpenType MATH
-        # table). Matches the @font-face set in docs/assets/style.css.
-        # OTF→WOFF2 via pyftsubset: Chrome's OTS sanitizer rejects the
-        # upstream .otf ("CFF: Failed validating CharStrings INDEX" —
-        # the autohinter-generated hint programs are malformed per OTS),
-        # so body text fell back to generic serif in Chromium. A bare
-        # woff2_compress is NOT enough (it wraps the CFF table verbatim
-        # and OTS still rejects it); --no-hinting --desubroutinize
-        # rewrites the CharStrings into a form OTS accepts. --unicodes=*
-        # keeps every glyph; pyftsubset preserves the MATH table.
-        mkdir -p $out/assets/fonts
-        for f in NewCMSans10-Regular NewCMSans10-Bold NewCMSans10-Oblique NewCMSans10-BoldOblique \
-                 NewCMMono10-Regular NewCMMono10-Bold NewCMMath-Regular; do
-          pyftsubset \
-            ${pkgs.newcomputermodern}/share/fonts/opentype/public/$f.otf \
-            --output-file=$out/assets/fonts/$f.woff2 --flavor=woff2 \
-            '--unicodes=*' '--layout-features=*' \
-            --no-hinting --desubroutinize
-        done
+        # Webfonts: independent derivation (only input is
+        # pkgs.newcomputermodern), so .typ edits don't re-run the seven
+        # OTF→WOFF2 subsetting passes.
+        mkdir -p $out/assets
+        cp -r ${webfonts} $out/assets/fonts
         # Static search index over the emitted HTML.
         pagefind --site $out --output-subdir pagefind
         # GH Pages custom domain. actions/upload-pages-artifact +
