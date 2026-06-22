@@ -32,13 +32,16 @@
 #asset("style.css", read("/assets/style.css", encoding: none))
 #asset("theme.js", read("/assets/theme.js", encoding: none))
 
-// Social-preview card (og:image). 1200×630 SVG, Ayu accent fill,
-// brand wordmark in NCM Sans. Inline literal — no external asset file.
+// Social-preview card source. 1200×630 SVG, Ayu accent fill, brand
+// wordmark in NCM Sans. Inline literal — no external asset file.
+// nix/docs.nix rasterizes this to og-image.png (resvg, with the NCM
+// font dir wired in) because OG scrapers (Slack/LinkedIn/Twitter/
+// Facebook) do not render SVG; page.typ points og:image at the PNG.
 #asset("og-image.svg", bytes(
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 630'>\n"
     + "  <rect width='1200' height='630' fill='#f29718'/>\n"
     + "  <text x='600' y='360' text-anchor='middle'\n"
-    + "    font-family='NewComputerModernSans, sans-serif'\n"
+    + "    font-family='NewComputerModernSans10, sans-serif'\n"
     + "    font-size='140' font-weight='700' fill='#ffffff'>rio-build</text>\n"
     + "</svg>\n",
 ))

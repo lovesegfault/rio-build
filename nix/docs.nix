@@ -246,6 +246,7 @@ let
             rioTypst
             pkgs.pagefind
             pkgs.makeWrapper
+            pkgs.resvg
             (pkgs.python3.withPackages (ps: [
               ps.fonttools
               ps.brotli
@@ -265,6 +266,13 @@ let
         typst compile --features bundle,html --format bundle \
           --root . ${mkInputArgs ghSha} --input x-target=html \
           --font-path "$TYPST_FONT_PATHS" book.typ $out/
+        # og:image must be raster (OG scrapers do not render SVG).
+        # book.typ emits og-image.svg; rasterize to 1200×630 PNG with
+        # the NCM font dir wired so the wordmark renders. The SVG stays
+        # in $out as the editable source.
+        resvg --width 1200 --height 630 --skip-system-fonts \
+          --use-fonts-dir ${pkgs.newcomputermodern}/share/fonts/opentype/public \
+          $out/og-image.svg $out/og-image.png
         # Webfonts: ship the NCM faces style.css references — body text
         # (NewCMSans10 regular/bold/oblique/bold-oblique — the sans
         # family uses Oblique, not Italic), mono (NewCMMono10

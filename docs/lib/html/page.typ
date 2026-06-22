@@ -64,9 +64,24 @@
           property: "og:description",
           content: meta-desc,
         ))
+        // PNG, not SVG: OG scrapers (Slack/LinkedIn/Twitter/Facebook)
+        // require raster. nix/docs.nix rasterizes book.typ's
+        // og-image.svg via resvg.
         html.elem("meta", attrs: (
           property: "og:image",
-          content: site-url + "/og-image.svg",
+          content: site-url + "/og-image.png",
+        ))
+        html.elem("meta", attrs: (
+          property: "og:image:type",
+          content: "image/png",
+        ))
+        html.elem("meta", attrs: (
+          property: "og:image:width",
+          content: "1200",
+        ))
+        html.elem("meta", attrs: (
+          property: "og:image:height",
+          content: "630",
         ))
       }
       #for tc in _theme-color {
