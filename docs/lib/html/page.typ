@@ -29,7 +29,14 @@
   let trail = if src-path != none { crumb-trail(chapters, src-path) } else {
     ()
   }
-  let page-url = if site-url != "" { site-url + "/" + route + ".html" }
+  // Directory form for the root: search engines and OG scrapers treat
+  // `/` and `/index.html` as distinct URLs, so canonical/og:url for the
+  // home page must be `<site>/`, not `<site>/index.html`.
+  let page-url = if site-url != "" {
+    if route == "index" { site-url + "/" } else {
+      site-url + "/" + route + ".html"
+    }
+  }
   html.elem("html", attrs: (lang: "en"))[
     #html.head[
       #html.elem("meta", attrs: (charset: "utf-8"))
