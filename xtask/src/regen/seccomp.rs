@@ -78,8 +78,9 @@ pub async fn run(tag: &str) -> Result<()> {
     // and vendors it back; the in-tree path moved. Older tags (the
     // //provenance baseline records v27.5.1) still have the profile at
     // `profiles/seccomp/default.json` — try the vendored path first
-    // and fall back on 404 so `xtask regen seccomp <old-tag>` (the
-    // diff-against-recorded-baseline workflow) keeps working.
+    // and fall back on any non-2xx so `xtask regen seccomp <old-tag>`
+    // (the diff-against-recorded-baseline workflow) keeps working
+    // through a transient CDN 5xx on the first URL.
     let base = format!("https://raw.githubusercontent.com/moby/moby/{tag}");
     let urls = [
         format!("{base}/vendor/github.com/moby/profiles/seccomp/default.json"),
@@ -87,14 +88,16 @@ pub async fn run(tag: &str) -> Result<()> {
     ];
 
     info!("fetching moby {tag} default.json");
+    let client = reqwest::Client::new();
     let mut v: Value = 'fetch: {
         for url in &urls {
-            let resp = reqwest::get(url).await?;
-            if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                info!("  {url} → 404, trying fallback");
+            let resp = client.get(url).send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                info!("  {url} → {status}, trying fallback");
                 continue;
             }
-            break 'fetch resp.error_for_status()?.json().await?;
+            break 'fetch resp.json().await?;
         }
         anyhow::bail!("moby {tag}: default.json not at any known path ({urls:?})");
     };
