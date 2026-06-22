@@ -139,20 +139,27 @@
           #html.elem("div", attrs: (id: "search"))[]
           #nav-tree(route)
         ]
-        #html.elem("main", attrs: (
-          class: "rio-main",
-          id: "main",
+        #html.elem(
+          "main",
           // QA S1: scope pagefind indexing to the chapter body only —
           // sidebar/TOC/dialog chrome outside <main> are excluded.
-          data-pagefind-body: "",
-        ))[
+          // Synthesized pages (404, src-path: none) are NOT indexed.
+          attrs: (class: "rio-main", id: "main")
+            + if src-path != none { (data-pagefind-body: "") } else { (:) },
+        )[
           #if trail.len() > 1 {
             // Breadcrumbs: ancestor chain root→leaf. Leaf (= this page,
             // already the <h1> below) is rendered unlinked; section
-            // headings (path: none) are also unlinked.
+            // headings (path: none) are also unlinked. Ignored by
+            // pagefind so ancestor titles don't pollute every nested
+            // page's index entry.
             html.elem(
               "nav",
-              attrs: (class: "rio-crumbs", aria-label: "Breadcrumb"),
+              attrs: (
+                class: "rio-crumbs",
+                aria-label: "Breadcrumb",
+                data-pagefind-ignore: "",
+              ),
               html.elem("ol", for (i, (t, p)) in trail.enumerate() {
                 let leaf = i + 1 == trail.len()
                 html.elem(
