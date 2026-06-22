@@ -432,17 +432,19 @@ rec {
           echo "$bare"
           exit 1
         fi
-        # (c2) QA4-#3/#6: output-level heading guards. misc-checks
+        # (c2) QA4-#3/#6: output-level heading guard. misc-checks
         # QA4-B lints SOURCE (`= ` first-heading vs manifest title)
-        # only; these grep RENDERED h2s so a heading show-rule
-        # regression that EATS a non-first heading (QA4-#3: deployment
+        # only; this counts RENDERED `<h2 id=` so a heading show-rule
+        # regression that EATS non-first headings (QA4-#3: deployment
         # §3 was eaten by `starts-with("deployment ")`) or mis-promotes
-        # levels (QA4-#6: gateway had H1→H3 skip) is caught at the
-        # gate. id= proves not-eaten + slug; <h2 proves level.
-        grep -q '<h2 id="deployment-order"' \
-          ${html}/spec/system/deployment.html
-        grep -q '<h2 id="responsibilities"' \
-          ${html}/spec/components/gateway.html
+        # levels (QA4-#6: gateway had H1→H3 skip) is caught tree-wide,
+        # not at two hand-picked witness ids that go red on a prose
+        # rename. Floor 200 against ~280 currently rendered.
+        h2n=$(grep -rohE '<h2 id="[^"]+"' ${html} | wc -l)
+        if [ "$h2n" -lt 200 ]; then
+          echo "FAIL: $h2n rendered <h2 id=…> (<200) — heading show-rule eating/mis-promoting?"
+          exit 1
+        fi
         # (c3) per-file duplicate heading ids. -H prefixes each match
         # with its path, so `sort | uniq -d` is per-file (the same
         # heading text in two CHAPTERS yields the same id in distinct
