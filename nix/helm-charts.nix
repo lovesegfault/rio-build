@@ -20,8 +20,8 @@ let
 in
 {
   # Chart 18.x bundles PostgreSQL 18. deployment.typ requires PG 15+;
-  # Aurora prod is PG 17, so dev stays ahead (catches forward-compat
-  # issues early).
+  # Aurora prod (infra/eks/rds.tf engine_version) is on the same major,
+  # so dev and prod exercise the same PG surface.
   inherit (charts.bitnami) postgresql;
 
   # Rook operator (CRDs + controller). Installed BEFORE rook-ceph-cluster
