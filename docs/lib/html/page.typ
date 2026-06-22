@@ -10,7 +10,14 @@
 #import "/lib/rio.typ": _current-route, _page-toc
 
 // Ayu accent — keeps the mobile-chrome tint in step with style.css.
-#let _theme-color = "#f29718"
+// Light/dark pair mirrors `--accent` in style.css; the dark entry
+// carries `media` so a dark-OS user gets the dark tint regardless of
+// the in-page data-theme toggle (browsers only read the meta, not the
+// stylesheet).
+#let _theme-color = (
+  (media: none, content: "#f29718"),
+  (media: "(prefers-color-scheme: dark)", content: "#e6b450"),
+)
 // Deploy base for canonical/OG URLs. nix/docs.nix passes this
 // unconditionally; only out-of-band `typst compile` hits the empty
 // default (which then omits canonical/OG meta).
@@ -62,7 +69,11 @@
           content: site-url + "/og-image.svg",
         ))
       }
-      #html.elem("meta", attrs: (name: "theme-color", content: _theme-color))
+      #for tc in _theme-color {
+        let attrs = (name: "theme-color", content: tc.content)
+        if tc.media != none { attrs.insert("media", tc.media) }
+        html.elem("meta", attrs: attrs)
+      }
       #html.title[#title — rio-build design book]
       // Inline SVG favicon (Ayu accent disc + "r" glyph). data: URI so
       // it ships with every page — no /favicon.ico round-trip.
