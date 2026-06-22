@@ -75,13 +75,29 @@ pub async fn run(tag: &str) -> Result<()> {
         ours.display()
     );
     // moby 29.x split seccomp profiles into github.com/moby/profiles
-    // and vendors it back; the in-tree path moved.
-    let url = format!(
-        "https://raw.githubusercontent.com/moby/moby/{tag}/vendor/github.com/moby/profiles/seccomp/default.json"
-    );
+    // and vendors it back; the in-tree path moved. Older tags (the
+    // //provenance baseline records v27.5.1) still have the profile at
+    // `profiles/seccomp/default.json` — try the vendored path first
+    // and fall back on 404 so `xtask regen seccomp <old-tag>` (the
+    // diff-against-recorded-baseline workflow) keeps working.
+    let base = format!("https://raw.githubusercontent.com/moby/moby/{tag}");
+    let urls = [
+        format!("{base}/vendor/github.com/moby/profiles/seccomp/default.json"),
+        format!("{base}/profiles/seccomp/default.json"),
+    ];
 
     info!("fetching moby {tag} default.json");
-    let mut v: Value = reqwest::get(&url).await?.error_for_status()?.json().await?;
+    let mut v: Value = 'fetch: {
+        for url in &urls {
+            let resp = reqwest::get(url).await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                info!("  {url} → 404, trying fallback");
+                continue;
+            }
+            break 'fetch resp.error_for_status()?.json().await?;
+        }
+        anyhow::bail!("moby {tag}: default.json not at any known path ({urls:?})");
+    };
 
     // Flatten: keep syscall blocks whose includes.caps ⊆ WORKER_CAPS.
     let syscalls = v["syscalls"].as_array_mut().expect("moby format changed");
