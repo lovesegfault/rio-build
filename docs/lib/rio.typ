@@ -111,6 +111,14 @@
 // Per-page route, set by lib/html/page.typ's `page-shell()`. Stays
 // `none` for PDF targets so `_chapter-nav()` returns the empty stub.
 #let _current-route = state("rio-current-route", none)
+// Contextual: current route, or `""` when unset. The html-arm
+// show-rules below use the route as a dict key (typst rejects `none`
+// keys); page-shell sets it but a standalone-chapter html compile
+// (`typst compile --input x-target=html docs/foo.typ`) doesn't.
+#let _current-route-or-empty() = {
+  let r = _current-route.get()
+  if r == none { "" } else { r }
+}
 
 // Per-route heading-slug occurrence counts, for the html-mode
 // `show heading:` rule below. Bundle mode shares one typst state space
@@ -638,7 +646,7 @@
       // body below. Numbering is positional via `.get()` (footnotes
       // 1..N-1 already pushed at this point).
       show footnote: it => context {
-        let route = _current-route.get()
+        let route = _current-route-or-empty()
         let n = _footnotes.get().at(route, default: ()).len() + 1
         _footnotes.update(d => {
           d.insert(route, d.at(route, default: ()) + (it.body,))
@@ -663,8 +671,8 @@
       // html.frame() paged sub-context.
       show heading: it => context if target() == "html" {
         let base = _slug(it.body)
-        let route = _current-route.get()
-        let key = if route == none { base } else { route + "::" + base }
+        let route = _current-route-or-empty()
+        let key = if route == "" { base } else { route + "::" + base }
         let n = _heading-slugs.get().at(key, default: 0)
         let id = if it.has("label") and it.label != none {
           // honour an explicit `= Title <slug>` so cross-link and
@@ -728,7 +736,7 @@
       // above. `.final()` (not positional `.get()`) so the section sees
       // every note regardless of where in the body it sat.
       context {
-        let route = _current-route.get()
+        let route = _current-route-or-empty()
         let notes = _footnotes.final().at(route, default: ())
         if notes.len() > 0 {
           html.elem(
