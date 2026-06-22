@@ -58,11 +58,20 @@
   asset("robots.txt", bytes(
     "User-agent: *\nAllow: /\nSitemap: " + site-url + "/sitemap.xml\n",
   ))
+  // <loc> mirrors page.typ's page-url: route=="index" → `<site>/`, not
+  // `<site>/index.html`, so the sitemap URL agrees with each page's
+  // <link rel=canonical>.
   asset("sitemap.xml", bytes(
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
       + "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
       + routes
-        .map(r => "  <url><loc>" + site-url + "/" + r + ".html</loc></url>\n")
+        .map(r => (
+          "  <url><loc>"
+            + if r == "index" { site-url + "/" } else {
+              site-url + "/" + r + ".html"
+            }
+            + "</loc></url>\n"
+        ))
         .join("")
       + "</urlset>\n",
   ))
