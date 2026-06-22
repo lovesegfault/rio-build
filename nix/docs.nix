@@ -185,7 +185,15 @@ let
   # `nix run .#docs`, packages.docs) gets the real URL; only an
   # out-of-band `typst compile` falls back to page.typ's empty default
   # (which then omits canonical/OG meta).
-  siteUrl = "https://lovesegfault.github.io/rio-build";
+  #
+  # The custom domain serves at root, so the book's root-relative hrefs
+  # (`/spec/...`, `/style.css`) resolve correctly. The default GH Pages
+  # project-site URL (lovesegfault.github.io/rio-build/) would NOT — it
+  # serves under a `/<repo>/` subpath that root-relative links escape.
+  # If the custom domain is ever dropped, hrefs need a base-path prefix
+  # (shiroa's `x-url-base` mechanism, not ported to the native bundle).
+  # Verified: `gh api repos/lovesegfault/rio-build/pages | jq .cname`.
+  siteUrl = "https://docs.rio-build.com";
   mkInputArgs =
     ghSha:
     lib.concatMapStringsSep " " (i: "--input ${lib.escapeShellArg i}") [
@@ -282,6 +290,11 @@ let
         done
         # Static search index over the emitted HTML.
         pagefind --site $out --output-subdir pagefind
+        # GH Pages custom domain. actions/upload-pages-artifact +
+        # deploy-pages will RESET the repo's Pages cname setting if the
+        # artifact lacks a CNAME file, so bake it in. Kept in sync with
+        # siteUrl above (the host component).
+        echo ${lib.removePrefix "https://" siteUrl} > $out/CNAME
         # `nix run .#docs` → serve the built tree. Root, 404 page, and a
         # loopback :8080 default are baked in (SWS otherwise binds the
         # privileged :80); everything else passes through, e.g.
