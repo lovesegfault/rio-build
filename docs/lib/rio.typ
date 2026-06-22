@@ -201,8 +201,11 @@
   // The block(width: 100%) wrapper is paged-only — inside
   // html.frame()'s paged sub-context there's no container width, so
   // 100% → 0pt → zero-width SVG (QA #1). frame-figure supplies a
-  // fixed-width box for kind:"algorithm" instead.
-  context if is-html() {
+  // fixed-width box for kind:"algorithm" instead. Gated on the
+  // compile-global `is-html-target()`, NOT contextual `is-html()`: this
+  // body is rendered inside `html.frame()` (frame-figure routes
+  // kind:"algorithm" through it), where `target()` reports "paged".
+  if is-html-target() {
     pseudocode-list(booktabs: false, indentation: 1.4em, body)
   } else {
     block(
@@ -219,7 +222,10 @@
 // in PDF (h(1fr) needs container width); below-line in HTML
 // (html.frame() has no width to push against, and below-line reflows
 // at any viewport — width-independent, so the 560pt box stays). QA2-C.
-#let rann(body) = context if is-html() {
+// Compile-global `is-html-target()` not contextual `is-html()`: rann()
+// is only ever called inside algorithm() bodies, which frame-figure
+// renders inside `html.frame()` — `target()` reports "paged" there.
+#let rann(body) = if is-html-target() {
   linebreak()
   h(2em)
   text(size: 0.85em, style: "italic", fill: muted, body)
