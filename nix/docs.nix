@@ -422,6 +422,26 @@ rec {
         # href is unambiguous.
         grep -q 'github.com/lovesegfault/rio-build/edit/main/docs/architecture.typ' \
           ${html}/architecture.html
+        # (c1) QA #3: tree-wide bare-href guard. typst emits `<a href>`
+        # (no value) when a link attr is none/unset; (c) checks one
+        # specific link, this is the negative tripwire over every
+        # html.elem("a", attrs:(href:…)) call site.
+        if grep -rqE '<a [^>]*\bhref(\s|>)' ${html}; then
+          echo "FAIL: bare-href link (QA #3 — html.elem href: none/unset)"
+          grep -rlE '<a [^>]*\bhref(\s|>)' ${html}
+          exit 1
+        fi
+        # (c2) QA4-#3/#6: output-level heading guards. misc-checks
+        # QA4-B lints SOURCE (`= ` first-heading vs manifest title)
+        # only; these grep RENDERED h2s so a heading show-rule
+        # regression that EATS a non-first heading (QA4-#3: deployment
+        # §3 was eaten by `starts-with("deployment ")`) or mis-promotes
+        # levels (QA4-#6: gateway had H1→H3 skip) is caught at the
+        # gate. id= proves not-eaten + slug; <h2 proves level.
+        grep -q '<h2 id="deployment-order"' \
+          ${html}/spec/system/deployment.html
+        grep -q '<h2 id="responsibilities"' \
+          ${html}/spec/components/gateway.html
         # (d) fletcher diagram survived html-target as inline SVG
         grep -q '<svg' ${html}/architecture.html
         # (e) pagefind indexed ≥30 docs (one fragment per indexed page;
