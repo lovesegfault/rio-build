@@ -403,6 +403,16 @@ pub enum ActorCommand {
     /// is retained and redelivered (idempotent on every plane:
     /// clears are removes, observed types upsert, marks
     /// refresh-not-step).
+    ///
+    /// LANE: deliberately main-mailbox (NOT [`AdminLane::Fast`]). The
+    /// controller polls it under the same 5s deadline as
+    /// `GetSpawnIntents`, but the handler is `&mut self` AND awaits
+    /// `apply_no_host_poisons` — the fast lane's `serve_fast_admin` /
+    /// `drain_admin_fast_lane` dispatch is sync `handle_admin(&self)`.
+    /// A MergeDag-burst timeout here is degraded-not-broken: the
+    /// commit-on-Ack buffer redelivers idempotently next tick (the
+    /// controller WARN-logs, no `SchedulerUnreachable` flip).
+    /// `GetSpawnIntents` is the latency-critical sibling and IS Fast.
     AckSpawnedIntents {
         spawned: Vec<rio_proto::types::SpawnIntent>,
         /// §13b: cells the controller saw NodeClaim Launched=False /
@@ -698,6 +708,17 @@ impl AdminQuery {
             // mid-Tick BY DESIGN (housekeeping yields to spawn-path
             // admin).
             Self::MintExecutorTokens { .. } => AdminLane::Fast,
+            // The controller's per-tick spawn-intent poll: under
+            // ADMIN_RPC_TIMEOUT (5s) and gates the
+            // `SchedulerUnreachable` condition + autoscaling. As Bulk
+            // it queued FIFO behind a MergeDag burst (251 deep
+            // observed → 70s blackout → controller flipped every pool
+            // unreachable → all builds cancelled). Handler cost is the
+            // SAME warm-memo `compute_spawn_intents` walk the mint arm
+            // above already prices acceptable mid-Tick — the
+            // "graph-bounded bulk read" rationale below was correct
+            // re: cost but wrong re: SLO.
+            Self::GetSpawnIntents { .. } => AdminLane::Fast,
             // Graph-independent estimator/ring reads (dashboard + CLI
             // surfaces): O(overrides) resolve, O(tiers) dry-run walk,
             // O(top_n) ring scan, O(classes) table read.
@@ -705,12 +726,10 @@ impl AdminQuery {
             | Self::SlaExplain { .. }
             | Self::SlaMispredictors { .. }
             | Self::SlaHwSampled { .. } => AdminLane::Fast,
-            // Graph-bounded bulk reads: full-population intent
-            // compute, O(dag) root scan (ALSO the harness barrier —
-            // must keep mailbox-FIFO semantics), per-build DAG dump.
-            Self::GetSpawnIntents { .. } | Self::GcRoots { .. } | Self::InspectBuildDag { .. } => {
-                AdminLane::Bulk
-            }
+            // Graph-bounded bulk reads: O(dag) root scan (ALSO the
+            // harness barrier — must keep mailbox-FIFO semantics),
+            // per-build DAG dump.
+            Self::GcRoots { .. } | Self::InspectBuildDag { .. } => AdminLane::Bulk,
             // Mutating or bulk-export admin ops: rare, operator-driven,
             // no latency SLO; mid-Tick mutation buys risk for nothing.
             Self::SlaEvict { .. } | Self::SlaImportCorpus { .. } | Self::SlaExportCorpus { .. } => {
@@ -1275,5 +1294,48 @@ impl GenerationReader {
         } else {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    /// Regression: the controller's per-tick spawn-intent poll MUST
+    /// ride the admin fast lane so its delivery is bounded by one
+    /// indivisible work slice, not the mailbox FIFO. As `Bulk` it
+    /// queued behind a 251-deep MergeDag burst, blew the controller's
+    /// 5s `ADMIN_RPC_TIMEOUT`, and flipped every pool
+    /// `SchedulerUnreachable`.
+    #[test]
+    fn controller_poll_queries_are_fast_lane() {
+        let (tx, _rx) = oneshot::channel();
+        assert_eq!(
+            AdminQuery::GetSpawnIntents {
+                req: SpawnIntentsRequest::default(),
+                reply: tx,
+            }
+            .lane(),
+            AdminLane::Fast,
+            "GetSpawnIntents gates SchedulerUnreachable under ADMIN_RPC_TIMEOUT=5s",
+        );
+        let (tx, _rx) = oneshot::channel();
+        assert_eq!(
+            AdminQuery::MintExecutorTokens {
+                intent_ids: vec![],
+                reply: tx,
+            }
+            .lane(),
+            AdminLane::Fast,
+            "MintExecutorTokens is the spawn-path mint under the same deadline",
+        );
+        // The harness barrier query MUST stay mailbox-FIFO — its
+        // round-trip is the test-harness flush contract.
+        let (tx, _rx) = oneshot::channel();
+        assert_eq!(
+            AdminQuery::GcRoots { reply: tx }.lane(),
+            AdminLane::Bulk,
+            "GcRoots is the barrier() flush — Fast would break FIFO semantics",
+        );
     }
 }
