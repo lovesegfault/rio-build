@@ -22,14 +22,16 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup-nix
       # Surfaces base-url metadata that deploy-pages reads. We don't
-      # consume base_path (docs use root-relative links), but the
-      # deploy step expects the artifact to have been produced under a
-      # configured run. (Does NOT enable Pages — no `enablement: true`
-      # and the build job has no `pages: write`.)
+      # consume base_path: the repo has a custom Pages domain
+      # (docs.rio-build.com — see siteUrl/CNAME in nix/docs.nix), so
+      # the site serves at root and the book's root-relative links
+      # resolve. The deploy step expects the artifact to have been
+      # produced under a configured run. (Does NOT enable Pages — no
+      # `enablement: true` and the build job has no `pages: write`.)
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-      # `result` is the .out output (post-processed HTML tree —
-      # symbol-dedup, dyn-render JS strip, 404.html). The .bin output
-      # (static-web-server wrapper) isn't built or needed here.
+      # `result` is the .out output (native typst bundle + WOFF2 fonts
+      # + pagefind index + CNAME). The .bin output (static-web-server
+      # wrapper) isn't built or needed here.
       - run: nix build .#docs --print-build-logs
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

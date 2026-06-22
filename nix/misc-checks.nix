@@ -2179,10 +2179,12 @@ in
     pkgs.runCommand "rio-docs-lint"
       {
         nativeBuildInputs = [ pkgs.jq ];
-        # docs/**/*.typ minus gitignored build artifacts (mirrors
-        # docsSrc — without the difference, .cache/typst-xdg vendored
-        # packages (~230 .typ files) are scanned and the lint becomes
-        # non-deterministic across dev environments).
+        # docs/**/*.typ. Under flake eval (git-tracked source) the
+        # `lib.fileset.difference docs/.cache + docs/dist` guard the
+        # prior pipeline carried is unnecessary — neither directory is
+        # tracked. Non-flake `nix-build` from a checkout with stale
+        # vendored .typ under docs/.cache would scan them, but the
+        # devshell wrapper that wrote there no longer exists.
         typSrc = pkgs.lib.fileset.toSource {
           root = ../docs;
           fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs;
