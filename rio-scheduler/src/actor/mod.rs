@@ -2122,7 +2122,20 @@ impl DagActor {
     /// `serve_fast_admin` after every fast-lane handler: any work that
     /// occupies the single-threaded actor inflates the drain time of
     /// everything queued behind it, whichever lane it arrived on.
+    ///
+    /// Sub-ms turns are NOT folded: the mailbox mix during a burst is
+    /// bimodal across 5 orders of magnitude (SubstituteProgress 4µs ×
+    /// 65k vs MergeDag 303ms × 256), and at α=0.05 the µs-class noise
+    /// decays a real 3.3s spike below the LOW bound within ~60 turns —
+    /// observed live as 11 activate/deactivate flaps in 5min, some
+    /// 112µs apart. The 1ms floor keeps the EWMA pricing the work that
+    /// actually competes for drain budget (MergeDag/Tick/ReportPull-
+    /// Outcome) while the µs-class commands contribute nothing to
+    /// projected drain anyway (65k × 4µs = 0.26s total).
     pub(crate) fn note_turn_cost(&mut self, elapsed: std::time::Duration) {
+        if elapsed < std::time::Duration::from_millis(1) {
+            return;
+        }
         let s = elapsed.as_secs_f64();
         self.turn_cost_ewma_secs = BACKPRESSURE_COST_EWMA_ALPHA * s
             + (1.0 - BACKPRESSURE_COST_EWMA_ALPHA) * self.turn_cost_ewma_secs;

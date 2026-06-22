@@ -931,9 +931,12 @@ async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> Tes
         actor.update_backpressure(114, 10_000);
         observe(&reader);
         // …then the biased-select fast lane drains up to QUOTA=16
-        // sub-µs handlers (each `note_turn_cost` at fast-lane rate)…
+        // handlers. note_turn_cost now floors at 1ms (sub-ms turns are
+        // noise that flapped the gate — see the fn doc), so model the
+        // inter-spike work as ReportPullOutcome-class (~5ms), the
+        // cheapest ≥1ms work that actually moves the EWMA.
         for _ in 0..crate::actor::ADMIN_FAST_LANE_DRAIN_QUOTA {
-            actor.note_turn_cost(std::time::Duration::from_micros(5));
+            actor.note_turn_cost(std::time::Duration::from_millis(5));
         }
         // …and the NEXT main-loop evaluation re-reads the now-decayed
         // EWMA.
@@ -977,19 +980,22 @@ async fn backpressure_cost_axis_survives_fast_lane_decay() -> TestResult {
         "one 140 s turn at q=100 must engage (drain = 100 × α × 140 s)"
     );
     for _ in 0..crate::actor::ADMIN_FAST_LANE_DRAIN_QUOTA {
+        // Sub-ms feeds are now no-ops at the note_turn_cost gate; this
+        // loop is kept to assert the gate itself: 16 µs-class feeds
+        // must NOT decay the 140s evidence at all.
         actor.note_turn_cost(std::time::Duration::from_micros(5));
     }
     actor.update_backpressure(100, 10_000);
     assert!(
         reader.is_active(),
-        "after QUOTA=16 fast-lane decays the live_053 evidence must \
-         survive (at α=0.05: drain ≈ 308 s; at α=0.3: drain ≈ 14 s — \
-         both > LOW=10, both arms hold here)"
+        "after QUOTA=16 sub-ms fast-lane feeds the live_053 evidence \
+         must survive (1ms floor: ewma unchanged at 7.0, drain = 700 s)"
     );
-    // The discriminating step: ONE more cheap MAIN turn. At α=0.3
-    // ewma=0.097 → drain=9.7 ≤ 10 → releases. At α=0.05 ewma=2.93 →
-    // drain=293 → stays.
-    actor.note_turn_cost(std::time::Duration::from_micros(5));
+    // The discriminating step: ONE more cheap MAIN turn at the 1ms
+    // floor. At α=0.05 ewma = 0.05×0.001 + 0.95×7.0 = 6.65 → drain =
+    // 665 s — stays. (Pre-floor at α=0.3 with µs feeds: drain ≈ 9.7 s
+    // ≤ LOW — released; the floor + α=0.05 each independently fix it.)
+    actor.note_turn_cost(std::time::Duration::from_millis(1));
     actor.update_backpressure(100, 10_000);
     assert!(
         reader.is_active(),
@@ -998,6 +1004,59 @@ async fn backpressure_cost_axis_survives_fast_lane_decay() -> TestResult {
          feed-vs-evaluate-rate asymmetry sh-024 §S2 names) / right: at \
          α=0.05 the 0.95^QUOTA ≈ 0.44 inter-evaluation decay keeps a \
          genuine pathological turn engaged across fast-lane drains"
+    );
+    Ok(())
+}
+
+// r[verify sched.admission.work-per-turn]
+/// **Bimodal-mix flap regression.** The mailbox during a nix-fast-build
+/// burst is bimodal across 5 OOM: SubstituteProgress 4µs × 65k vs
+/// MergeDag 303ms × 256. Pre-1ms-floor, one slow Tick (3.3s) lifted
+/// ewma to 0.166 → drain = 247s @ q=1484 → ACTIVATE; ~60 × 4µs feeds
+/// decayed it to 0.007 → drain = 9.8s → DEACTIVATE 112µs later — 11
+/// flaps in 5min. With the floor, the µs-class feeds are no-ops and
+/// the gate engages once on the spike and holds until ≥1ms work
+/// (ReportPullOutcome/MergeDag) genuinely brings projected drain
+/// under LOW.
+#[tokio::test]
+async fn backpressure_cost_axis_bimodal_mix_does_not_flap() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let reader = actor.backpressure_flag();
+
+    // Warm the EWMA with the MergeDag baseline (303ms × a few).
+    for _ in 0..8 {
+        actor.note_turn_cost(std::time::Duration::from_millis(303));
+    }
+    let mut rising_edges = 0u32;
+    let mut was_active = false;
+    let mut observe = |r: &crate::actor::command::BackpressureReader| {
+        let now = r.is_active();
+        if now && !was_active {
+            rising_edges += 1;
+        }
+        was_active = now;
+    };
+    // The diagnosed trace, 5 cycles: one 3.3s Tick spike @ q≈1484,
+    // then ~60 SubstituteProgress 4µs feeds, evaluating after each.
+    for _ in 0..5 {
+        actor.note_turn_cost(std::time::Duration::from_millis(3300));
+        actor.update_backpressure(1484, 10_000);
+        observe(&reader);
+        for _ in 0..60 {
+            actor.note_turn_cost(std::time::Duration::from_micros(4));
+            actor.update_backpressure(1422, 10_000);
+            observe(&reader);
+        }
+    }
+    assert!(
+        rising_edges <= 1,
+        "bimodal mix flapped {rising_edges}× (pre-1ms-floor: every 3.3s \
+         spike activated and 60×4µs feeds at α=0.05 decayed it below \
+         LOW within the same evaluation window — the live 11-flaps-in-\
+         5min trace). With the floor the µs feeds are no-ops; the gate \
+         engages once and holds."
     );
     Ok(())
 }
