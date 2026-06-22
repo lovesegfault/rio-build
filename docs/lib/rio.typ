@@ -134,12 +134,15 @@
 // Flatten typst content to a plain string (best-effort; drops styling
 // and any leaf without `.text`/`.body`/`.child`/`.children`). Used for
 // slug derivation only — the rendered heading keeps the original
-// `it.body` content.
+// `it.body` content. Footnotes are dropped entirely so a heading like
+// `= Title#footnote[…]` doesn't leak footnote text into the slug/TOC.
+// `array.join` on an empty array returns `none` in typst, so the
+// children branch sums explicitly to keep the contract "always str".
 #let _to-string(c) = {
   if type(c) == str { c } else if type(c) != content { "" } else if (
-    c.has("text")
-  ) { c.text } else if c.has("children") {
-    c.children.map(_to-string).join("")
+    c.func() == footnote
+  ) { "" } else if c.has("text") { c.text } else if c.has("children") {
+    c.children.map(_to-string).sum(default: "")
   } else if c.has("body") { _to-string(c.body) } else if c.has("child") {
     _to-string(c.child)
   } else if c == [ ] { " " } else { "" }
