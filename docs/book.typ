@@ -22,10 +22,17 @@
     title: c.title,
     {
       // Bundle mode shares one counter space across `document()` calls;
-      // reset so each page's first heading is §1, not §N (QA H2).
-      // Heading-slug ids are text-derived (lib/rio.typ _slug), so this
-      // doesn't change anchor hrefs.
+      // reset so each page's first heading is §1, not §N (QA H2), and
+      // each page's first Figure/Table/Algorithm/Listing is N=1 — not
+      // a running total across the whole book (architecture.typ's 5
+      // captioned figures otherwise leave the next chapter at "Figure
+      // 6"). Heading-slug ids are text-derived (lib/rio.typ _slug), so
+      // this doesn't change anchor hrefs.
       counter(heading).update(0)
+      counter(figure.where(kind: image)).update(0)
+      counter(figure.where(kind: table)).update(0)
+      counter(figure.where(kind: "algorithm")).update(0)
+      counter(figure.where(kind: "listing")).update(0)
       page-shell(route, c.title, c.path)[#include "/" + c.path]
     },
   )
