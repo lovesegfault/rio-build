@@ -2025,15 +2025,24 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     // refused/fenced merge rolls back — re-submitting is idempotent.
     // Any other code, a timeout (DEADLINE_EXCEEDED — not provably
     // pre-merge), or a retryable code that somehow carries the
-    // build-id header propagates unchanged. Budget mirrors the
-    // deposed-believer window: 4 retries at 0.5/1/2/4s under the
-    // per-attempt timeout.
-    const SUBMIT_RETRIES: u32 = 4;
+    // build-id header propagates unchanged.
+    //
+    // Budget covers BOTH refusal classes: the deposed-believer fence
+    // window (≤ ~5s, the original 4×0.5/1/2/4 = 7.5s sizing) AND a
+    // sustained cost-axis backpressure hold — post-P0/P1 re-diagnosis
+    // observed the gate held for 89s before the prices_into_drain fix
+    // landed; the 4-retry/7.5s budget exhausted in 3 of those windows.
+    // 8 retries at 0.5/1/2/4/8/16/16/16/16s ≈ 79.5s sleep + 9 attempts
+    // under the per-attempt timeout covers a ~90s hold without making
+    // a genuine outage hang the client. Proportional jitter so a
+    // nix-fast-build burst's N parallel submits don't herd into the
+    // same backpressure-release instant.
+    const SUBMIT_RETRIES: u32 = 8;
     const SUBMIT_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
         base: std::time::Duration::from_millis(500),
         mult: 2.0,
-        cap: std::time::Duration::from_secs(4),
-        jitter: rio_common::backoff::Jitter::None,
+        cap: std::time::Duration::from_secs(16),
+        jitter: rio_common::backoff::Jitter::Proportional(0.25),
     };
     let (meta, _ext, msg) = request.into_parts();
     let mut attempt: u32 = 0;
