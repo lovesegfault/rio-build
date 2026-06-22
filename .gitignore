@@ -40,6 +40,12 @@ __pycache__/
 
 # typst output
 docs/**/*.pdf
+# Retired-pipeline artifacts: the wrapper that wrote here is gone, but
+# existing checkouts that ever ran it still carry ~230 vendored .typ
+# under docs/.cache/typst-xdg/. Keep ignored so a routine `git add docs/`
+# doesn't pull them into docsSrc/typSrc filesets.
+docs/.cache/
+docs/dist/
 
 # Sprint-local implementation plans (artifact, not source)
 docs/plans/

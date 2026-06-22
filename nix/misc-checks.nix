@@ -2179,15 +2179,21 @@ in
     pkgs.runCommand "rio-docs-lint"
       {
         nativeBuildInputs = [ pkgs.jq ];
-        # docs/**/*.typ. Under flake eval (git-tracked source) the
-        # `lib.fileset.difference docs/.cache + docs/dist` guard the
-        # prior pipeline carried is unnecessary — neither directory is
-        # tracked. Non-flake `nix-build` from a checkout with stale
-        # vendored .typ under docs/.cache would scan them, but the
-        # devshell wrapper that wrote there no longer exists.
+        # docs/**/*.typ. The `difference docs/.cache + docs/dist` guard
+        # is forward-dead (the wrapper that wrote there is deleted) but
+        # NOT backward-dead: existing checkouts that ever ran the old
+        # wrapper still carry ~230 vendored .typ under
+        # docs/.cache/typst-xdg/, and non-flake `nix-build` from such a
+        # tree would lint them against deny_shared. .gitignore covers
+        # `git add`; this covers the dirty-tree path.
         typSrc = pkgs.lib.fileset.toSource {
           root = ../docs;
-          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs;
+          fileset = pkgs.lib.fileset.difference (pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs) (
+            pkgs.lib.fileset.unions [
+              (pkgs.lib.fileset.maybeMissing ../docs/.cache)
+              (pkgs.lib.fileset.maybeMissing ../docs/dist)
+            ]
+          );
         };
         # Non-.typ files that reference docs by path — rust comments +
         # warn! bodies, nix comments, github workflows, shell scripts,

@@ -98,6 +98,12 @@ let
         # literal path; not book content. Excluded so editing it doesn't
         # rebuild docs-pdf/docs-html.
         (lib.fileset.maybeMissing ../docs/REVIEW.md)
+        # Retired-pipeline artifacts: existing checkouts may still carry
+        # vendored .typ under docs/.cache/typst-xdg/ from the deleted
+        # wrapper. .gitignore covers `git add`; this covers non-flake
+        # `nix-build` from a dirty tree.
+        (lib.fileset.maybeMissing ../docs/.cache)
+        (lib.fileset.maybeMissing ../docs/dist)
       ]
     );
   };
