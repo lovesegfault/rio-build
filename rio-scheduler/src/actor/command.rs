@@ -714,7 +714,7 @@ impl AdminQuery {
             // it queued FIFO behind a MergeDag burst (251 deep
             // observed → 70s blackout → controller flipped every pool
             // unreachable → all builds cancelled). Handler cost is the
-            // SAME warm-memo `compute_spawn_intents` walk the mint arm
+            // same warm-memo `compute_spawn_intents` walk the mint arm
             // above already prices acceptable mid-Tick — the
             // "graph-bounded bulk read" rationale below was correct
             // re: cost but wrong re: SLO.
