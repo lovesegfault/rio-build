@@ -14,28 +14,16 @@ pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 use crate::reconcilers::pool::pod::UpstreamAddrs;
 use rio_crds::pool::{ExecutorKind, Pool, PoolSpec};
 
-/// Minimal `PoolSpec` with all CEL-required fields explicit and
-/// optional fields `None`.
-///
-/// NEXT FIELD ADD: touch THIS fn — 1 site (down from the previous
-/// 4-5 test literals each hitting E0063 on every field add).
-/// CEL-exhaustiveness is the point; don't `#[derive(Default)]` on
-/// `PoolSpec`.
+/// Minimal `PoolSpec` for reconciler tests. Delegates to
+/// [`PoolSpec::test_fixture`] in rio-crds — the single E0063
+/// touch-point — and overrides only the fields the reconciler tests
+/// inspect (`max_concurrent` for cap logic, `features` for the kvm
+/// resource-request branch).
 pub fn test_pool_spec(kind: ExecutorKind) -> PoolSpec {
     PoolSpec {
-        kind,
-        image: "rio-builder:test".into(),
-        systems: vec!["x86_64-linux".into()],
         max_concurrent: Some(10),
-        node_selector: None,
-        tolerations: None,
-        host_users: None,
-        fuse_threads: None,
         features: vec!["kvm".into()],
-        image_pull_policy: None,
-        privileged: None,
-        seccomp_profile: None,
-        host_network: None,
+        ..PoolSpec::test_fixture(kind)
     }
 }
 

@@ -295,6 +295,36 @@ pub struct PoolSpec {
     // field — deployments are fresh-only, so removal is clean.
 }
 
+impl PoolSpec {
+    /// Minimal `PoolSpec` for `kind` with all CEL-required fields
+    /// set and every optional field `None`.
+    ///
+    /// **NEXT FIELD ADD: touch THIS fn — 1 site.** This is the
+    /// single E0063 touch-point shared by `rio-crds`'s CEL tests
+    /// and `rio-controller`'s reconciler tests; both delegate here
+    /// so adding a `PoolSpec` field hits exactly one struct
+    /// literal. CEL-exhaustiveness is the point — don't
+    /// `#[derive(Default)]` on `PoolSpec`.
+    #[doc(hidden)]
+    pub fn test_fixture(kind: ExecutorKind) -> Self {
+        Self {
+            kind,
+            image: "rio-builder:test".into(),
+            systems: vec!["x86_64-linux".into()],
+            max_concurrent: None,
+            node_selector: None,
+            tolerations: None,
+            host_users: None,
+            fuse_threads: None,
+            features: vec![],
+            image_pull_policy: None,
+            privileged: None,
+            seccomp_profile: None,
+            host_network: None,
+        }
+    }
+}
+
 /// Seccomp profile selector — mirrors K8s `SeccompProfile` shape.
 ///
 /// Struct not enum: kube-core's structural schema rewriter REJECTS

@@ -28,22 +28,10 @@ use rio_crds::pool::{ExecutorKind, Pool, PoolSpec, SeccompProfileKind};
 /// Minimal valid `PoolSpec` for `kind` — every CEL rule on
 /// `PoolSpec` passes. Each negative case mutates exactly one field
 /// from this baseline so the asserted error is the ONLY violation.
+/// Delegates to [`PoolSpec::test_fixture`] (the single E0063
+/// touch-point shared with rio-controller's fixtures).
 fn pool_spec(kind: ExecutorKind) -> PoolSpec {
-    PoolSpec {
-        kind,
-        image: "ghcr.io/rio-build/builder:latest".into(),
-        systems: vec!["x86_64-linux".into()],
-        max_concurrent: None,
-        node_selector: None,
-        tolerations: None,
-        host_users: None,
-        fuse_threads: None,
-        features: vec![],
-        image_pull_policy: None,
-        privileged: None,
-        seccomp_profile: None,
-        host_network: None,
-    }
+    PoolSpec::test_fixture(kind)
 }
 
 /// Minimal valid `ComponentScalerSpec` — every nested CEL rule
