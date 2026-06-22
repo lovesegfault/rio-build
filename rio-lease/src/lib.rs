@@ -1238,15 +1238,21 @@ pub async fn run_lease_loop<H: LeaseHooks>(
     // `error: None`, hiding "apiserver said 503" behind "apiserver
     // hung?" in the lease ledger logs. Disable it so the status code
     // surfaces.
-    let client = match async {
-        let mut config = kube::Config::infer()
-            .await
-            .map_err(kube::Error::InferConfig)?;
-        config.default_retry = false;
-        kube::Client::try_from(config)
-    }
-    .await
-    {
+    //
+    // No shared `kube_client_no_retry()` helper: rio-common is
+    // intentionally kube-free (rio-crds Cargo.toml records it) and
+    // rio-crds is `derive`-only / no-Client / no-tokio by design.
+    // Each kube::Client init site documents its own retry choice —
+    // the lease loop and the controller reconciler want it OFF (own
+    // backoff layered on top); rio-cli/xtask one-shot commands are
+    // fine with kube's default 15× retry.
+    let client = match kube::Config::infer()
+        .await
+        .map_err(kube::Error::InferConfig)
+        .and_then(|mut c| {
+            c.default_retry = false;
+            kube::Client::try_from(c)
+        }) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "kube client init failed; lease loop exiting (this replica will never lead)");

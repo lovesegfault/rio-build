@@ -57,11 +57,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- K8s client ----
-    // try_default reads in-cluster config (service account token
-    // at /var/run/secrets/kubernetes.io/serviceaccount/) or
-    // KUBECONFIG for local dev. `?` — no kube client = useless
-    // controller, fail loud.
-    let client = Client::try_default().await?;
+    // In-cluster config (service account token at /var/run/secrets/
+    // kubernetes.io/serviceaccount/) or KUBECONFIG for local dev.
+    // `?` — no kube client = useless controller, fail loud.
+    //
+    // `default_retry = false`: kube 4.0's `try_default()` layers a
+    // 15× exponential 429/503/504 retry inside every API call. The
+    // reconciler's `standard_error_policy` (5s→300s) backs off on
+    // top of it; with kube's internal retry on, a sustained 503
+    // surfaces as ONE `reconcile_errors_total{error_kind="kube"}`
+    // increment per 15-retry burst and saturates the
+    // `reconcile_duration_seconds` 10s top bucket. Same opt-out as
+    // rio-lease's `run_lease_loop` (which records why no shared
+    // helper exists).
+    let client = {
+        let mut c = kube::Config::infer().await?;
+        c.default_retry = false;
+        Client::try_from(c)?
+    };
     info!("kubernetes client connected");
 
     // ---- Guard domain (health + skew sentinel; lease joins below) ----
