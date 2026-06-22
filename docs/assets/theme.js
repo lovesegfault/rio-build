@@ -7,7 +7,16 @@
   // supplies the dark vars). Stored value present → explicit; absent →
   // auto.
   const ICONS = { light: "○", dark: "●", auto: "◐" };
-  const stored = localStorage.getItem(KEY);
+  // localStorage throws (SecurityError) in sandboxed iframes / storage-
+  // disabled browsers, and setItem throws (QuotaExceededError) in Safari
+  // private mode. Guard so the rest of the IIFE (search/copy/kbd-nav)
+  // still initialises; theme just degrades to per-load auto.
+  const store = {
+    get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+    set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+    rm: (k) => { try { localStorage.removeItem(k); } catch {} },
+  };
+  const stored = store.get(KEY);
   if (stored === "light" || stored === "dark") root.dataset.theme = stored;
 
   const isEditable = (el) =>
@@ -43,10 +52,10 @@
       const apply = (t) => {
         if (t === "auto") {
           delete root.dataset.theme;
-          localStorage.removeItem(KEY);
+          store.rm(KEY);
         } else {
           root.dataset.theme = t;
-          localStorage.setItem(KEY, t);
+          store.set(KEY, t);
         }
         btn.textContent = ICONS[t];
         btn.title = "Theme: " + t;
