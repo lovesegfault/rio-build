@@ -39,7 +39,10 @@
   // Directory form for the root: search engines and OG scrapers treat
   // `/` and `/index.html` as distinct URLs, so canonical/og:url for the
   // home page must be `<site>/`, not `<site>/index.html`.
-  let page-url = if site-url != "" {
+  // src-path == none (the 404 shell) → no canonical/OG: a not-found
+  // page has no canonical URL and isn't an `og:type=article`. Mirrors
+  // the data-pagefind-body gate further down.
+  let page-url = if site-url != "" and src-path != none {
     if route == "index" { site-url + "/" } else {
       site-url + "/" + route + ".html"
     }
@@ -55,6 +58,12 @@
         ),
       )
       #html.elem("meta", attrs: (name: "description", content: meta-desc))
+      #if src-path == none {
+        // 404: tell crawlers not to index. GH Pages serves 404.html
+        // with status 200 for soft-404 detection, so the meta tag is
+        // the only signal.
+        html.elem("meta", attrs: (name: "robots", content: "noindex"))
+      }
       #if page-url != none {
         html.elem("link", attrs: (rel: "canonical", href: page-url))
         html.elem("meta", attrs: (property: "og:title", content: title))
