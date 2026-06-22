@@ -1202,7 +1202,8 @@ Nix sandbox (user/mount/PID/network namespaces).
 
 *Seccomp profile:* Builder pods set `seccompProfile: Localhost` pointing at
 `seccomp-rio-builder.json` when `privileged != true`. The profile is a
-default-deny allowlist derived from moby `default.json` v27.5.1 (see
+default-deny allowlist derived from moby `default.json` at the tag
+`cargo xtask regen seccomp` defaults to (see
 #rref("builder.seccomp.localhost-profile")), permitting the namespace/mount
 syscalls the FUSE mount + overlayfs + nix-daemon sandbox need --- plus the
 read-side trace syscalls (`ptrace`, `process_vm_readv`) that
