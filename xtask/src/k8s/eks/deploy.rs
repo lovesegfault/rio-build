@@ -1284,7 +1284,9 @@ mod pg_gate_tests {
     use super::*;
     use ::kube::core::Status;
 
-    /// kube 3.x apiserver error shape: `Error::Api(Box<Status>)`.
+    /// kube apiserver error shape since 3.x: `Error::Api(Box<Status>)`
+    /// (the `Box` was added when `Error` shrank for the 3.0 enum-size
+    /// pass; still the shape at 4.x).
     fn api_err(message: &str, reason: &str, code: u16) -> ::kube::Error {
         ::kube::Error::Api(Status::failure(message, reason).with_code(code).boxed())
     }
