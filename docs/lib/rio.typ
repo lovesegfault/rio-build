@@ -282,7 +282,7 @@
   // Page backrefs are meaningless in HTML (every chapter is "page 1").
   // QA2-D.
   if not is-html() {
-    let refs = get-entry-back-references(entry, deduplicate: true)
+    let refs = get-entry-back-references(entry, deduplicate: deduplicate)
     if refs.len() > 0 {
       let lbl = if refs.len() == 1 { "p." } else { "pp." }
       text(fill: muted, size: 0.85em)[~—~#lbl~#refs.join(", ")]
