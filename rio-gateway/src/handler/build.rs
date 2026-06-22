@@ -2054,6 +2054,10 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
             // gate (scheduler_service.rs) — same idempotency proof as
             // UNAVAILABLE applies (no build_id ⇒ MergeDag rolled back).
             // The 0.5/1/2/4s backoff covers the observed flap window.
+            // refusal-census: allow(judge_refusal Undecided is too broad
+            //   — DEADLINE_EXCEEDED is Undecided but NOT provably
+            //   pre-merge here; the build_id-header gate is the law,
+            //   the code pair is its narrow trigger set)
             Err(st)
                 if matches!(
                     st.code(),
