@@ -84,18 +84,29 @@ let
   };
 
   # Typst sources only. docs/gen/ is excluded — compileRoot overlays
-  # the hermetic docsData there.
+  # the hermetic docsData there. docs/assets/ is excluded from the
+  # shared compile root and overlaid only in mkDocs (the HTML build)
+  # so editing style.css/theme.js doesn't invalidate compileRoot →
+  # mkDocsPdf, whose output is byte-identical regardless.
   docsSrc = lib.fileset.toSource {
     root = ../docs;
     fileset = lib.fileset.difference ../docs (
       lib.fileset.unions [
         ../docs/gen
+        ../docs/assets
         # Contributor bug-pattern catalog cited from rust comments by
         # literal path; not book content. Excluded so editing it doesn't
         # rebuild docs-pdf/docs-html.
         (lib.fileset.maybeMissing ../docs/REVIEW.md)
       ]
     );
+  };
+
+  # HTML-only assets (style.css, theme.js). book.typ `read()`s these at
+  # compile time, book-pdf.typ does not.
+  docsAssets = lib.fileset.toSource {
+    root = ../docs/assets;
+    fileset = ../docs/assets;
   };
 
   # Generated reference data (metric/alert/error/config tables, plus
@@ -294,6 +305,7 @@ let
         # wrapped binary so TYPST_PACKAGE_CACHE_PATH/TYPST_FONT_PATHS
         # are baked in; --font-path is belt-and-suspenders.
         cp -r ${compileRoot} ./root && chmod -R +w ./root
+        cp -r ${docsAssets} ./root/assets
         cd ./root
         mkdir -p $out
         typst compile --features bundle,html --format bundle \
