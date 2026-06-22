@@ -45,9 +45,13 @@ variable "addons" {
     # Gateway API CRD release tag; crds_hash is the fetchurl hash for the
     # standard-install.yaml bundle (consumed by nix/cilium-render.nix, not
     # terraform — it rides along because the whole pins tree lands here).
+    # excluded_crds: CRD .metadata.name values dropped from the standard
+    # bundle before apply — single-sourced from nix/pins.toml so the tf
+    # filter and nix/cilium-render.nix's yq filter cannot drift.
     gateway_api = object({
-      version   = string
-      crds_hash = string
+      version       = string
+      crds_hash     = string
+      excluded_crds = list(string)
     })
     # aws-load-balancer-controller chart version (eks-charts repo).
     aws_load_balancer_controller = object({ version = string })

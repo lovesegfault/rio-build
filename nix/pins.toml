@@ -54,6 +54,19 @@ identity_label_filter = "k8s:!job-name k8s:!batch.kubernetes.io/job-name k8s:!co
 # not terraform).
 version = "v1.5.1"
 crds_hash = "sha256:1f7rhk99gggr3j580099f3b7x3bsliwpqlfj7fpgg1qsp6rh443m"
+# CRDs from the standard-install bundle to DROP before applying — THE
+# single source. Consumed by:
+#   - nix/cilium-render.nix (yq filter for the k3s/VM render),
+#   - infra/eks/addons.tf via var.addons.gateway_api.excluded_crds
+#     (this file → `cargo xtask regen tfvars` → generated.auto.tfvars.json),
+#   - the gateway-api-excluded-crds symmetry check (nix/misc-checks.nix).
+# tlsroutes: gateway-api v1.5.1 standard-install ships TLSRoute at v1
+# (served:true) / v1alpha2 (served:false); cilium-operator 1.19.x
+# hard-codes a v1alpha2 field indexer when ANY tlsroutes CRD is present
+# → fatal "no matches for kind TLSRoute in version v1alpha2" → operator
+# CrashLoopBackOff (cilium/cilium#45139, fixed in 1.20 via #45251). We
+# don't use TLSRoute. Empty this list once addons.cilium.version >= 1.20.
+excluded_crds = ["tlsroutes.gateway.networking.k8s.io"]
 
 [addons.aws_load_balancer_controller]
 # v3.0+ aligns chart with app version.

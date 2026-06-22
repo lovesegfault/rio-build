@@ -32,20 +32,17 @@ data "kubectl_file_documents" "gateway_api_crds" {
 }
 
 resource "kubectl_manifest" "gateway_api_crds" {
-  # Drop TLSRoute: gateway-api v1.5.1 standard-install.yaml ships
-  # tlsroutes.gateway.networking.k8s.io at v1 (served:true) / v1alpha2
-  # (served:false) — verified `grep '^  name:' standard-install.yaml`
-  # against pins.addons.gateway_api.crds_hash. cilium-operator 1.19.x
-  # registers a hard-coded v1alpha2 field indexer when ANY tlsroutes
-  # CRD is present → fatal "no matches for kind TLSRoute in version
-  # v1alpha2" → operator CrashLoopBackOff (cilium/cilium#45139, fixed
-  # in 1.20 via #45251). We don't use TLSRoute. Remove this filter
-  # once addons.cilium.version >= 1.20. MIRRORS the yq filter in
-  # nix/cilium-render.nix — same crds_hash, same premise; the VM gate
-  # stays green only if both filter, so keep them symmetric.
+  # Drop CRDs listed in pins.addons.gateway_api.excluded_crds (the
+  # single source — see nix/pins.toml for the why-tlsroutes rationale).
+  # nix/cilium-render.nix's yq filter reads the SAME pin, and the
+  # gateway-api-excluded-crds check in nix/misc-checks.nix asserts both
+  # lanes still consume it — so when the cilium 1.20 bump empties the
+  # list, prod and the VM gate move together.
   for_each = {
     for k, v in data.kubectl_file_documents.gateway_api_crds.manifests :
-    k => v if !strcontains(k, "tlsroutes.gateway.networking.k8s.io")
+    k => v if !anytrue([
+      for crd in var.addons.gateway_api.excluded_crds : strcontains(k, crd)
+    ])
   }
   yaml_body = each.value
 

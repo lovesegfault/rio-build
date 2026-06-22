@@ -3186,6 +3186,76 @@ in
         touch $out
       '';
 
+  # ONE list, TWO consumers — `pins.addons.gateway_api.excluded_crds`.
+  # Same shape as cilium-labels-filter: asserts every consumer renders
+  # the one pin and carries no open-coded copy. Consumers:
+  #   (a) the k3s/VM render (cilium-render.nix builds the yq filter
+  #       FROM the pin) — asserted by grepping the rendered CRD bundle;
+  #   (b) infra/eks/addons.tf, which consumes
+  #       var.addons.gateway_api.excluded_crds — the value flows
+  #       pins.toml → `cargo xtask regen tfvars` →
+  #       generated.auto.tfvars.json (tfvars-fresh pins THAT edge);
+  #       this check stages addons.tf and the generated tfvars so an
+  #       open-coded `tlsroutes` literal in either is unshippable.
+  # When the cilium 1.20 bump empties the pin, both lanes go together
+  # and this check holds the empty-list case (the for_each filter
+  # becomes a no-op, the yq predicate becomes `select(true)`).
+  gateway-api-excluded-crds =
+    let
+      rendered = import ./cilium-render.nix {
+        inherit pkgs;
+        inherit (inputs) nixhelm;
+        system = pkgs.stdenv.hostPlatform.system;
+        gatewayEnabled = true;
+      };
+      pins = import ./pins.nix;
+      excluded = pins.addons.gateway_api.excluded_crds;
+      wantJson = builtins.toJSON excluded;
+    in
+    pkgs.runCommand "rio-gateway-api-excluded-crds"
+      {
+        addonsTf = ../infra/eks/addons.tf;
+        generatedTfvars = ../infra/eks/generated.auto.tfvars.json;
+        nativeBuildInputs = [ pkgs.jq ];
+      }
+      ''
+        crds=${rendered}/00-gateway-api-crds.yaml
+        # (a) every excluded CRD is absent from the VM render.
+        ${pkgs.lib.concatMapStringsSep "\n" (crd: ''
+          if grep -qF '${crd}' "$crds"; then
+            echo "FAIL: ${crd} present in cilium-render output —" >&2
+            echo "the yq filter detached from pins.addons.gateway_api.excluded_crds." >&2
+            exit 1
+          fi
+        '') excluded}
+        # (b) addons.tf consumes the variable, with no open-coded CRD
+        # name (an open-coded literal is the drift this pin exists to
+        # prevent — the pre-pin shape was `strcontains(k, "tlsroutes…")`).
+        grep -q 'var.addons.gateway_api.excluded_crds' "$addonsTf" || {
+          echo "FAIL: infra/eks/addons.tf no longer consumes" >&2
+          echo "var.addons.gateway_api.excluded_crds — the production filter" >&2
+          echo "lane detached from the pins.toml single source." >&2
+          exit 1
+        }
+        if grep -nE 'strcontains\([^)]*"[a-z]+\.gateway\.networking\.k8s\.io"' "$addonsTf"; then
+          echo "FAIL: infra/eks/addons.tf carries an open-coded Gateway API CRD name —" >&2
+          echo "the single source is nix/pins.toml addons.gateway_api.excluded_crds." >&2
+          exit 1
+        fi
+        # The tfvars emission carries the pin verbatim (the value
+        # addons.tf actually reads at plan time).
+        got=$(jq -cS '.addons.gateway_api.excluded_crds // empty' "$generatedTfvars")
+        if [ "$got" != ${pkgs.lib.escapeShellArg wantJson} ]; then
+          echo "FAIL: infra/eks/generated.auto.tfvars.json excluded_crds" >&2
+          echo "does not match nix/pins.toml:" >&2
+          echo "  got:  $got" >&2
+          echo "  want: ${wantJson}" >&2
+          echo "run: cargo xtask regen tfvars" >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
   # merged_bug_024: the quota-volume selection's unit tier. Runs the
   # REAL nix/nixos-node/quota-volume-select.sh (staged — (vvvvv)/(wwwww):
   # the script file is the check input AND the check asserts
