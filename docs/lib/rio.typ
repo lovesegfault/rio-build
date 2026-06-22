@@ -427,12 +427,6 @@
 
 // ─── the template ───────────────────────────────────────────────────
 #let rio(domains: none, paper: none, body) = {
-  // `x-target` (NOT `target` — that would shadow typst's builtin
-  // `target()` which the show-rules below need to detect
-  // `html.frame()`'s paged sub-context). Single-sourced from the
-  // module-level `_x-target` / `_is-pdf-target` so `is-html-target()`
-  // and `is-pdf` can never disagree on the x-target value set.
-  let x-target = _x-target
   // is-pdf — direct `typst compile` (pdf / book-pdf). The html/paged
   // split is handled per-site via the contextual `is-html()`/
   // `is-paged()` predicates above; gate html.elem/html.frame on
@@ -811,7 +805,7 @@
   // not when stitched into book-pdf or rendered to html.
   // `context` so `_book-mode.get()` resolves; the CLI `--input x-target`
   // and the in-doc `#book-pdf-mode()` are equivalent gates.
-  let in-book = x-target == "book-pdf"
+  let in-book = _x-target == "book-pdf"
   let front = context if (
     paper != none and is-pdf and not in-book and not _book-mode.get()
   ) [
