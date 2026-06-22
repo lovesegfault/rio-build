@@ -157,18 +157,17 @@
 }
 
 // Locate the current route in the flattened chapter manifest. Returns
-// (title: str, prev: (title,path,depth)|none, next: …|none). QA #6 +
-// #9 share this — title for <title>/<h1>, prev/next for the nav
-// wrapper. The chapter title in lib/html/meta.typ is the single source
-// of truth. Must be called from `context`.
+// (prev: (title,path,depth)|none, next: …|none) for the prev/next nav
+// wrapper (QA #9). page-shell receives the chapter title directly as
+// an argument, so it is NOT threaded through here. Must be called from
+// `context`.
 #let _chapter-nav() = {
   let flat = flatten-chapters(chapters).filter(c => c.path != none)
   let cur = _current-route.get()
-  if cur == none { return (title: "", prev: none, next: none) }
+  if cur == none { return (prev: none, next: none) }
   let idx = flat.position(c => route-for(c.path) == cur)
-  if idx == none { return (title: "", prev: none, next: none) }
+  if idx == none { return (prev: none, next: none) }
   (
-    title: flat.at(idx).title,
     prev: if idx > 0 { flat.at(idx - 1) } else { none },
     next: if idx + 1 < flat.len() { flat.at(idx + 1) } else { none },
   )
