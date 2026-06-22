@@ -368,8 +368,11 @@ rec {
           ${html}/architecture.html
         # (d) fletcher diagram survived html-target as inline SVG
         grep -q '<svg' ${html}/architecture.html
-        # (e) pagefind index emitted
+        # (e) pagefind indexed ≥30 docs (one fragment per indexed page;
+        # a misconfigured --site root or missing data-pagefind-body
+        # would still ship a non-empty pagefind.js).
         test -s ${html}/pagefind/pagefind.js
+        test "$(ls ${html}/pagefind/fragment/ | wc -l)" -ge 30
         # (f) bug_003: refs.gh() permalinks pin a commit, not /blob/main/
         ! grep -rq 'lovesegfault/rio-build/blob/main/' ${html}
         # (g) bug_033/025: #r() emits an `id="r-…"` anchor per marker so
@@ -383,6 +386,19 @@ rec {
         # (j) design assertion: nothing from the retired pipeline leaked
         # (charclass dodges the deny_shared identifier lint on this file)
         ! grep -rqiE 'shi[r]oa' ${html}
+        # (k) QA #5: rio-table wrapper survived (the lib/rio.typ show-
+        # rule wraps every table in a div for horizontal-scroll). ≥30.
+        test "$(grep -roh 'class="rio-table"' ${html} | wc -l)" -ge 30
+        # (l) QA #6: distinct <title> per page (page-shell title plumb).
+        test "$(grep -rhoP '<title>[^<]+' ${html} | sort -u | wc -l)" -ge 25
+        # (m) page-size tripwire: equation-heavy chapter must stay under
+        # 7 MiB (the original svg-dedup regression was 25M→4.4M; native
+        # html.frame() emits inline SVG too).
+        sz=$(stat -c%s ${html}/spec/components/sla-sizing.html)
+        if [ "$sz" -gt 7340032 ]; then
+          echo "FAIL: sla-sizing.html is ''${sz}B (>7MiB) — equation/SVG bloat regression"
+          exit 1
+        fi
         touch $out
       '';
   };
