@@ -34,20 +34,31 @@ let
     arch = "amd64";
   };
 
-  # Upstream kube-scheduler matching `pins.cluster.kubernetes_version`. The
-  # kube-build-scheduler Deployment (templates/kube-build-scheduler.yaml)
-  # `image:` is set via `buildScheduler.image` in extraValues by the
-  # consumer. v1.36.x latest patch — k3s-full pins the SAME minor so
-  # API surface matches.
-  kubeSchedulerImage = pkgs.dockerTools.pullImage {
-    imageName = "registry.k8s.io/kube-scheduler";
-    imageDigest = "sha256:94dfc9f285718a06bb873947959b8514ed95dddaa7c74d765cc346fdfa684859";
-    finalImageName = "registry.k8s.io/kube-scheduler";
-    finalImageTag = "v1.36.2";
-    hash = "sha256-TSyV0UW+2eZQSgAweY177H5i2UnFQr8wLPjdFSY/eyo=";
-    os = "linux";
-    arch = "amd64";
-  };
+  # Upstream kube-scheduler. The kube-build-scheduler Deployment
+  # (templates/kube-build-scheduler.yaml) `image:` is set via
+  # `buildScheduler.image` in extraValues by the consumer. The minor is
+  # asserted to match `pins.cluster.kubernetes_version` so a pins.toml
+  # bump can't silently leave a version-skewed second scheduler running
+  # against the new apiserver — k3s-full's `or throw` catches its side,
+  # this catches kwok's.
+  kubeSchedulerTag = "v1.36.2";
+  kubeSchedulerImage =
+    assert pkgs.lib.assertMsg
+      (pkgs.lib.hasPrefix "v${pins.cluster.kubernetes_version}." kubeSchedulerTag)
+      ''
+        nix/tests/fixtures/kwok.nix kubeSchedulerTag = "${kubeSchedulerTag}" but
+        nix/pins.toml cluster.kubernetes_version = "${pins.cluster.kubernetes_version}".
+        Bump the pullImage digest+tag to a v${pins.cluster.kubernetes_version}.x patch.
+      '';
+    pkgs.dockerTools.pullImage {
+      imageName = "registry.k8s.io/kube-scheduler";
+      imageDigest = "sha256:94dfc9f285718a06bb873947959b8514ed95dddaa7c74d765cc346fdfa684859";
+      finalImageName = "registry.k8s.io/kube-scheduler";
+      finalImageTag = kubeSchedulerTag;
+      hash = "sha256-TSyV0UW+2eZQSgAweY177H5i2UnFQr8wLPjdFSY/eyo=";
+      os = "linux";
+      arch = "amd64";
+    };
 
   # Upstream Karpenter NodeClaim/NodePool CRDs at the pinned version.
   # rio-controller creates `karpenter.sh/v1` NodeClaims directly; the
