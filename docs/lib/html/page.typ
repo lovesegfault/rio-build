@@ -4,7 +4,8 @@
 // content block and no `attrs:`, so the document root goes through
 // `html.elem("html", attrs: ...)` instead.
 #import "meta.typ": (
-  chapters, crumb-trail, descriptions, repo-edit-base, route-for,
+  canonical-url, chapters, crumb-trail, descriptions, repo-edit-base, route-for,
+  site-url,
 )
 #import "nav.typ": nav-tree
 #import "/lib/rio.typ": _current-route, _page-toc
@@ -18,10 +19,6 @@
   (media: none, content: "#f29718"),
   (media: "(prefers-color-scheme: dark)", content: "#e6b450"),
 )
-// Deploy base for canonical/OG URLs. nix/docs.nix passes this
-// unconditionally; only out-of-band `typst compile` hits the empty
-// default (which then omits canonical/OG meta).
-#let site-url = sys.inputs.at("site-url", default: "")
 
 #let page-shell(route, title, src-path, body) = {
   _current-route.update(route)
@@ -38,16 +35,12 @@
     "rio-build design book — " + title
   }
   let trail = if is-error-page { () } else { crumb-trail(chapters, src-path) }
-  // Directory form for the root: search engines and OG scrapers treat
-  // `/` and `/index.html` as distinct URLs, so canonical/og:url for the
-  // home page must be `<site>/`, not `<site>/index.html`.
   // The 404 shell → no canonical/OG: a not-found page has no canonical
   // URL and isn't an `og:type=article`. Mirrors the data-pagefind-body
-  // gate further down.
+  // gate further down. URL shape is single-sourced in meta.typ
+  // `canonical-url` (book.typ's sitemap reads the same helper).
   let page-url = if site-url != "" and not is-error-page {
-    if route == "index" { site-url + "/" } else {
-      site-url + "/" + route + ".html"
-    }
+    canonical-url(route)
   }
   html.elem("html", attrs: (lang: "en"))[
     #html.head[

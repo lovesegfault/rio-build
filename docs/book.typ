@@ -4,8 +4,10 @@
 // assets. Each chapter `.typ` applies `#show: rio.with(...)` itself,
 // so this file only routes + wraps in the page shell. PDF stitching
 // is `book-pdf.typ`.
-#import "/lib/html/meta.typ": chapters, flatten-chapters, route-for
-#import "/lib/html/page.typ": page-shell, site-url
+#import "/lib/html/meta.typ": (
+  canonical-url, chapters, flatten-chapters, route-for, site-url,
+)
+#import "/lib/html/page.typ": page-shell
 #import "/lib/rio.typ": bundle-mode
 
 // Bundle mode shares one label/state space across all `document()`
@@ -58,20 +60,14 @@
   asset("robots.txt", bytes(
     "User-agent: *\nAllow: /\nSitemap: " + site-url + "/sitemap.xml\n",
   ))
-  // <loc> mirrors page.typ's page-url: route=="index" → `<site>/`, not
-  // `<site>/index.html`, so the sitemap URL agrees with each page's
-  // <link rel=canonical>.
+  // <loc> via meta.typ `canonical-url` — same helper page.typ uses for
+  // `<link rel=canonical>`, so sitemap and per-page canonical can't
+  // disagree on URL shape (root → `/`, not `/index.html`).
   asset("sitemap.xml", bytes(
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
       + "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
       + routes
-        .map(r => (
-          "  <url><loc>"
-            + if r == "index" { site-url + "/" } else {
-              site-url + "/" + r + ".html"
-            }
-            + "</loc></url>\n"
-        ))
+        .map(r => "  <url><loc>" + canonical-url(r) + "</loc></url>\n")
         .join("")
       + "</urlset>\n",
   ))

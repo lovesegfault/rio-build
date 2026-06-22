@@ -150,4 +150,18 @@
   if path == "intro.typ" { "index" } else { path.slice(0, path.len() - 4) }
 }
 
+// Deploy base for canonical/OG/sitemap URLs. nix/docs.nix passes this
+// unconditionally; only out-of-band `typst compile` hits the empty
+// default (which then omits canonical/OG meta + sitemap).
+#let site-url = sys.inputs.at("site-url", default: "")
+
+// Route → absolute URL. Single source for `<link rel=canonical>`,
+// `og:url`, and the sitemap `<loc>` so the next URL-shape change (drop
+// `.html`, add path prefix, trailing-slash policy) hits one place.
+// Directory form for the root: search engines and OG scrapers treat `/`
+// and `/index.html` as distinct URLs, so the home page is `<site>/`.
+#let canonical-url(route) = if route == "index" { site-url + "/" } else {
+  site-url + "/" + route + ".html"
+}
+
 #let label-for(path) = label("chapter:" + route-for(path))
