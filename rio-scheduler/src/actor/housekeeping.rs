@@ -204,9 +204,12 @@ impl DagActor {
         // batch (94% of Tick cost over 46 live Ticks for merge;
         // pull's S6 batched completion is the same multi-RTT shape).
         // Tick must never block on either coalesce buffer.
-        // Per-phase attribution (round-9 dossier B2 — the merge.rs
-        // `phase!` pattern verbatim, leader-only by the early-return
-        // above). live_053's 134.65s Tick was log-silent for its
+        // Per-phase attribution (round-9 dossier B2 — same
+        // elapsed→histogram→debug→reset shape as merge.rs'
+        // `record_merge_phase`, but interleaves
+        // `drain_admin_fast_lane` between capture and reset so cannot
+        // share). Leader-only by the early-return above. live_053's
+        // 134.65s Tick was log-silent for its
         // first ~118s: rio_scheduler_actor_cmd_seconds{cmd=Tick}
         // names the total and nothing named the phase, so the
         // forensics had to derive the breakdown from side effects

@@ -422,8 +422,11 @@ impl DagActor {
         let mut prepared: Vec<PreparedMerge> = Vec::with_capacity(batch.len());
         let mut replies: Vec<oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>> =
             Vec::with_capacity(batch.len());
+        // One `t` threaded across iterations (matching the chained
+        // `record_merge_phase` convention) — a per-iteration `let mut
+        // t` made the helper's trailing reset a dead store/syscall.
+        let mut t = Instant::now();
         for PendingMerge { req, reply } in batch {
-            let mut t = Instant::now();
             match self.prepare_merge_persist(req).await {
                 Ok(p) => {
                     prepared.push(p);
@@ -706,8 +709,12 @@ impl DagActor {
         // wire payload + temp-table scan are inflated inside the held
         // fenced tx (the deposed-believer window is sized against this
         // tx's duration).
-        let mut edge_seen: HashSet<(Uuid, Uuid)> = HashSet::with_capacity(n_edges_est);
-        let mut all_edges: Vec<(Uuid, Uuid)> = Vec::with_capacity(n_edges_est);
+        // `batch_insert_edges` is `ON CONFLICT DO NOTHING` over an
+        // unordered SELECT, so insertion order is immaterial — collect
+        // into the dedup set directly and drain to a Vec at the bind
+        // site, instead of holding two `n_edges_est`-capacity
+        // collections inside the held fenced tx.
+        let mut all_edges: HashSet<(Uuid, Uuid)> = HashSet::with_capacity(n_edges_est);
         let mut build_ids: Vec<Uuid> = Vec::with_capacity(prepared.len());
         let mut all_wanted: Vec<crate::db::wanted::WantedRow<'_>> = Vec::with_capacity(n_nodes_est);
         for (k, p) in prepared.iter().enumerate() {
@@ -735,13 +742,11 @@ impl DagActor {
                 let child = resolve(&e.child_drv_path).ok_or_else(|| ActorError::MissingDbId {
                     drv_path: e.child_drv_path.clone(),
                 })?;
-                if edge_seen.insert((parent, child)) {
-                    all_edges.push((parent, child));
-                }
+                all_edges.insert((parent, child));
             }
         }
-        drop(edge_seen);
         *culprit = 0;
+        let all_edges: Vec<(Uuid, Uuid)> = all_edges.into_iter().collect();
         crate::db::SchedulerDb::batch_insert_build_derivations_multi(
             tx.conn(),
             &link_builds,
@@ -755,6 +760,7 @@ impl DagActor {
         drop(link_drvs);
         drop(all_edges);
         drop(all_wanted);
+        drop(path_to_hash);
 
         // ─── Batch 6: job creation + AS-5 reset ────────────────────
         // bug_390: the pruned-origin vouch exemption reads the DURABLE
@@ -1108,9 +1114,10 @@ impl DagActor {
         // fenced tx `record_resubmit_resets` opens.
         let resubmit_resets: Vec<DrvHash> = prepared
             .iter()
-            .flat_map(|p| p.ingest.merge_result.reset_on_resubmit.iter().cloned())
-            .collect::<HashSet<DrvHash>>()
+            .flat_map(|p| p.ingest.merge_result.reset_on_resubmit.iter())
+            .collect::<HashSet<&DrvHash>>()
             .into_iter()
+            .cloned()
             .collect();
         if !resubmit_resets.is_empty()
             && let Err(e) = self.record_resubmit_resets(&resubmit_resets).await

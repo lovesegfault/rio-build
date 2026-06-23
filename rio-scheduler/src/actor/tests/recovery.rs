@@ -2755,7 +2755,7 @@ async fn stage_parent_with_other_builds_cancelled_child(
     )
     .await?;
     // B1: the pruned re-request — parent only, no edges, so
-    // batch_insert_build_derivations links B1 to the parent only.
+    // batch_insert_build_derivations_multi links B1 to the parent only.
     merge_dag(&handle, b1, vec![mk_parent()], vec![], false).await?;
     barrier(&handle).await;
     drop(handle);

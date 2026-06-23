@@ -81,7 +81,7 @@ fn copy_escape_pg_array_into(out: &mut String, items: &[String]) {
 
 impl SchedulerDb {
     /// Link a build to a derivation. Test-only singular form; production
-    /// path is [`Self::batch_insert_build_derivations`].
+    /// path is [`Self::batch_insert_build_derivations_multi`].
     #[cfg(test)]
     pub(crate) async fn insert_build_derivation(
         &self,
