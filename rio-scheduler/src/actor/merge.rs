@@ -437,23 +437,29 @@ impl DagActor {
             // its own `newly_inserted` and re-insert its own
             // `removed_retriable`.
             //
-            // ActorError is not Clone (sqlx::Error). The first reply
-            // (last-prepared merge) gets the ORIGINAL error verbatim —
-            // at N=1 (the common case) this is exact. Remaining
-            // replies get a synthesised per-merge error: retryable
-            // batch-level failures (StaleGeneration / NotLeader) →
-            // `NotLeader` (the gateway's retry guard keys on
-            // UNAVAILABLE/RESOURCE_EXHAUSTED); the rest fold into
-            // `Database` (a batch sqlx error is terminal either way).
+            // ActorError is not Clone (sqlx::Error). The ORIGINAL typed
+            // error goes to the FIRST-prepared reply: `persist_merges`
+            // iterates `prepared` forward, so a per-merge-attributable
+            // failure (e.g. `MissingDbId` naming a drv_path) is
+            // overwhelmingly merge[0]'s data — sending it to
+            // merge[N-1] would deliver INTERNAL: <path it never sent>
+            // to the wrong gateway. Remaining replies get a
+            // synthesised per-merge error of the SAME retry class
+            // (single-source `retry_class()`, not an inline matches!):
+            // Retryable → `NotLeader` (the gateway's retry guard keys
+            // on UNAVAILABLE/RESOURCE_EXHAUSTED); Terminal →
+            // `Database(Protocol(..))`. At N=1 the original is exact.
             let msg = e.to_string();
-            let retryable = matches!(
-                e,
-                ActorError::StaleGeneration { .. } | ActorError::NotLeader
-            );
-            let mut original = Some(e);
-            for (p, reply) in prepared.into_iter().zip(replies).rev() {
+            // refusal-census: derives from retry_class() — not an
+            // adjudication site (the source-of-truth match lives in
+            // `ActorError::retry_class`).
+            let retryable = e.retry_class() == super::command::RetryClass::Retryable;
+            for p in prepared.into_iter().rev() {
                 self.cleanup_failed_merge(p.ingest.build_id, p.ingest.merge_result)
                     .await;
+            }
+            let mut original = Some(e);
+            for reply in replies {
                 let per = original.take().unwrap_or_else(|| {
                     if retryable {
                         ActorError::NotLeader
@@ -697,6 +703,16 @@ impl DagActor {
         let mut job_spans: Vec<usize> = Vec::with_capacity(prepared.len());
         let mut all_reset_hashes: Vec<DrvHash> = Vec::new();
         let mut all_reset_rows: Vec<crate::db::attempts::AttemptRow> = Vec::new();
+        // Cross-merge AS-5 dedup: pre-P2 merge[k+1]'s phase-5 ran AFTER
+        // merge[k]'s phase-6d cleared the in-mem status, so the
+        // `status() ∈ {Poisoned,DepFailed,Failed}` gate below was an
+        // implicit dedup. Batched phase-5 reads the SAME pre-phase-6
+        // state for every merge — without an explicit dedup, two
+        // overlapping reprobe lanes would push two `poison_cleared`
+        // ledger rows (each with a fresh attempt_id; the ON CONFLICT
+        // WHERE exec_id IS NOT NULL guard does not apply at
+        // exec_id=None) and double-count the resubmit-cycle clear.
+        let mut reset_seen: HashSet<&str> = HashSet::new();
         for p in prepared.iter() {
             let start = job_specs.len();
             let mut queued: HashSet<String> = HashSet::new();
@@ -751,18 +767,21 @@ impl DagActor {
                         crate::state::JobOrigin::Reprobe,
                     ));
                 }
-                if self.dag.node(h).is_some_and(|s| {
-                    matches!(
-                        s.status(),
-                        DerivationStatus::Poisoned
-                            | DerivationStatus::DependencyFailed
-                            | DerivationStatus::Failed
+                if reset_seen.insert(h.as_str())
+                    && self.dag.node(h).is_some_and(|s| {
+                        matches!(
+                            s.status(),
+                            DerivationStatus::Poisoned
+                                | DerivationStatus::DependencyFailed
+                                | DerivationStatus::Failed
+                        )
+                    })
+                    && let Some(mut row) = self.reset_row_for(
+                        h,
+                        crate::state::OutcomeClass::PoisonCleared,
+                        crate::state::ReportingParty::Scheduler,
                     )
-                }) && let Some(mut row) = self.reset_row_for(
-                    h,
-                    crate::state::OutcomeClass::PoisonCleared,
-                    crate::state::ReportingParty::Scheduler,
-                ) {
+                {
                     // Full reset: mirrors the admin clear's PG-side zero.
                     row.resubmit_cycle = 0;
                     all_reset_rows.push(row);
@@ -771,6 +790,7 @@ impl DagActor {
             }
             job_spans.push(job_specs.len() - start);
         }
+        drop(reset_seen);
         let job_rows: Vec<crate::db::materialization::NewJobRow<'_>> = job_specs
             .iter()
             .map(
