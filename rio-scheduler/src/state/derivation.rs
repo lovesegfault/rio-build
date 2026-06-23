@@ -174,7 +174,7 @@ db_str_enum! {
     /// the snapshot test, the exhaustive transition-table test, and the
     /// dashboard's cross-language cardinality check (vitest reads the
     /// same golden) all key on it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum DerivationStatus {
         Created = "created",
         Queued = "queued",

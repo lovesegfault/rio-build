@@ -3,7 +3,7 @@
 // r[impl sched.merge.shared-priority-max]
 // r[impl sched.merge.toctou-serial]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use tokio::sync::oneshot;
@@ -61,13 +61,18 @@ pub(super) struct PendingMerge {
 // masked this; CLAUDE.md's documented `cargo test` fallback does not.
 
 /// One-site emit for the merge-phase histogram + the per-phase debug
-/// line. The function-local `phase!` macros in `prepare_merge_persist`
-/// / `reconcile_merged_state` (which also reset their `t_phase`) and
-/// `flush_pending_merges`' two batched-phase emits all route here.
-fn record_merge_phase(phase: &'static str, elapsed: std::time::Duration) {
+/// line, and reset `t_phase` for the next phase. Called directly at
+/// every phase boundary in `prepare_merge_persist` /
+/// `reconcile_merged_state` / `flush_pending_merges` — no fn-local
+/// macro wrapper. (`housekeeping.rs`' `phase!` is the same shape for a
+/// different metric, but its body interleaves `drain_admin_fast_lane`
+/// between the elapsed capture and the reset, so it cannot share.)
+fn record_merge_phase(phase: &'static str, t_phase: &mut Instant) {
+    let elapsed = t_phase.elapsed();
     metrics::histogram!("rio_scheduler_merge_phase_seconds", "phase" => phase)
         .record(elapsed.as_secs_f64());
     debug!(?elapsed, phase, "merge phase");
+    *t_phase = Instant::now();
 }
 
 /// Cross-phase carrier from [`DagActor::prepare_merge_persist`] to
@@ -408,7 +413,7 @@ impl DagActor {
         let mut replies: Vec<oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>> =
             Vec::with_capacity(batch.len());
         for PendingMerge { req, reply } in batch {
-            let t = Instant::now();
+            let mut t = Instant::now();
             match self.prepare_merge_persist(req).await {
                 Ok(p) => {
                     prepared.push(p);
@@ -418,7 +423,7 @@ impl DagActor {
                     let _ = reply.send(Err(e));
                 }
             }
-            record_merge_phase("0to4-prepare-batched", t.elapsed());
+            record_merge_phase("0to4-prepare-batched", &mut t);
         }
         if prepared.is_empty() {
             return;
@@ -433,7 +438,7 @@ impl DagActor {
         // original to `replies[0]` unconditionally delivered
         // INTERNAL:<path it never sent> to the wrong gateway when k>0
         // — see `batch_persist_err_routes_to_culprit_merge`.
-        let t_persist = Instant::now();
+        let mut t_persist = Instant::now();
         let mut culprit = 0usize;
         if let Err(e) = self.persist_merges(&mut prepared, &mut culprit).await {
             // `build_id` is the operator-side join key to the gateway's
@@ -486,7 +491,7 @@ impl DagActor {
             }
             return;
         }
-        record_merge_phase("5-persist-and-activate-batched", t_persist.elapsed());
+        record_merge_phase("5-persist-and-activate-batched", &mut t_persist);
 
         // Phase 6+ per merge, then reply. Every build is now
         // Active+committed; DB writes here are log-and-continue.
@@ -599,24 +604,25 @@ impl DagActor {
         let mut node_rows: Vec<crate::db::DerivationRow> = Vec::with_capacity(n_nodes_est);
         // ONE batch-wide path_to_hash, folded into Batch-1's Σ|nodes_i|
         // walk (not a second flat_map pass over the same set inside the
-        // held fenced tx). Populated BEFORE the seen-dedup `continue`:
-        // last-write-wins is benign by construction (debug_assert
-        // below), and the per-row body reads only fields
-        // batch_upsert_derivations does not mutate.
+        // held fenced tx). Populated AFTER the seen-dedup `continue` so
+        // cross-merge duplicate nodes (same hash ⇒ same path, the
+        // validate_node contract) don't re-insert; resolve() needs only
+        // first-wins. The debug_assert catches the inverse — same path,
+        // different hash — i.e., a regression in `ingest::validate_node`.
         let mut path_to_hash: HashMap<&str, &str> = HashMap::with_capacity(n_nodes_est);
         for p in prepared.iter() {
             for node in &p.ingest.nodes {
+                if !seen.insert(node.drv_hash.as_str()) {
+                    continue;
+                }
                 let prev = path_to_hash.insert(node.drv_path.as_str(), node.drv_hash.as_str());
                 debug_assert!(
-                    prev.is_none_or(|v| v == node.drv_hash.as_str()),
+                    prev.is_none(),
                     "batch path_to_hash conflict: {} → {} vs {prev:?} \
                      (path↔hash validated at ingest::validate_node — regression there)",
                     node.drv_path,
                     node.drv_hash,
                 );
-                if !seen.insert(node.drv_hash.as_str()) {
-                    continue;
-                }
                 let status = if p
                     .ingest
                     .merge_result
@@ -667,10 +673,7 @@ impl DagActor {
         // edge to a node merge[j<k] introduced resolves through
         // `id_map` (the cross-merge-within-batch case a per-merge map
         // missed and `self.dag.db_id_for_path` cannot serve until
-        // post-commit). Last-write-wins is benign by construction:
-        // drv_hash is the content hash of the .drv at drv_path, so two
-        // nodes with the same drv_path carry the same drv_hash unless
-        // a client lied. Path↔hash consistency is the gRPC ingest
+        // post-commit). Path↔hash consistency is the gRPC ingest
         // layer's contract (`ingest::validate_node`); the debug_assert
         // in Batch-1 catches a regression there. No release-mode
         // rejection — adversarial input that slips ingest validation
@@ -684,6 +687,15 @@ impl DagActor {
         let n_edges_est: usize = prepared.iter().map(|p| p.edges.len()).sum();
         let mut link_builds: Vec<Uuid> = Vec::with_capacity(n_nodes_est);
         let mut link_drvs: Vec<Uuid> = Vec::with_capacity(n_nodes_est);
+        // Cross-merge dedup (same `seen`/`reset_seen`/`queued`
+        // rationale): edges are the largest per-merge collection (~3×
+        // nodes), and overlapping closures — the P2 target shape —
+        // ship Σ|edges_i| rows through the temp-table COPY otherwise.
+        // ON CONFLICT DO NOTHING makes it semantically correct, but the
+        // wire payload + temp-table scan are inflated inside the held
+        // fenced tx (the deposed-believer window is sized against this
+        // tx's duration).
+        let mut edge_seen: HashSet<(Uuid, Uuid)> = HashSet::with_capacity(n_edges_est);
         let mut all_edges: Vec<(Uuid, Uuid)> = Vec::with_capacity(n_edges_est);
         let mut build_ids: Vec<Uuid> = Vec::with_capacity(prepared.len());
         let mut all_wanted: Vec<crate::db::wanted::WantedRow<'_>> = Vec::with_capacity(n_nodes_est);
@@ -712,9 +724,12 @@ impl DagActor {
                 let child = resolve(&e.child_drv_path).ok_or_else(|| ActorError::MissingDbId {
                     drv_path: e.child_drv_path.clone(),
                 })?;
-                all_edges.push((parent, child));
+                if edge_seen.insert((parent, child)) {
+                    all_edges.push((parent, child));
+                }
             }
         }
+        drop(edge_seen);
         *culprit = 0;
         crate::db::SchedulerDb::batch_insert_build_derivations_multi(
             tx.conn(),
@@ -1041,18 +1056,20 @@ impl DagActor {
                 "Pending→Active rejected on fresh build (BuildInfo::transition bug)"
             );
             let _ = applied;
-            // This merge's created jobs.
-            p.ingest.created_jobs = (0..span)
-                .map(|_| {
-                    let (_, h, _, origin) = spec_iter.next().unwrap();
-                    let r = created_iter.next().unwrap();
-                    super::materialize::CreatedJob {
-                        drv_hash: h,
-                        job_id: r.job_id,
-                        created: r.created,
-                        upgraded: r.upgraded,
-                        origin,
-                    }
+            // This merge's created jobs: `job_specs` and `created` are
+            // input-order ⇔ result-order, so `zip` over the next `span`
+            // pairs encodes the lockstep structurally (no per-step
+            // `.next().unwrap()` × 2 against an unused range index).
+            p.ingest.created_jobs = spec_iter
+                .by_ref()
+                .zip(created_iter.by_ref())
+                .take(span)
+                .map(|((_, h, _, origin), r)| super::materialize::CreatedJob {
+                    drv_hash: h,
+                    job_id: r.job_id,
+                    created: r.created,
+                    upgraded: r.upgraded,
+                    origin,
                 })
                 .collect();
         }
@@ -1128,12 +1145,6 @@ impl DagActor {
         let nodes = crate::domain::nodes_from_proto(nodes);
         let edges = crate::domain::edges_from_proto(edges);
         let mut t_phase = Instant::now();
-        macro_rules! phase {
-            ($name:literal) => {
-                record_merge_phase($name, t_phase.elapsed());
-                t_phase = Instant::now();
-            };
-        }
 
         // === Step 0: Top-down demand-set substitution check =========
         // r[impl sched.merge.substitute-topdown+13]
@@ -1212,7 +1223,7 @@ impl DagActor {
             }
             None => (nodes, edges, HashSet::new()),
         };
-        phase!("0-topdown-roots");
+        record_merge_phase("0-topdown-roots", &mut t_phase);
 
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
@@ -1226,7 +1237,7 @@ impl DagActor {
                 jti.as_deref(),
             )
             .await?;
-        phase!("1-db-build-row");
+        record_merge_phase("1-db-build-row", &mut t_phase);
 
         // === Step 2: DAG merge (BEFORE in-memory map inserts) ========
         // If merge fails (cycle), nothing is in the actor's maps; only the
@@ -1256,7 +1267,7 @@ impl DagActor {
             }
         };
         let newly_inserted = &merge_result.newly_inserted;
-        phase!("2-dag-merge-inmem");
+        record_merge_phase("2-dag-merge-inmem", &mut t_phase);
 
         // === Step 3: In-memory map inserts ============================
         let event_rx = self.events.register(build_id);
@@ -1304,7 +1315,7 @@ impl DagActor {
             .cloned()
             .chain(existing_reprobe.iter().cloned())
             .collect();
-        phase!("3-inmem-maps");
+        record_merge_phase("3-inmem-maps", &mut t_phase);
 
         // === Step 4: Scheduler-side cache check (BEFORE DB persist) ====
         // Apply the pre-MergeDag store probe (the FindMissingPaths RPC
@@ -1338,7 +1349,7 @@ impl DagActor {
                 return Err(e);
             }
         };
-        phase!("4-check-cached-outputs");
+        record_merge_phase("4-check-cached-outputs", &mut t_phase);
 
         // === Step 5: PG persist + → Active ============================
         // All remaining error-returning PG writes. On any error, roll
@@ -1367,8 +1378,6 @@ impl DagActor {
             .iter()
             .map(|(h, _)| h.clone())
             .partition(|h| existing_reprobe.contains(h));
-        let _ = &mut t_phase; // last phase! write is intentionally unread
-
         Ok(PreparedMerge {
             ingest: MergeIngest {
                 build_id,
@@ -1419,12 +1428,6 @@ impl DagActor {
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         let mut t_phase = Instant::now();
-        macro_rules! phase {
-            ($name:literal) => {
-                record_merge_phase($name, t_phase.elapsed());
-                t_phase = Instant::now();
-            };
-        }
 
         // r[sched.merge.reconcile-order+2]: split pending_substitute by
         // lane. Reprobe-substitutable (pre-existing Poisoned/Failed/
@@ -1450,7 +1453,7 @@ impl DagActor {
 
         let (mut cached_count, deferred_hits, other_builds, reprobe_unlocked) =
             self.apply_cached_hits(ingest, &node_index).await;
-        phase!("6a-cached-hits-loop");
+        record_merge_phase("6a-cached-hits-loop", &mut t_phase);
 
         // Compute critical-path priorities for newly-inserted nodes.
         // Done AFTER cache-hit transitions so completed derivations
@@ -1467,7 +1470,7 @@ impl DagActor {
             &self.builds,
             newly_inserted,
         );
-        phase!("6b-critical-path");
+        record_merge_phase("6b-critical-path", &mut t_phase);
 
         // r[impl sched.materialize.listing-priority+2]
         // Post-6b priority re-stamp: the merge-tx batch (step 5)
@@ -1506,7 +1509,7 @@ impl DagActor {
                    "post-6b mat-job priority re-stamp failed (build is Active; \
                     listing degenerates to (created_at, job_id) for this batch)");
         }
-        phase!("6b-priority-restamp");
+        record_merge_phase("6b-priority-restamp", &mut t_phase);
 
         // I-047: pre-existing Completed nodes may have stale output_paths
         // (GC deleted the output between the node's original completion and
@@ -1524,7 +1527,7 @@ impl DagActor {
                 precomputed_probe.as_ref(),
             )
             .await;
-        phase!("6c-verify-preexisting");
+        record_merge_phase("6c-verify-preexisting", &mut t_phase);
 
         // Reprobe-substitutable lane FIRST: a hard-Poisoned node whose
         // output is now upstream-substitutable must have its status
@@ -1551,7 +1554,7 @@ impl DagActor {
             // deleted.
             self.apply_reprobe_reset_in_memory(&reprobe_sub).await;
         }
-        phase!("6d-reprobe-reset");
+        record_merge_phase("6d-reprobe-reset", &mut t_phase);
 
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
@@ -1562,7 +1565,7 @@ impl DagActor {
             .cloned()
             .collect();
         let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
-        phase!("6e-seed-initial-states");
+        record_merge_phase("6e-seed-initial-states", &mut t_phase);
 
         // I-099: advance pre-existing Queued dependents of re-probe
         // hits (collected in 6a). Runs AFTER 6c so a sibling dep that
@@ -1604,7 +1607,7 @@ impl DagActor {
                 }
             }
         }
-        phase!("6f-reprobe-unlocked");
+        record_merge_phase("6f-reprobe-unlocked", &mut t_phase);
 
         // Newly-inserted substitutable lane: nodes are at Created/
         // Queued/Ready (via seed_initial_states above) and stay there.
@@ -1623,7 +1626,7 @@ impl DagActor {
                 "new_sub lane routed to materialization jobs"
             );
         }
-        phase!("6g-new-sub-jobs");
+        record_merge_phase("6g-new-sub-jobs", &mut t_phase);
 
         // Pre-existing nodes that weren't newly-inserted, stale-reset,
         // or re-probe-cached: count Completed/Skipped as cached, and
@@ -1634,9 +1637,7 @@ impl DagActor {
         if first_dep_failed.is_none() {
             first_dep_failed = preexisting_failed;
         }
-        phase!("6h-preexisting-nodes-loop");
-        let _ = &mut t_phase; // last phase! write is intentionally unread
-
+        record_merge_phase("6h-preexisting-nodes-loop", &mut t_phase);
         MergeReconcile {
             cached_count,
             first_dep_failed,
@@ -2568,7 +2569,13 @@ impl DagActor {
         let mut reset = HashSet::new();
         let mut to_spawn: Vec<(DrvHash, Vec<String>)> = Vec::new();
         let mut demote_parents: HashSet<DrvHash> = HashSet::new();
-        let mut to_persist: HashMap<DerivationStatus, Vec<DrvHash>> = HashMap::new();
+        // BTreeMap (not HashMap): deterministic persist order. The
+        // pre-batched code called update_derivation_status inline
+        // pass-2-then-pass-3; correctness here depends on the
+        // `reset.contains(p)` guard below keeping the per-status hash
+        // sets disjoint, but a determinism guarantee means a regression
+        // there shows up as a stable failure, not a flake.
+        let mut to_persist: BTreeMap<DerivationStatus, Vec<DrvHash>> = BTreeMap::new();
         for (drv_hash, output_paths, unwanted) in candidates {
             let Some(gone) = output_paths
                 .iter()
