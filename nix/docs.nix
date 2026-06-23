@@ -307,7 +307,14 @@ let
       ''
         typst compile --root ${compileRoot} -f pdf \
           ${mkInputArgs ghSha} --input x-target=book-pdf \
-          ${compileRoot}/book-pdf.typ $out
+          ${compileRoot}/book-pdf.typ $out 2>typst-stderr.log
+        cat typst-stderr.log >&2
+        # Warnings-as-errors. PDF target has no allowlist — every
+        # warning class that fired here was source-fixable.
+        if grep -qE '^warning:' typst-stderr.log; then
+          echo "error: typst emitted warnings — fix the source or allowlist in nix/docs.nix" >&2
+          exit 1
+        fi
       '';
 
   mkDocs =
@@ -348,7 +355,20 @@ let
         mkdir -p $out
         typst compile --features bundle,html --format bundle \
           --root . ${mkInputArgs ghSha} --input x-target=html \
-          --font-path "$TYPST_FONT_PATHS" book.typ $out/
+          --font-path "$TYPST_FONT_PATHS" book.typ $out/ 2>typst-stderr.log
+        cat typst-stderr.log >&2
+        # Warnings-as-errors. Plain redirect (not `2> >(tee …)`) so the
+        # grep can't race a procsub flush. Allowlist:
+        #   - "bundle export is experimental": emitted unconditionally
+        #     by `--format bundle`; typst has no suppress flag. Drop
+        #     this entry once bundle export is stabilized upstream.
+        bad=$(grep -E '^warning:' typst-stderr.log \
+          | grep -vE '^warning: bundle export is experimental$' || true)
+        if [ -n "$bad" ]; then
+          echo "$bad" >&2
+          echo "error: typst emitted unexpected warnings — fix the source or extend the allowlist in nix/docs.nix" >&2
+          exit 1
+        fi
         # og:image must be raster (OG scrapers do not render SVG).
         # book.typ emits og-image.svg; rasterize to 1200×630 PNG with
         # the NCM font dir wired so the wordmark renders. The SVG stays

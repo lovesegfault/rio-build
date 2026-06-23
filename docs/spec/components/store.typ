@@ -1530,7 +1530,7 @@ freezes (#rref("store.substitute.stale-reclaim")).
   (config `substitute_stall_secs`, default 180 s) MUST be aborted by its own
   owner (`fetch_nar`'s per-read watchdog; the NAR GET carries no request-level
   timeout, so this is the only clock on the body). The abort releases the claim
-  **in place** --- `claim_id`/`claimed_by` cleared, progress evidence NULLed,
+  *in place* --- `claim_id`/`claimed_by` cleared, progress evidence NULLed,
   durable `stall_count` incremented --- so the row survives with its stall
   evidence and the next attempt re-claims it immediately
   (#rref("store.substitute.stale-reclaim")). The release is claim-guarded on
@@ -1596,24 +1596,24 @@ applies to builder uploads, not substitution).
 #r("store.substitute.stale-reclaim+4")[
   When a claim attempt finds an existing `'uploading'` placeholder for the
   requested path, `claim_placeholder` MUST apply three takeover arms in
-  precedence order. (1) A **released-in-place** row (`claim_id` IS NULL ---
+  precedence order. (1) A *released-in-place* row (`claim_id` IS NULL ---
   what #rref("store.substitute.stall-abort") leaves behind) is claimable
   immediately by any caller, with no staleness threshold and `stall_count`
-  preserved. (2) **Heartbeat death**: a placeholder older than
+  preserved. (2) *Heartbeat death*: a placeholder older than
   `SUBSTITUTE_STALE_THRESHOLD` (90 seconds --- 3× the 30 s placeholder
   heartbeat, so a live owner is never collected; `reap_one` re-checks the
   threshold inside its transaction as the race guard) is reclaimed by
   DELETE + re-INSERT
   --- benign churn (deploys, scale-in, crashes) resets stall evidence and
   never accrues strikes; this arm precedes the stall arm so a dead owner is
-  reaped, not striked, when both predicates hold. (3) **Download-stalled**
+  reaped, not striked, when both predicates hold. (3) *Download-stalled*
   (substitution claimants only, which carry the verified narinfo's `NarSize`):
   the takeover predicate is two-clock and PHASE-KEYED over durable data
   (migration 092) --- `claim_phase = 'downloading'` ∧
   `fetched_bytes IS NOT NULL` ∧ `fetched_bytes < nar_size` ∧
   `last_progress_at` older than the stall window ∧ `updated_at` WITHIN the
   stall window (the owner is alive; a dead owner falls to arm 2 and is
-  reaped, not striked). A matching claim is taken over **in place** (new
+  reaped, not striked). A matching claim is taken over *in place* (new
   `claim_id`/`claimed_by`, `claim_phase = 'downloading'`, progress reset,
   `stall_count += 1`) so stall evidence survives ownership changes. Owners
   parked on the local NAR-byte budget (`claim_phase = 'budget_parked'`) and

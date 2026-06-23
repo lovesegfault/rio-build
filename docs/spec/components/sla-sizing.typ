@@ -150,8 +150,8 @@ rather than raw $n$. After a version bump the ring buffer may hold 32 samples bu
 *Peak memory* $M(c)$ is fit as *p90 quantile regression* on $log M = a + b log c$ once $n_"eff" >= 10$. The fit minimizes the weighted pinball loss $rho_tau (u) = u(tau - bb(1)[u<0])$ at $tau = 0.9$ @koenker2005 rather than sorting and picking the 90th percentile; the solver is neutral, LP @koenker2005 or IRLS both work. Log-linear captures sub/super-linear power-law with two parameters, and p90 is chosen over mean because least-squares puts \~50% of runs above the line and into @oom territory. This matches Autopilot/@vpa practice @rzadca2020 of sizing from a decaying-histogram percentile rather than a point estimate.
 
 Below $n_"eff" = 10$, p90 is not estimable. Instead the model fits ordinary least squares on $log M$ and applies the small-sample prediction-interval factor $exp(t_(0.9, max(3, n_"eff" - 2)) dot.op hat(sigma)_"resid" dot.op sqrt(1 + h_0))$, with leverage
-$ h_0 = 1 / (sum w_i) + (log c^* - overline(log c))^2 / S_(x x), $
-$S_(x x) = sum w_i (log c_i - overline(log c))^2$, and $overline(log c) := (sum w_i log c_i) slash (sum w_i)$. Because $n_"eff" >= sum w_i$ when weights sit below 1, substituting $1 slash n_"eff"$ for the first term would *narrow* the interval and is therefore anti-conservative. Degrees of freedom are floored at 3: the Student-$t$ factor, not $z = 1.28$, is what widens the interval under extrapolation, which is exactly the post-bump case.
+$ h_0 = 1 / (sum w_i) + (log c^* - macron(log c))^2 / S_(x x), $
+$S_(x x) = sum w_i (log c_i - macron(log c))^2$, and $macron(log c) := (sum w_i log c_i) slash (sum w_i)$. Because $n_"eff" >= sum w_i$ when weights sit below 1, substituting $1 slash n_"eff"$ for the first term would *narrow* the interval and is therefore anti-conservative. Degrees of freedom are floored at 3: the Student-$t$ factor, not $z = 1.28$, is what widens the interval under extrapolation, which is exactly the post-bump case.
 
 #r("sched.sla.disk-scalar")
 

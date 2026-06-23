@@ -499,6 +499,13 @@
   } else { it }
   show table.cell.where(y: 0): strong
 
+  // align() is a no-op under the html target and emits a warning.
+  // Strip it globally there so third-party packages (glossarium's
+  // default theme) don't leak warnings we can't fix at source.
+  // Contextual `is-html()` (not compile-global `is-pdf`) so align
+  // still applies inside `html.frame()` where target() == "paged".
+  show align: it => context if is-html() { it.body } else { it }
+
   // glossarium: intercepts @key refs for registered entries, falls
   // through to native @label otherwise. Registration is gated on
   // `_gloss-done` so book-pdf's many `rio()` calls fire exactly once.
