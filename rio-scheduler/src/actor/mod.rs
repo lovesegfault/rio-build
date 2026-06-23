@@ -123,8 +123,10 @@ pub(crate) const ADMIN_FAST_LANE_DRAIN_QUOTA: usize = 16;
 /// so the arm is dormant and the actor never wakes on it). One
 /// `Option<tokio::time::Instant>` per buffer is the whole deadline
 /// state — the prior Interval+armed_at pair encoded the same instant
-/// twice on two clock bases.
-async fn coalesce_due(deadline: Option<tokio::time::Instant>) {
+/// twice on two clock bases. `pub(crate)` so the cost-poller select!
+/// (`sla/cost.rs`) reuses the same `None ⇒ pending()` shape instead
+/// of open-coding `.unwrap()` under an `is_some()` guard.
+pub(crate) async fn coalesce_due(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(d) => tokio::time::sleep_until(d).await,
         None => std::future::pending().await,

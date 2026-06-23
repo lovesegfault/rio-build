@@ -1184,23 +1184,20 @@ impl DagActor {
                 // would succeed, and the pruned classification would
                 // only turn a routine substitute failure into a
                 // wrongful terminal fail-fast. Resolved path→hash via
-                // the original node list (edges carry drv_paths on the
-                // wire).
-                let path_to_hash: HashMap<&str, &str> = nodes
-                    .iter()
-                    .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
-                    .collect();
-                // ∩ kept set HERE so consumers can iterate
-                // `pruned_closure_parents` directly (O(|pruned|))
-                // instead of scanning every kept node × contains(). A
+                // the KEPT (`demanded`) subset — edges carry drv_paths
+                // on the wire — so a parent outside the kept set is
+                // absent from the map and `filter_map` drops it (∩ kept
+                // baked into the lookup, no separate set scan): a
                 // pruned parent that is itself outside the kept set
                 // never had its closure dropped FROM THIS submission's
                 // post-prune DAG and must not get a Pruned-origin job.
-                let kept: HashSet<&str> = demanded.iter().map(|n| n.drv_hash.as_str()).collect();
+                let kept_path_to_hash: HashMap<&str, &str> = demanded
+                    .iter()
+                    .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
+                    .collect();
                 let parents: HashSet<String> = edges
                     .iter()
-                    .filter_map(|e| path_to_hash.get(e.parent_drv_path.as_str()))
-                    .filter(|h| kept.contains(*h))
+                    .filter_map(|e| kept_path_to_hash.get(e.parent_drv_path.as_str()))
                     .map(|h| (*h).to_string())
                     .collect();
                 (demanded, Vec::new(), parents)

@@ -2542,8 +2542,9 @@ pub async fn interrupt_housekeeping(
             // The retry wake: fires within COST_RELOAD_RETRY_SECS of a
             // failed leader-edge reload, so the deferred price-fold/
             // persist window is the typed envelope, not the tick.
-            _ = async { tokio::time::sleep_until(reload_retry.unwrap()).await },
-                if reload_retry.is_some() => {},
+            // `coalesce_due` is the actor's `None ⇒ pending()` helper —
+            // no `.unwrap()` under an `is_some()` guard.
+            () = crate::actor::coalesce_due(reload_retry) => {},
         }
         // The wake law over the prelude's closed alphabet: Proceed
         // disarms and runs the body; Standby disarms and skips (a
