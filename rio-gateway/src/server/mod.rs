@@ -1165,6 +1165,7 @@ impl russh::server::Server for GatewayServer {
             max_channels_per_connection: self.max_channels_per_connection,
             open_channels: 0,
             accepted_channels: HashSet::new(),
+            over_bound_channels: HashSet::new(),
             channel_writers: HashMap::new(),
             empty_connection_grace: self.empty_connection_grace,
             handshake_timeout: self.handshake_timeout,

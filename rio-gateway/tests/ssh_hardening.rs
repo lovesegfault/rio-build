@@ -279,19 +279,19 @@ async fn test_channel_open_slot_reuse_under_bound() -> anyhow::Result<()> {
 }
 
 // r[verify gw.conn.channel-limit+4]
-/// Crossing the per-connection channel bound terminates the CONNECTION,
-/// not just the offending open. russh allocates and registers per-channel
-/// state before consulting the handler and never frees it for a refused
-/// open, so a per-open `SSH_MSG_CHANNEL_OPEN_FAILURE` would let a client
-/// loop opens past the bound and grow gateway memory without bound — the
-/// over-bound open must surface as a connection-level/transport error
-/// (NOT `ChannelOpenFailure`), and the connection must be unusable
-/// afterwards.
-///
-/// Every await on the (dying) connection is bounded so a regression that
-/// leaves it half-alive fails the test instead of hanging it.
+// r[verify gw.conn.session-cap+2]
+/// Crossing the per-connection channel bound rejects only the EXCESS
+/// channel's exec — never the channel OPEN, never the whole connection.
+/// A per-open `SSH_MSG_CHANNEL_OPEN_FAILURE` makes an OpenSSH mux client
+/// fall back to a corrupted direct connection (`gw.conn.session-cap+2`);
+/// terminating the connection drops up to 512 in-flight protocol sessions
+/// on the floor. With the bound at 8: BOUND opens are accepted AND their
+/// execs admitted, the BOUND+1th open is also confirmed but its exec gets
+/// `channel_failure`, and the prior BOUND sessions stay live — proven by
+/// running the worker-protocol handshake on one of them AFTER the
+/// over-bound rejection.
 #[tokio::test]
-async fn test_channel_open_over_bound_terminates_connection() -> anyhow::Result<()> {
+async fn test_channel_open_over_bound_rejects_only_excess_exec() -> anyhow::Result<()> {
     common::init_test_logging();
     const BOUND: usize = 8;
     const STEP: std::time::Duration = std::time::Duration::from_secs(10);
@@ -299,37 +299,150 @@ async fn test_channel_open_over_bound_terminates_connection() -> anyhow::Result<
         spawn_ssh_server_with(|s| s.with_max_channels_per_connection(BOUND)).await?;
     let session = connect_and_auth(addr, client_key).await?;
 
-    // Fill the connection up to the bound; all of these are accepted.
+    // Fill the connection up to the bound; every open is accepted AND its
+    // exec admitted — these are the in-flight sessions the bound must not
+    // collateral-kill.
     let mut chans = Vec::new();
     for i in 0..BOUND {
-        let ch = session
+        let mut ch = session
             .channel_open_session()
             .await
             .unwrap_or_else(|e| panic!("open #{i} should be accepted (bound={BOUND}): {e:?}"));
+        ch.exec(true, "nix-daemon --stdio").await?;
+        let msg = ch.wait().await.expect("server reply");
+        assert!(
+            matches!(msg, russh::ChannelMsg::Success),
+            "exec #{i} (under bound) must be admitted: {msg:?}"
+        );
         chans.push(ch);
     }
 
-    // The BOUND+1th open crosses the bound: the gateway must end the SSH
-    // session rather than refuse the single open, so the client sees the
-    // transport die (no reply for this open, then disconnect) — never the
-    // per-open `SSH_MSG_CHANNEL_OPEN_FAILURE` of a connection that stays
-    // usable.
+    // The BOUND+1th open crosses the bound. It MUST still be confirmed at
+    // the SSH level — no `ChannelOpenFailure`, no connection error — so
+    // an OpenSSH mux master tells its client `MUX_S_SESSION_OPENED` and
+    // the client never falls back to a direct connection.
+    let mut over = tokio::time::timeout(STEP, session.channel_open_session())
+        .await
+        .map_err(|_| anyhow::anyhow!("over-bound open did not resolve within {STEP:?}"))?
+        .unwrap_or_else(|e| {
+            panic!(
+                "the over-bound open must be CONFIRMED (rejection deferred to exec), \
+                 not refused or have the connection terminated; got {e:?}"
+            )
+        });
+
+    // The rejection arrives at exec: clean `channel_failure`, same as the
+    // global session cap.
+    over.exec(true, "nix-daemon --stdio").await?;
+    let msg = tokio::time::timeout(STEP, over.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("over-bound exec reply did not resolve within {STEP:?}"))?
+        .expect("server reply to over-bound exec");
+    assert!(
+        matches!(msg, russh::ChannelMsg::Failure),
+        "exec on the over-bound channel must get channel_failure; got {msg:?}"
+    );
+
+    // The connection MUST stay alive and the prior BOUND sessions MUST
+    // still work: run the first step of the worker-protocol handshake on
+    // chans[0] and observe the gateway's reply on the same channel. A
+    // regression to kill-connection makes this `data()` send fail or the
+    // reply never arrive.
+    assert!(
+        !session.is_closed(),
+        "an over-bound open must NOT terminate the connection"
+    );
+    let live = &mut chans[0];
+    live.data(&WORKER_MAGIC_1.to_le_bytes()[..]).await?;
+    let mut reply = Vec::new();
+    while reply.len() < 16 {
+        let msg = tokio::time::timeout(STEP, live.wait()).await.map_err(|_| {
+            anyhow::anyhow!(
+                "prior session must stay live after the over-bound rejection; \
+                     timed out waiting for its handshake reply ({} bytes so far)",
+                reply.len()
+            )
+        })?;
+        match msg {
+            Some(russh::ChannelMsg::Data { data }) => reply.extend_from_slice(&data),
+            Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => {
+                anyhow::bail!(
+                    "prior session was torn down by the over-bound rejection \
+                     (channel ended before its handshake reply)"
+                )
+            }
+            Some(_) => {}
+        }
+    }
+    assert_eq!(
+        u64::from_le_bytes(reply[0..8].try_into().unwrap()),
+        WORKER_MAGIC_2,
+        "prior session's handshake reply must be WORKER_MAGIC_2"
+    );
+    assert_eq!(
+        u64::from_le_bytes(reply[8..16].try_into().unwrap()),
+        PROTOCOL_VERSION,
+        "prior session's handshake reply must carry the protocol version"
+    );
+
+    drop(over);
+    drop(chans);
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.channel-limit+4]
+/// The hard backstop at 2×BOUND DOES terminate the connection: russh
+/// registers per-channel state for every accepted open and never frees it
+/// for a refused one, so accept-then-reject-at-exec alone would let a
+/// hostile client grow russh memory without bound. With the bound at 8:
+/// 2×BOUND opens are all confirmed (BOUND under-bound + BOUND over-bound),
+/// and the (2×BOUND+1)th open surfaces as a connection-level error — NOT
+/// `ChannelOpenFailure` — after which the connection is unusable.
+///
+/// Every await on the (dying) connection is bounded so a regression that
+/// leaves it half-alive fails the test instead of hanging it.
+#[tokio::test]
+async fn test_channel_open_hard_backstop_terminates_connection() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const BOUND: usize = 8;
+    const STEP: std::time::Duration = std::time::Duration::from_secs(10);
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_max_channels_per_connection(BOUND)).await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    // 2×BOUND opens are all confirmed: the first BOUND normally, the next
+    // BOUND as accept-then-reject-at-exec over-bound channels.
+    let mut chans = Vec::new();
+    for i in 0..(2 * BOUND) {
+        let ch = tokio::time::timeout(STEP, session.channel_open_session())
+            .await
+            .map_err(|_| anyhow::anyhow!("open #{i} did not resolve within {STEP:?}"))?
+            .unwrap_or_else(|e| {
+                panic!("open #{i} must be confirmed (hard backstop is 2×{BOUND}): {e:?}")
+            });
+        chans.push(ch);
+    }
+
+    // The (2×BOUND+1)th open trips the backstop: the gateway ends the SSH
+    // session rather than confirm the open, so the client sees the
+    // transport die — never the per-open `SSH_MSG_CHANNEL_OPEN_FAILURE`
+    // of a connection that stays usable.
     let over = tokio::time::timeout(STEP, session.channel_open_session())
         .await
-        .map_err(|_| anyhow::anyhow!("over-bound open did not resolve within {STEP:?}"))?;
+        .map_err(|_| anyhow::anyhow!("backstop open did not resolve within {STEP:?}"))?;
     assert!(
         over.is_err(),
-        "the over-bound open must fail, got a usable channel"
+        "the (2×BOUND+1)th open must fail, got a usable channel"
     );
     assert!(
         !matches!(over, Err(russh::Error::ChannelOpenFailure(_))),
-        "crossing the bound must terminate the connection, not refuse the single open \
+        "the hard backstop must terminate the connection, not refuse the single open \
          with SSH_MSG_CHANNEL_OPEN_FAILURE; got the per-open refusal: {over:?}"
     );
 
-    // The connection itself must be dead: the handler error ends russh's
-    // session loop, so the client observes the close shortly after. Poll
-    // bounded — Drop-side teardown runs strictly after the error.
+    // The connection itself must be dead.
     let mut closed = session.is_closed();
     for _ in 0..40 {
         if closed {
@@ -340,17 +453,7 @@ async fn test_channel_open_over_bound_terminates_connection() -> anyhow::Result<
     }
     assert!(
         closed,
-        "the connection must be torn down after an over-bound open, not stay usable"
-    );
-
-    // And nothing on it works any more — a further open on the same
-    // connection fails instead of being accepted into a freed slot.
-    let after = tokio::time::timeout(STEP, session.channel_open_session())
-        .await
-        .map_err(|_| anyhow::anyhow!("post-termination open did not resolve within {STEP:?}"))?;
-    assert!(
-        after.is_err(),
-        "an open after the connection was terminated must fail, got a usable channel"
+        "the connection must be torn down after the hard backstop, not stay usable"
     );
 
     drop(chans);

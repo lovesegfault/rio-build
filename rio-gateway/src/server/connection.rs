@@ -757,6 +757,18 @@ pub struct ConnectionHandler {
     /// `max_channels_per_connection` (only accepted opens insert; closes
     /// remove).
     pub(super) accepted_channels: std::collections::HashSet<ChannelId>,
+    /// Channel ids whose `channel_open_session` arrived with
+    /// `open_channels >= max_channels_per_connection`. They are ACCEPTED
+    /// at the SSH level (`Ok(true)`) so a stock OpenSSH mux master sees
+    /// `MUX_S_SESSION_OPENED` and never falls back to a corrupted direct
+    /// connection (`r[gw.conn.session-cap+2]`); the rejection is delivered
+    /// at `exec_request` instead. They are NOT in `accepted_channels` and
+    /// have NO entry in `channel_writers` (the channel handle is dropped
+    /// immediately, both halves), so they never reach the protocol path.
+    /// Bounded by `max_channels_per_connection` — `channel_open_session`
+    /// terminates the connection at `2 * max` total to keep russh-side
+    /// state bounded against a hostile spammer.
+    pub(super) over_bound_channels: std::collections::HashSet<ChannelId>,
     /// Window-aware write halves of accepted channels, split off in
     /// `channel_open_session` and held until the channel either execs
     /// (`exec_request` moves the half into the session's response pump —
@@ -1341,41 +1353,70 @@ impl Handler for ConnectionHandler {
         // burst of N opens with no execs is invisible to the session
         // map but still allocates a russh channel-table entry each.
         //
-        // Crossing the bound ends the CONNECTION (handler error ends
-        // russh's session loop), not just the offending open: russh
+        // Crossing the bound does NOT end the connection (it would drop
+        // up to 512 in-flight protocol sessions on the floor) and does
+        // NOT refuse the single open with `Ok(false)`/
+        // `SSH_MSG_CHANNEL_OPEN_FAILURE` (an OpenSSH mux master treats
+        // that as `MUX_S_REMOTE_ERROR` and the mux client falls back to
+        // a direct connection whose handshake is corrupted by
+        // `LocalCommand` — `r[gw.conn.session-cap+2]`). Instead, the
+        // open is ACCEPTED so the mux client sees `MUX_S_SESSION_OPENED`
+        // and the rejection is deferred to `exec_request`, which is the
+        // safe shed point for the same reason as the global session cap.
+        // The channel handle is dropped immediately (no write half kept,
+        // no `accepted_channels` entry, no `open_channels` increment) so
+        // the only per-channel cost is the russh table entry; the id is
+        // recorded in `over_bound_channels` for the exec-time refusal
+        // and `channel_close` cleanup.
+        //
+        // A per-open `Ok(false)` would also leak russh-side state: russh
         // allocates the channel's state (an eager mpsc plus window ref)
         // before consulting this handler, inserts it into its
         // per-connection channel map for any non-error result, and
         // never removes that entry for a refused open — the client
         // sends no CHANNEL_CLOSE for an open that failed, and russh's
-        // open-failure removal only covers server-initiated opens — so
-        // a per-open `Ok(false)` refusal lets an over-bound client keep
-        // looping CHANNEL_OPENs and grow per-connection memory without
-        // bound, defeating the bound itself. Erroring out is the only
-        // response that keeps russh-side state bounded: nothing is
-        // inserted for this open, and the connection unwinds through
-        // the normal drop paths (conn permit/fd/gauges, per-channel
-        // tasks, session permits), surfacing via the accept-site
-        // `log_session_end`. A connection at this bound is already
-        // leaking channels or hostile — legitimate ControlMaster
-        // fan-out sits far below it (a 128-core CI box running
-        // nix-fast-build behind one mux is ~128 channels, ~4×
-        // headroom), so the corrupted-fallback concern that argues for
-        // polite per-open handling of stock nix clients does not apply
-        // here.
+        // open-failure removal only covers server-initiated opens. The
+        // accept-then-reject-at-exec path keeps russh state bounded by
+        // the hard backstop below: at `2 * max` total open channels
+        // (under-bound + over-bound) the connection IS terminated — a
+        // client that gets there is hostile or badly leaking, not a
+        // legitimate ControlMaster fan-out (a 128-core CI box running
+        // nix-fast-build behind one mux is ~128 channels, ~4× under the
+        // soft bound).
         if self.open_channels >= self.max_channels_per_connection {
+            if self.open_channels + self.over_bound_channels.len()
+                >= 2 * self.max_channels_per_connection
+            {
+                warn!(
+                    peer = ?self.peer_addr,
+                    open = self.open_channels,
+                    over_bound = self.over_bound_channels.len(),
+                    limit = self.max_channels_per_connection,
+                    "closing SSH connection: per-connection channel hard backstop (2×bound) exceeded"
+                );
+                metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit")
+                    .increment(1);
+                anyhow::bail!(
+                    "per-connection channel hard backstop exceeded ({} open + {} over-bound, limit 2×{})",
+                    self.open_channels,
+                    self.over_bound_channels.len(),
+                    self.max_channels_per_connection
+                );
+            }
             warn!(
                 peer = ?self.peer_addr,
+                channel = ?channel_id,
                 open = self.open_channels,
                 limit = self.max_channels_per_connection,
-                "closing SSH connection: per-connection channel bound exceeded"
+                "per-connection channel bound exceeded; accepting open, will reject at exec"
             );
             metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit").increment(1);
-            anyhow::bail!(
-                "per-connection channel bound exceeded ({} open, limit {})",
-                self.open_channels,
-                self.max_channels_per_connection
-            );
+            self.over_bound_channels.insert(channel_id);
+            // Drop both halves — no protocol path for this channel. The
+            // russh table entry stays until the client (or our
+            // exec-time `reject_exec`) closes it.
+            drop(channel);
+            return Ok(true);
         }
         self.note_channel_accepted(channel_id);
         // Keep the channel's window-aware write half: it is what the
@@ -1462,6 +1503,24 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // r[impl gw.conn.channel-limit+4]
+        // r[impl gw.conn.session-cap+2]
+        // The over-bound open was accepted only so the mux client would
+        // see `MUX_S_SESSION_OPENED`; THIS is where it is refused — a
+        // clean `channel_failure` + exit-status 1, same as the global
+        // session cap below. Checked before everything else (including
+        // the `accepted_channels` gate, which would also reject it but
+        // with the wrong reason logged) and before `session_sem` so the
+        // refusal costs no permit.
+        if self.over_bound_channels.contains(&channel_id) {
+            warn!(
+                peer = ?self.peer_addr,
+                channel = ?channel_id,
+                "rejecting exec request: channel was opened over the per-connection bound"
+            );
+            return reject_exec(session, channel_id);
+        }
+
         let Ok(command) = String::from_utf8(data.to_vec()) else {
             warn!(channel = ?channel_id, "rejecting exec request: command is not valid UTF-8");
             return reject_exec(session, channel_id);
@@ -1711,6 +1770,12 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         // r[impl gw.conn.channel-limit+4]
+        // Over-bound channels are tracked only in `over_bound_channels`
+        // (no `accepted_channels`/`open_channels`/`channel_writers`
+        // entry); a close for one is pure set removal.
+        if self.over_bound_channels.remove(&channel) {
+            return Ok(());
+        }
         // Only act on closes for channels this connection actually
         // accepted (see note_channel_closed): russh hands us a close for
         // any id the peer claims, and trusting it would let forged or
