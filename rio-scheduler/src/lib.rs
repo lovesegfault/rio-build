@@ -166,6 +166,13 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_scheduler_pull_outcome_flush_batch_size",
         PULL_OUTCOME_FLUSH_BATCH_SIZE_BUCKETS,
     ),
+    (
+        "rio_scheduler_mergedag_coalesce_batch_size",
+        // 1/2/4/8/16/32 = MERGE_PERSIST_BATCH_MAX. The le=1 mass is
+        // the N=1 fast path (single-merge, no batching gain); le≥8 is
+        // where the phase-5 round-trip amortization is material.
+        &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -209,6 +216,13 @@ pub fn describe_metrics() {
          trigger measured N̄≈5.5). The sh-007c S6 O(1)-PG-per-flush \
          amortization scales with this; a sustained le=5 mass means \
          the 250ms deadline window is not coalescing."
+    );
+    describe_histogram!(
+        "rio_scheduler_mergedag_coalesce_batch_size",
+        "Count of MergeDag commands drained per flush_pending_merges pass \
+         (P2 phase-5 coalesce). The le=1 bucket is the bit-identical \
+         single-merge fast path; le≥8 is where the per-merge ~13-round-trip \
+         persist transaction amortizes into one fenced batch tx."
     );
     describe_histogram!(
         "rio_scheduler_merge_phase_seconds",

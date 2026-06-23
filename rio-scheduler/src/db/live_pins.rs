@@ -1673,7 +1673,10 @@ mod registration_writer_census {
         // Family B: &mut borrows through the state path.
         let borrows = census(&["&mut state.sched.", "resource_floor"]);
         let expected_borrows: BTreeMap<String, usize> = [
-            ("actor/merge.rs".to_string(), 1),
+            // 2: persist_merge_to_db (single-merge) +
+            // persist_prepared_batch (P2 batched) — same
+            // hydrate-then-clamp head, two persist paths.
+            ("actor/merge.rs".to_string(), 2),
             ("actor/floor.rs".to_string(), 1),
         ]
         .into();

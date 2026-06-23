@@ -656,6 +656,29 @@ pub struct DagActor {
     /// satisfy the exhaustive destructure; the drain runs in
     /// `handle_leader_lost` BEFORE the wipe.
     pending_pull_outcomes: Vec<pull::PendingReport>,
+    /// P2 (phase-5 coalesce): queued `ActorCommand::MergeDag`
+    /// commands — request AND reply — held between
+    /// [`Self::handle_merge_dag_intake`]'s push and the
+    /// [`Self::flush_pending_merges`] that runs every per-merge phase
+    /// 0-4/6+ serially with phase-5 PG persist coalesced into ONE
+    /// fenced transaction. The structural backpressure fix: 256 merges
+    /// × 197ms phase-5 (65% of MergeDag cost) was the chokepoint
+    /// three estimator iterations (P1/P1′) tuned around; coalescing
+    /// the per-merge ~13-round-trip persist tx into one batch tx cuts
+    /// the burst's actor-occupied time toward the ~27s non-PG floor,
+    /// keeping the cost-axis below the 30s threshold so the gate
+    /// reverts to a never-engages safety valve. Leader-scoped:
+    /// `handle_leader_lost` DRAINS with `Err(NotLeader)` (never
+    /// `clear()` — the gateway's retry loop re-submits to the new
+    /// leader). Same `pending_pull_outcomes` discipline.
+    pending_merges: Vec<merge::PendingMerge>,
+    /// P2 flush trigger (iv): the
+    /// [`MERGE_PERSIST_FLUSH_DEADLINE`](merge::MERGE_PERSIST_FLUSH_DEADLINE)
+    /// (50ms) select! arm — bounds SubmitBuild reply latency for
+    /// sub-BATCH_MAX inbound rates. Same `MissedTickBehavior::Delay`
+    /// and `reset()` on empty→nonempty discipline as
+    /// `pull_flush_deadline`.
+    merge_flush_deadline: tokio::time::Interval,
     /// sh-027 §3, flush trigger (iv): the
     /// [`REPORT_OUTCOME_FLUSH_DEADLINE`](pull::REPORT_OUTCOME_FLUSH_DEADLINE)
     /// (250ms) select! arm — bounds ack latency for sub-BATCH_MAX
@@ -1261,6 +1284,12 @@ impl DagActor {
                 iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 iv
             },
+            pending_merges: Vec::new(),
+            merge_flush_deadline: {
+                let mut iv = tokio::time::interval(merge::MERGE_PERSIST_FLUSH_DEADLINE);
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                iv
+            },
             pending_walk_completed: Vec::new(),
             status_outbox: std::collections::VecDeque::new(),
             db,
@@ -1445,6 +1474,12 @@ impl DagActor {
             // `handle_report_outcome` resets it on the next first
             // push regardless.
             pull_flush_deadline: _,
+            // Retained: same drain-with-NotLeader-before-wipe
+            // discipline as `pending_pull_outcomes` (Hazard L);
+            // `handle_merge_dag_intake`'s inline `is_leader()` gate
+            // means a standby/mid-acquire never pushed.
+            pending_merges: _,
+            merge_flush_deadline: _,
             // Retained: flush-scoped (always empty between flushes;
             // `flush_pending_pull_outcomes` and `handle_leader_lost`
             // both `debug_assert!` it).
@@ -1779,6 +1814,21 @@ impl DagActor {
                     self.flush_pending_pull_outcomes().await;
                     continue;
                 }
+                // P2 flush trigger (iv): same placement-after-rx +
+                // guard + reset-on-first-push discipline as the
+                // pull_flush_deadline arm above. The flush IS
+                // MergeDag-class work, so feed `note_turn_cost` (the
+                // queued-intake MergeDag turns themselves are now ~µs
+                // and would otherwise decay the EWMA to zero while
+                // real merge work piles up here).
+                _ = self.merge_flush_deadline.tick(),
+                    if !self.pending_merges.is_empty() =>
+                {
+                    let t = Instant::now();
+                    self.flush_pending_merges().await;
+                    self.note_turn_cost(t.elapsed());
+                    continue;
+                }
             };
             consecutive_fast = 0;
 
@@ -1806,22 +1856,15 @@ impl DagActor {
 
             match cmd {
                 ActorCommand::MergeDag { req, reply } => {
-                    let build_id = req.build_id;
-                    let result = self.handle_merge_dag(req).await;
-                    // If the reply channel was dropped (client disconnected during
-                    // merge), the build is orphaned. Cancel it immediately.
-                    if reply.send(result).is_err() {
-                        warn!(
-                            build_id = %build_id,
-                            "MergeDag reply receiver dropped, cancelling orphaned build"
-                        );
-                        if let Err(e) = self
-                            .handle_cancel_build(build_id, None, "client_disconnect_during_merge")
-                            .await
-                        {
-                            error!(build_id = %build_id, error = %e, "failed to cancel orphaned build");
-                        }
-                    }
+                    // P2: queue for batched phase-5 persist. The reply
+                    // (and the orphan-cancel-on-drop) fire from
+                    // `flush_pending_merges` after the batch tx
+                    // commits. The eager-flush trigger (i) inside
+                    // intake means a full-batch flush's cost is
+                    // attributed to THIS turn → `note_turn_cost`
+                    // below sees it; the deadline-arm flush feeds
+                    // `note_turn_cost` itself.
+                    self.handle_merge_dag_intake(req, reply).await;
                 }
                 ActorCommand::ProcessCompletion {
                     executor_id,

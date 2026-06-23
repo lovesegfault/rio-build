@@ -6605,8 +6605,11 @@ fn stale_solve_revalidation_call_site_censuses() {
     );
     assert_eq!(
         count(merge_src, "clamp_floor_to_live"),
-        1,
-        "the hydrate seam applies the in-place clamp law exactly once"
+        2,
+        "the hydrate seam applies the in-place clamp law exactly once \
+         per persist path (persist_merge_to_db single-merge + \
+         persist_prepared_batch P2-batched — same hydrate-then-clamp \
+         head, two phase-5 entry points)"
     );
     assert!(
         prod(floor_src).contains("pub(super) fn clamp_floor_to_live"),

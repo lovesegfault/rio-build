@@ -200,6 +200,10 @@ impl DagActor {
         // misattributed to the estimator phase; the per-phase budget
         // WARN (S2's defense-in-depth) wraps it once that lands.
         self.flush_pending_pull_outcomes().await;
+        // P2 flush trigger (ii): drain any merges queued since the
+        // last flush — defense-in-depth behind trigger (iv) (the 50ms
+        // MERGE_PERSIST_FLUSH_DEADLINE select! arm).
+        self.flush_pending_merges().await;
         // Per-phase attribution (round-9 dossier B2 — the merge.rs
         // `phase!` pattern verbatim, leader-only by the early-return
         // above). live_053's 134.65s Tick was log-silent for its

@@ -292,6 +292,34 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Multi-build form of [`Self::batch_insert_build_derivations`] —
+    /// `(build_id, derivation_id)` pairs from N merges in one round-trip
+    /// (P2 phase-5 coalesce). Two parallel-array binds; same `ON
+    /// CONFLICT DO NOTHING` so a shared derivation linked by two builds
+    /// in one batch is benign.
+    pub(crate) async fn batch_insert_build_derivations_multi(
+        tx: &mut PgConnection,
+        pairs: &[(Uuid, Uuid)],
+    ) -> Result<(), sqlx::Error> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let builds: Vec<Uuid> = pairs.iter().map(|(b, _)| *b).collect();
+        let drvs: Vec<Uuid> = pairs.iter().map(|(_, d)| *d).collect();
+        sqlx::query(
+            r#"
+            INSERT INTO build_derivations (build_id, derivation_id)
+            SELECT b, d FROM UNNEST($1::uuid[], $2::uuid[]) AS t(b, d)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(&builds)
+        .bind(&drvs)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
     // r[impl sched.db.merge-batch-shape]
     /// Batch-insert edges. Same `COPY → ON COMMIT DROP temp →
     /// INSERT … SELECT … ON CONFLICT DO NOTHING` shape as

@@ -1025,6 +1025,14 @@ impl DagActor {
         for super::pull::PendingReport { reply, .. } in self.pending_pull_outcomes.drain(..) {
             let _ = reply.send(Err(super::pull::PullRejection::NotLeader));
         }
+        // P2 flush trigger (iii): same Hazard-L drain for queued
+        // merges. Nothing was merged in-memory yet (intake is just
+        // `Vec::push`), so no `cleanup_failed_merge` needed — only
+        // the reply, so the gateway's retry loop re-submits to the
+        // successor.
+        for super::merge::PendingMerge { reply, .. } in self.pending_merges.drain(..) {
+            let _ = reply.send(Err(super::ActorError::NotLeader));
+        }
         debug_assert!(
             self.pending_walk_completed.is_empty(),
             "pending_walk_completed is flush-scoped — a non-empty vec \

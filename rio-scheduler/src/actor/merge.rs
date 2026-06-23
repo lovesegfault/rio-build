@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -17,6 +18,37 @@ use crate::state::{
 };
 
 use super::{ActorError, DagActor, MergeDagRequest};
+
+/// P2 (phase-5 coalesce): the actor batches at most this many queued
+/// `MergeDag` commands per [`DagActor::flush_pending_merges`] pass.
+/// Chosen so a full batch's deduped node set stays well within the
+/// `batch_upsert_derivations` COPY sub-second envelope (sh-036's 14k
+/// nodes ≈ ~30 nix-fast-build-scale submissions).
+pub(super) const MERGE_PERSIST_BATCH_MAX: usize = 32;
+
+/// P2 flush trigger (iv): a queued merge persists at most this long
+/// after the FIRST push of its batch. SubmitBuild is a synchronous RPC
+/// the gateway is awaiting, so this is an order of magnitude tighter
+/// than `REPORT_OUTCOME_FLUSH_DEADLINE` — at the 256-merge burst's
+/// observed ~800/s arrival a 50 ms window coalesces ~40, capped at
+/// `MERGE_PERSIST_BATCH_MAX`. Short in tests so single-merge sites do
+/// not each wait 50 ms.
+#[cfg(not(test))]
+pub(super) const MERGE_PERSIST_FLUSH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(50);
+#[cfg(test)]
+pub(super) const MERGE_PERSIST_FLUSH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(10);
+
+/// One queued `ActorCommand::MergeDag` — request and reply, held
+/// between intake and the [`DagActor::flush_pending_merges`] that runs
+/// every per-merge phase 0-4/6+ serially with phase-5 PG persist
+/// coalesced into one fenced transaction.
+#[derive(Debug)]
+pub(super) struct PendingMerge {
+    pub(super) req: MergeDagRequest,
+    pub(super) reply: oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>,
+}
 
 /// sh-036.1 red-first witness: incremented at
 /// [`DagActor::find_missing_with_breaker`] entry. With
@@ -77,6 +109,49 @@ pub(super) struct MergeIngest {
     pub precomputed_probe: Option<Result<FindMissingPathsResponse, tonic::Status>>,
 }
 
+/// Phases 0–4 output, ready for the (possibly batched) phase-5
+/// persist. Carries every input `persist_and_activate` /
+/// `persist_prepared_batch` reads PLUS every field `MergeIngest` needs
+/// for phase 6+; `created_jobs` (the only phase-5 OUTPUT that crosses
+/// into phase 6) is filled in by the persist call.
+pub(super) struct PreparedMerge {
+    pub build_id: Uuid,
+    pub tenant_id: Option<Uuid>,
+    pub nodes: Vec<crate::domain::DerivationNode>,
+    pub edges: Vec<crate::domain::DerivationEdge>,
+    pub merge_result: crate::dag::MergeResult,
+    pub pruned_closure_parents: HashSet<String>,
+    pub new_sub_lane: Vec<DrvHash>,
+    pub reprobe_sub_lane: Vec<DrvHash>,
+    pub event_rx: super::BuildEventReceivers,
+    pub existing_reprobe: HashSet<DrvHash>,
+    pub cached_hits: HashMap<DrvHash, Vec<String>>,
+    pub pending_substitute: Vec<(DrvHash, Vec<String>)>,
+    pub jwt_token: Option<String>,
+    pub precomputed_probe: Option<Result<FindMissingPathsResponse, tonic::Status>>,
+    /// Filled by phase 5 (`persist_and_activate` /
+    /// `persist_prepared_batch`); empty until then.
+    pub created_jobs: Vec<super::materialize::CreatedJob>,
+}
+
+impl From<PreparedMerge> for MergeIngest {
+    fn from(p: PreparedMerge) -> Self {
+        Self {
+            build_id: p.build_id,
+            edges_len: p.edges.len(),
+            nodes: p.nodes,
+            merge_result: p.merge_result,
+            event_rx: p.event_rx,
+            existing_reprobe: p.existing_reprobe,
+            cached_hits: p.cached_hits,
+            pending_substitute: p.pending_substitute,
+            created_jobs: p.created_jobs,
+            jwt_token: p.jwt_token,
+            precomputed_probe: p.precomputed_probe,
+        }
+    }
+}
+
 /// Output of [`DagActor::reconcile_merged_state`].
 pub(super) struct MergeReconcile {
     pub cached_count: u32,
@@ -117,6 +192,20 @@ impl DagActor {
         // transition reject) live here. After this returns Ok the build is
         // committed; later DB errors are log-and-continue.
         let ingest = self.validate_and_ingest(req).await?;
+        Ok(self.finish_merge_dag(ingest, t_total).await)
+    }
+
+    /// Phases 6+ of merge: post-Active reconciliation, count update,
+    /// `BuildStarted`/`InputsResolved` emit, completion check, dispatch
+    /// sweep. The build is committed (Active in PG) before this runs;
+    /// every DB write here is log-and-continue. Extracted from
+    /// `handle_merge_dag` so the P2 batched-flush path can run phase 5
+    /// for N merges in one transaction, then this per-merge.
+    async fn finish_merge_dag(
+        &mut self,
+        ingest: MergeIngest,
+        t_total: Instant,
+    ) -> super::BuildEventReceivers {
         let build_id = ingest.build_id;
         let total_derivations = ingest.nodes.len() as u32;
 
@@ -193,7 +282,7 @@ impl DagActor {
                 .get(&build_id)
                 .is_some_and(|b| b.state().is_terminal())
             {
-                return Ok(ingest.event_rx);
+                return ingest.event_rx;
             }
         }
 
@@ -234,7 +323,517 @@ impl DagActor {
             "handle_merge_dag total"
         );
 
-        Ok(ingest.event_rx)
+        ingest.event_rx
+    }
+
+    // -----------------------------------------------------------------------
+    // P2: phase-5 coalesce — intake / flush
+    // -----------------------------------------------------------------------
+
+    /// Handle one `ActorCommand::MergeDag` (the actor turn): queue it on
+    /// [`Self::pending_merges`] and — when the batch cap is reached —
+    /// drain via [`Self::flush_pending_merges`]. The reply is sent only
+    /// after the flush's batched phase-5 transaction commits AND the
+    /// per-merge phase-6 reconcile completes (the same
+    /// reply-after-durable contract `handle_merge_dag` always had —
+    /// `cleanup_failed_merge` is the rollback if the batch tx fails).
+    ///
+    /// Flush triggers (mirrors [`Self::handle_report_outcome`]):
+    /// (i) `len ≥ MERGE_PERSIST_BATCH_MAX` here; (ii) `handle_tick`
+    /// head; (iii) `handle_leader_lost` (drains with `NotLeader`);
+    /// (iv) the [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm.
+    pub(super) async fn handle_merge_dag_intake(
+        &mut self,
+        req: MergeDagRequest,
+        reply: oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>,
+    ) {
+        // No leader gate: a standby DOES merge (r[sched.lease.k8s-lease+2]
+        // — "DAGs are still merged so state is warm for takeover"). The
+        // deposed-believer window is fenced at phase-5 commit (the
+        // claims-floor re-check), same as the pre-P2 inline path.
+        //
+        // sh-027 §3 idiom (s3-interval-reset): the deadline arm's guard
+        // is `!pending.is_empty()`; while idle the Interval is unpolled
+        // and goes stale, so the FIRST queue after any idle gap >50ms
+        // would re-enable a guard with an immediately-Ready tick →
+        // flushes at N=1. Reset on the empty→nonempty edge.
+        if self.pending_merges.is_empty() {
+            self.merge_flush_deadline.reset();
+        }
+        self.pending_merges.push(PendingMerge { req, reply });
+        if self.pending_merges.len() >= MERGE_PERSIST_BATCH_MAX {
+            self.flush_pending_merges().await;
+        }
+    }
+
+    /// Drain [`Self::pending_merges`]: per-merge phases 0-4, ONE fenced
+    /// phase-5 PG transaction for the whole batch
+    /// ([`Self::persist_prepared_batch`]), per-merge phase 6+, then
+    /// reply. The N=1 fast path is the unmodified pre-P2
+    /// `handle_merge_dag` so single-merge behaviour (and every test
+    /// site that exercises it) is bit-identical.
+    ///
+    /// Reply-after-durable: every reply is sent strictly after the
+    /// batched persist commits (or, on a per-merge phase-0-4 rejection,
+    /// immediately with `Err` and no in-mem residue). A batch-tx
+    /// failure rolls back every prepared merge in REVERSE order
+    /// (`cleanup_failed_merge` consumes `MergeResult` to re-insert
+    /// `removed_retriable`; later merges' `dag.merge` ran on top of
+    /// earlier ones, so unwind order matters) and replies `Err` to
+    /// each — the gateway's `is_retryable_refusal_code` retries.
+    pub(super) async fn flush_pending_merges(&mut self) {
+        if self.pending_merges.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.pending_merges);
+        metrics::histogram!("rio_scheduler_mergedag_coalesce_batch_size")
+            .record(batch.len() as f64);
+
+        // N=1 fast path: bit-identical to pre-P2 (and to every direct
+        // `handle_merge_dag` test caller).
+        if batch.len() == 1 {
+            let PendingMerge { req, reply } = batch.into_iter().next().unwrap();
+            let build_id = req.build_id;
+            let result = self.handle_merge_dag(req).await;
+            self.send_merge_reply(build_id, reply, result).await;
+            return;
+        }
+
+        // Phases 0-4 per merge (serial). A per-merge rejection
+        // (cycle, breaker open, insert_build PG error) replies `Err`
+        // here and is excluded from the persist batch — its in-mem
+        // state is already rolled back inside `prepare_merge_persist`.
+        // Ordering: prepared[i+1]'s `dag.merge` runs on top of
+        // prepared[i]'s `newly_inserted` — exactly the dedup the
+        // serial pre-P2 path produced (r[sched.merge.dedup]).
+        let mut prepared: Vec<(
+            PreparedMerge,
+            oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>,
+        )> = Vec::with_capacity(batch.len());
+        for PendingMerge { req, reply } in batch {
+            let t = Instant::now();
+            match self.prepare_merge_persist(req).await {
+                Ok(p) => prepared.push((p, reply)),
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+            metrics::histogram!(
+                "rio_scheduler_merge_phase_seconds",
+                "phase" => "0to4-prepare-batched"
+            )
+            .record(t.elapsed().as_secs_f64());
+        }
+        if prepared.is_empty() {
+            return;
+        }
+
+        // Phase 5: ONE fenced transaction for the whole batch.
+        let t_persist = Instant::now();
+        if let Err(e) = self.persist_prepared_batch(&mut prepared).await {
+            error!(
+                error = %e, batch = prepared.len(),
+                "batched phase-5 persist failed; rolling back every prepared merge"
+            );
+            // Reverse-order rollback: later merges layered on earlier
+            // ones in `self.dag`; rollback_merge expects to remove only
+            // its own `newly_inserted` and re-insert its own
+            // `removed_retriable`.
+            let msg = e.to_string();
+            let retryable = matches!(
+                e,
+                ActorError::StaleGeneration { .. } | ActorError::NotLeader
+            );
+            for (p, reply) in prepared.into_iter().rev() {
+                self.cleanup_failed_merge(p.build_id, p.merge_result).await;
+                // ActorError is not Clone (sqlx::Error). The
+                // batch-level failure modes are sqlx / StaleGeneration
+                // / MissingDbId — propagate the retryable ones
+                // verbatim, fold the rest into Database (the gateway's
+                // retry guard keys on UNAVAILABLE/RESOURCE_EXHAUSTED;
+                // a batch sqlx error is terminal either way).
+                let per = if retryable {
+                    ActorError::NotLeader
+                } else {
+                    ActorError::Database(sqlx::Error::Protocol(msg.clone()))
+                };
+                let _ = reply.send(Err(per));
+            }
+            return;
+        }
+        metrics::histogram!(
+            "rio_scheduler_merge_phase_seconds",
+            "phase" => "5-persist-and-activate-batched"
+        )
+        .record(t_persist.elapsed().as_secs_f64());
+
+        // Phase 6+ per merge, then reply. Every build is now
+        // Active+committed; DB writes here are log-and-continue.
+        for (p, reply) in prepared {
+            let build_id = p.build_id;
+            self.note_created_materialization_jobs(&p.created_jobs)
+                .await;
+            let t = Instant::now();
+            let rx = self.finish_merge_dag(p.into(), t).await;
+            self.send_merge_reply(build_id, reply, Ok(rx)).await;
+        }
+    }
+
+    /// Send a `MergeDag` reply; on receiver-dropped (gateway gave up
+    /// while the merge was queued/running), cancel the now-orphaned
+    /// build. Extracted from the run-loop `MergeDag` arm so the flush's
+    /// N=1 and N>1 paths share the orphan-cancel.
+    async fn send_merge_reply(
+        &mut self,
+        build_id: Uuid,
+        reply: oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>,
+        result: Result<super::BuildEventReceivers, ActorError>,
+    ) {
+        let was_ok = result.is_ok();
+        if reply.send(result).is_err() && was_ok {
+            warn!(
+                build_id = %build_id,
+                "MergeDag reply receiver dropped, cancelling orphaned build"
+            );
+            if let Err(e) = self
+                .handle_cancel_build(build_id, None, "client_disconnect_during_merge")
+                .await
+            {
+                error!(build_id = %build_id, error = %e, "failed to cancel orphaned build");
+            }
+        }
+    }
+
+    /// Phase-5 PG persist for N prepared merges in ONE fenced
+    /// transaction (P2 — the structural backpressure fix). The
+    /// expensive per-merge round-trips coalesce: derivation upsert
+    /// (deduped across merges — same `drv_hash` ⇒ same `.drv` content,
+    /// so first-row-wins), build_derivation links, edges, wanted,
+    /// activation each become ONE call; job creation, poison clear,
+    /// resubmit-reset ledger and post-commit hydration stay per-merge
+    /// (small / rare; the batch already captures the ~13N→~O(N₀)
+    /// round-trip reduction the chokepoint analysis targeted).
+    ///
+    /// On `Err` NOTHING is committed (the fenced tx aborts) and no
+    /// in-memory state is touched — the caller rolls back every
+    /// prepared merge via `cleanup_failed_merge`.
+    ///
+    /// On `Ok` every prepared merge is Active in PG; per-merge
+    /// `created_jobs` is populated, db_id/floor hydrated,
+    /// `BuildInfo→Active` applied, and the best-effort
+    /// `record_resubmit_resets` run.
+    #[allow(clippy::too_many_lines)]
+    async fn persist_prepared_batch(
+        &mut self,
+        prepared: &mut [(
+            PreparedMerge,
+            oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>,
+        )],
+    ) -> Result<(), ActorError> {
+        debug_assert!(
+            prepared.len() > 1,
+            "N=1 takes the handle_merge_dag fast path"
+        );
+        let serving_generation = self.serving_generation();
+        let mut tx = match self.db.begin_fenced(serving_generation).await? {
+            crate::db::FencedBegin::Fenced { floor } => {
+                self.note_fenced_evidence_write("merge transaction (begin-time check, batched)");
+                return Err(ActorError::StaleGeneration {
+                    serving: serving_generation.as_i64(),
+                    floor,
+                });
+            }
+            crate::db::FencedBegin::Open(ftx) => ftx,
+        };
+
+        // ─── Batch 1: derivation upsert ───────────────────────────
+        // Dedup by drv_hash across the whole batch: PG's
+        // `ON CONFLICT DO UPDATE … cannot affect row a second time`
+        // rejects an in-batch duplicate, and the row contents are
+        // hash-determined so first-wins is correct. The `status`
+        // column reads `self.dag` — every prepared merge's
+        // `dag.merge` already ran (phases 0-4), so newly-inserted
+        // membership and existing-node status are consistent.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut node_rows: Vec<crate::db::DerivationRow> = Vec::new();
+        for (p, _) in prepared.iter() {
+            for node in &p.nodes {
+                if !seen.insert(node.drv_hash.as_str()) {
+                    continue;
+                }
+                let status = if p
+                    .merge_result
+                    .newly_inserted
+                    .contains(node.drv_hash.as_str())
+                {
+                    DerivationStatus::Created
+                } else if let Some(state) = self.dag.node(&node.drv_hash) {
+                    state.status()
+                } else {
+                    DerivationStatus::Created
+                };
+                node_rows.push(crate::db::DerivationRow {
+                    drv_hash: node.drv_hash.clone(),
+                    drv_path: node.drv_path.clone(),
+                    pname: (!node.pname.is_empty()).then(|| node.pname.clone()),
+                    system: node.system.clone(),
+                    status,
+                    required_features: node.required_features.clone(),
+                    expected_output_paths: node.expected_output_paths.clone(),
+                    output_names: node.output_names.clone(),
+                    is_fixed_output: node.is_fixed_output,
+                    is_ca: node.is_content_addressed,
+                });
+            }
+        }
+        let total_node_rows = node_rows.len();
+        let id_map =
+            crate::db::SchedulerDb::batch_upsert_derivations(tx.conn(), &node_rows).await?;
+        drop(node_rows);
+        drop(seen);
+
+        // ─── Batch 2/3/4/5: links, edges, activation, wanted ──────
+        let mut all_links: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut all_edges: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut build_ids: Vec<Uuid> = Vec::with_capacity(prepared.len());
+        let mut all_wanted: Vec<crate::db::wanted::WantedRow<'_>> = Vec::new();
+        for (p, _) in prepared.iter() {
+            build_ids.push(p.build_id);
+            let path_to_hash: HashMap<&str, &str> = p
+                .nodes
+                .iter()
+                .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
+                .collect();
+            let resolve = |drv_path: &str| -> Option<Uuid> {
+                path_to_hash
+                    .get(drv_path)
+                    .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
+                    .or_else(|| self.dag.db_id_for_path(drv_path))
+            };
+            for node in &p.nodes {
+                if let Some((id, _)) = id_map.get(node.drv_hash.as_str()) {
+                    all_links.push((p.build_id, *id));
+                    all_wanted.push(crate::db::wanted::WantedRow {
+                        build_id: p.build_id,
+                        derivation_id: *id,
+                        wanted_output_names: &node.wanted_output_names,
+                    });
+                }
+            }
+            for e in &p.edges {
+                let parent =
+                    resolve(&e.parent_drv_path).ok_or_else(|| ActorError::MissingDbId {
+                        drv_path: e.parent_drv_path.clone(),
+                    })?;
+                let child = resolve(&e.child_drv_path).ok_or_else(|| ActorError::MissingDbId {
+                    drv_path: e.child_drv_path.clone(),
+                })?;
+                all_edges.push((parent, child));
+            }
+        }
+        crate::db::SchedulerDb::batch_insert_build_derivations_multi(tx.conn(), &all_links).await?;
+        crate::db::SchedulerDb::batch_insert_edges(tx.conn(), &all_edges).await?;
+        crate::db::SchedulerDb::activate_builds_tx(tx.conn(), &build_ids).await?;
+        crate::db::SchedulerDb::record_wanted_in_tx(tx.conn(), &all_wanted).await?;
+        drop(all_links);
+        drop(all_edges);
+        drop(all_wanted);
+
+        // ─── Batch 6: job creation + AS-5 reset ────────────────────
+        // Per-merge job-row construction (the pruned/new_sub/reprobe
+        // lane logic from `persist_merge_to_db` Batch 5), concatenated
+        // into ONE `create_materialization_jobs_in_tx`. Owned drv_hash
+        // strings: `NewJobRow` borrows `&str`, and the per-merge lanes
+        // it borrows from would otherwise be three disjoint lifetimes.
+        let mut job_specs: Vec<(Uuid, String, Option<Uuid>, crate::state::JobOrigin)> = Vec::new();
+        let mut job_spans: Vec<usize> = Vec::with_capacity(prepared.len());
+        let mut all_reset_hashes: Vec<DrvHash> = Vec::new();
+        let mut all_reset_rows: Vec<crate::db::attempts::AttemptRow> = Vec::new();
+        for (p, _) in prepared.iter() {
+            let start = job_specs.len();
+            let mut queued: HashSet<String> = HashSet::new();
+            for node in &p.nodes {
+                if p.pruned_closure_parents.contains(node.drv_hash.as_str())
+                    && let Some((db_id, _)) = id_map.get(node.drv_hash.as_str())
+                    && crate::db::SchedulerDb::classify_durable_evidence_in_tx(tx.conn(), *db_id)
+                        .await?
+                        != rio_evidence_kernel::ClosureEvidence::Vouched
+                {
+                    queued.insert(node.drv_hash.clone());
+                    job_specs.push((
+                        *db_id,
+                        node.drv_hash.clone(),
+                        p.tenant_id,
+                        crate::state::JobOrigin::Pruned,
+                    ));
+                }
+            }
+            for h in &p.new_sub_lane {
+                if !queued.contains(h.as_str())
+                    && let Some((db_id, _)) = id_map.get(h.as_str())
+                {
+                    queued.insert(h.as_str().to_owned());
+                    job_specs.push((
+                        *db_id,
+                        h.as_str().to_owned(),
+                        p.tenant_id,
+                        crate::state::JobOrigin::CacheOpportunity,
+                    ));
+                }
+            }
+            for h in &p.reprobe_sub_lane {
+                if !queued.contains(h.as_str())
+                    && let Some((db_id, _)) = id_map.get(h.as_str())
+                {
+                    job_specs.push((
+                        *db_id,
+                        h.as_str().to_owned(),
+                        p.tenant_id,
+                        crate::state::JobOrigin::Reprobe,
+                    ));
+                }
+                if self.dag.node(h).is_some_and(|s| {
+                    matches!(
+                        s.status(),
+                        DerivationStatus::Poisoned
+                            | DerivationStatus::DependencyFailed
+                            | DerivationStatus::Failed
+                    )
+                }) && let Some(mut row) = self.reset_row_for(
+                    h,
+                    crate::state::OutcomeClass::PoisonCleared,
+                    crate::state::ReportingParty::Scheduler,
+                ) {
+                    row.resubmit_cycle = 0;
+                    all_reset_rows.push(row);
+                    all_reset_hashes.push(h.clone());
+                }
+            }
+            job_spans.push(job_specs.len() - start);
+        }
+        let job_rows: Vec<crate::db::materialization::NewJobRow<'_>> = job_specs
+            .iter()
+            .map(
+                |(db_id, h, tenant, origin)| crate::db::materialization::NewJobRow {
+                    derivation_id: *db_id,
+                    drv_hash: h.as_str(),
+                    tenant_id: *tenant,
+                    origin: *origin,
+                    priority: 0.0,
+                    carried_realized_paths: None,
+                },
+            )
+            .collect();
+        let created = crate::db::SchedulerDb::create_materialization_jobs_in_tx(
+            tx.conn(),
+            &job_rows,
+            serving_generation.as_i64(),
+        )
+        .await?;
+        if !all_reset_hashes.is_empty() {
+            crate::db::SchedulerDb::clear_poison_batch_in_tx(tx.conn(), &all_reset_hashes).await?;
+            crate::db::SchedulerDb::append_attempts_batch(tx.conn(), &all_reset_rows).await?;
+        }
+        drop(job_rows);
+
+        // r[verify sched.db.tx-commit-before-mutate]
+        #[cfg(debug_assertions)]
+        for (p, _) in prepared.iter() {
+            for hash in &p.merge_result.newly_inserted {
+                if let Some(state) = self.dag.node(hash) {
+                    debug_assert!(
+                        state.db_id.is_none(),
+                        "newly-inserted node {hash} has db_id set before commit — \
+                         in-mem mutation leaked into tx scope"
+                    );
+                }
+            }
+        }
+
+        // r[impl sched.evidence.durability+4]
+        match tx.commit_refenced().await? {
+            crate::db::FencedCommit::Refenced { floor } => {
+                self.note_fenced_evidence_write("merge transaction (commit-time check, batched)");
+                return Err(ActorError::StaleGeneration {
+                    serving: serving_generation.as_i64(),
+                    floor,
+                });
+            }
+            crate::db::FencedCommit::Committed => {}
+        }
+
+        // ─── Post-commit per-merge ────────────────────────────────
+        // ANALYZE once for the batch (I-102).
+        if total_node_rows >= 500 {
+            let pool = self.db.pool().clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    sqlx::query("ANALYZE derivations, build_derivations, derivation_edges")
+                        .execute(&pool)
+                        .await
+                {
+                    warn!(error = %e, rows = total_node_rows,
+                          "post-merge ANALYZE failed (non-fatal; autovacuum will catch up)");
+                }
+            });
+        }
+        // Slice `created` back per-merge (input-order ⇔ result-order).
+        let mut created_iter = created.into_iter();
+        let mut spec_iter = job_specs.into_iter();
+        for ((p, _), span) in prepared.iter_mut().zip(job_spans) {
+            // db_id / floor hydration over THIS merge's nodes only
+            // (id_map is batch-global; restricting by p.nodes preserves
+            // the `newly_inserted.contains` floor-promotion guard).
+            for node in &p.nodes {
+                if let Some((db_id, floor)) = id_map.get(node.drv_hash.as_str())
+                    && let Some(state) = self.dag.node_mut(&node.drv_hash)
+                {
+                    state.db_id = Some(*db_id);
+                    if p.merge_result
+                        .newly_inserted
+                        .contains(node.drv_hash.as_str())
+                    {
+                        let f = &mut state.sched.resource_floor;
+                        f.mem_bytes = f.mem_bytes.max(floor.mem_bytes);
+                        f.disk_bytes = f.disk_bytes.max(floor.disk_bytes);
+                        f.deadline_secs = f.deadline_secs.max(floor.deadline_secs);
+                        f.cores = f.cores.max(floor.cores);
+                        super::floor::clamp_floor_to_live(f, &self.sla_ceilings);
+                    }
+                }
+            }
+            // BuildInfo Pending→Active (PG side committed above).
+            let applied = self
+                .builds
+                .get_mut(&p.build_id)
+                .is_some_and(|b| b.transition(BuildState::Active).is_ok());
+            debug_assert!(applied, "Pending→Active rejected on fresh build");
+            let _ = applied;
+            // r[impl sched.db.clear-poison-batch+3] — best-effort.
+            if !p.merge_result.reset_on_resubmit.is_empty()
+                && let Err(e) = self
+                    .record_resubmit_resets(&p.merge_result.reset_on_resubmit)
+                    .await
+            {
+                warn!(count = p.merge_result.reset_on_resubmit.len(), error = %e,
+                      "failed to clear poison in PG for resubmit-reset nodes");
+            }
+            // This merge's created jobs.
+            p.created_jobs = (0..span)
+                .map(|_| {
+                    let (_, h, _, origin) = spec_iter.next().unwrap();
+                    let r = created_iter.next().unwrap();
+                    super::materialize::CreatedJob {
+                        drv_hash: DrvHash::from(h.as_str()),
+                        job_id: r.job_id,
+                        created: r.created,
+                        upgraded: r.upgraded,
+                        origin,
+                    }
+                })
+                .collect();
+        }
+        Ok(())
     }
 
     /// Steps 0–5 of merge: top-down root prune, DB build row, in-mem DAG
@@ -244,10 +843,75 @@ impl DagActor {
     /// in-mem/DB state is rolled back (`cleanup_failed_merge`). On Ok
     /// the build is Active and committed — the caller's later DB writes
     /// are log-and-continue.
+    ///
+    /// Thin wrapper post-P2: phases 0-4 in [`Self::prepare_merge_persist`],
+    /// phase 5 here (per-merge transaction). The batched flush calls
+    /// `prepare_merge_persist` directly and runs phase 5 via
+    /// [`Self::persist_prepared_batch`] instead.
     async fn validate_and_ingest(
         &mut self,
         req: MergeDagRequest,
     ) -> Result<MergeIngest, ActorError> {
+        let mut p = self.prepare_merge_persist(req).await?;
+        let mut t_phase = Instant::now();
+        macro_rules! phase {
+            ($name:literal) => {
+                let elapsed = t_phase.elapsed();
+                metrics::histogram!("rio_scheduler_merge_phase_seconds", "phase" => $name)
+                    .record(elapsed.as_secs_f64());
+                debug!(?elapsed, phase = $name, "merge phase");
+                t_phase = Instant::now();
+            };
+        }
+        // === Step 5: PG persist + → Active ============================
+        // All remaining error-returning PG writes. On any error, roll
+        // back the merge AND the map inserts AND delete the DB build row
+        // so in-memory and DB state stay consistent. After this returns
+        // Ok the build is committed (Active); later DB writes are
+        // log-and-continue.
+        p.created_jobs = match self
+            .persist_and_activate(
+                p.build_id,
+                &p.nodes,
+                &p.edges,
+                &p.merge_result,
+                &p.pruned_closure_parents,
+                p.tenant_id,
+                &p.new_sub_lane,
+                &p.reprobe_sub_lane,
+            )
+            .await
+        {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                self.cleanup_failed_merge(p.build_id, p.merge_result).await;
+                return Err(e);
+            }
+        };
+        phase!("5-persist-and-activate");
+        // Post-commit: feed the in-memory job view from the merge
+        // transaction's created jobs (never inside the tx — the view is
+        // a droppable cache; a rolled-back merge must leave no entry).
+        self.note_created_materialization_jobs(&p.created_jobs)
+            .await;
+        let _ = &mut t_phase;
+        Ok(p.into())
+    }
+
+    /// Steps 0–4 of merge: top-down root prune, DB build row, in-mem
+    /// DAG merge, in-mem map inserts, cache-check. Stops just BEFORE
+    /// the phase-5 PG persist transaction so the P2 batched flush can
+    /// coalesce N merges' phase-5 upserts into one fenced transaction.
+    ///
+    /// All `?`-returnable error paths through phase 4 live here; on
+    /// error any partial in-mem/DB state is rolled back. On Ok the
+    /// build is in-memory-merged and PG has a Pending build row; the
+    /// caller MUST either run phase 5 (and on its failure
+    /// `cleanup_failed_merge`) or `cleanup_failed_merge` directly.
+    async fn prepare_merge_persist(
+        &mut self,
+        req: MergeDagRequest,
+    ) -> Result<PreparedMerge, ActorError> {
         let MergeDagRequest {
             build_id,
             tenant_id,
@@ -508,44 +1172,24 @@ impl DagActor {
             .filter(|(h, _)| existing_reprobe.contains(h))
             .map(|(h, _)| h.clone())
             .collect();
-        let created_jobs = match self
-            .persist_and_activate(
-                build_id,
-                &nodes,
-                &edges,
-                &merge_result,
-                &pruned_closure_parents,
-                tenant_id,
-                &new_sub_lane,
-                &reprobe_sub_lane,
-            )
-            .await
-        {
-            Ok(jobs) => jobs,
-            Err(e) => {
-                self.cleanup_failed_merge(build_id, merge_result).await;
-                return Err(e);
-            }
-        };
-        phase!("5-persist-and-activate");
-        // Post-commit: feed the in-memory job view from the merge
-        // transaction's created jobs (never inside the tx — the view is
-        // a droppable cache; a rolled-back merge must leave no entry).
-        self.note_created_materialization_jobs(&created_jobs).await;
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        Ok(MergeIngest {
+        Ok(PreparedMerge {
             build_id,
-            edges_len: edges.len(),
+            tenant_id,
             nodes,
+            edges,
             merge_result,
+            pruned_closure_parents,
+            new_sub_lane,
+            reprobe_sub_lane,
             event_rx,
             existing_reprobe,
             cached_hits,
             pending_substitute,
-            created_jobs,
             jwt_token,
             precomputed_probe,
+            created_jobs: Vec::new(),
         })
     }
 

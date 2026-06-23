@@ -287,6 +287,32 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Multi-build form of [`Self::activate_build_tx`] (P2 phase-5
+    /// coalesce). Same `rows_affected == len` guard so a missing build
+    /// row aborts the whole batch transaction — every merge in the
+    /// batch has already inserted its row in the same actor turn, so a
+    /// short count is the same "silent half-done commit" guard the
+    /// singular form has.
+    pub(crate) async fn activate_builds_tx(
+        tx: &mut PgConnection,
+        build_ids: &[Uuid],
+    ) -> Result<(), sqlx::Error> {
+        if build_ids.is_empty() {
+            return Ok(());
+        }
+        let result = sqlx::query(
+            "UPDATE builds SET status = 'active', started_at = now() \
+             WHERE build_id = ANY($1::uuid[])",
+        )
+        .bind(build_ids)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != build_ids.len() as u64 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        Ok(())
+    }
+
     /// Update a build's status. Terminal statuses persist the settled
     /// payload's accounting in the same UPDATE: the counts are FINAL at
     /// the terminal transition (`update_build_counts_with` no-ops on

@@ -749,6 +749,9 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
             reply: reply_tx,
         })
         .await?;
+    // P2: intake only queues; the reply.send (and orphan-cancel) fires
+    // from `flush_pending_merges` — Tick is flush trigger (ii).
+    handle.send_unchecked(ActorCommand::Tick).await?;
     barrier(&handle).await;
 
     // Actor should log the orphan cancellation.
