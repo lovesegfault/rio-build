@@ -674,7 +674,7 @@ pub struct DagActor {
     pending_merges: Vec<merge::PendingMerge>,
     /// P2 flush trigger (iv): the
     /// [`MERGE_PERSIST_FLUSH_DEADLINE`](merge::MERGE_PERSIST_FLUSH_DEADLINE)
-    /// (50ms) select! arm — bounds SubmitBuild reply latency for
+    /// (250ms) select! arm — bounds SubmitBuild reply latency for
     /// sub-BATCH_MAX inbound rates. Same `MissedTickBehavior::Delay`
     /// and `reset()` on empty→nonempty discipline as
     /// `pull_flush_deadline`.

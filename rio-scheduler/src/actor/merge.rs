@@ -26,16 +26,20 @@ use super::{ActorError, DagActor, MergeDagRequest};
 /// nodes ≈ ~30 nix-fast-build-scale submissions).
 pub(super) const MERGE_PERSIST_BATCH_MAX: usize = 32;
 
-/// P2 flush trigger (iv): a queued merge persists at most this long
-/// after the FIRST push of its batch. SubmitBuild is a synchronous RPC
-/// the gateway is awaiting, so this is an order of magnitude tighter
-/// than `REPORT_OUTCOME_FLUSH_DEADLINE` — at the 256-merge burst's
-/// observed ~800/s arrival a 50 ms window coalesces ~40, capped at
-/// `MERGE_PERSIST_BATCH_MAX`. Short in tests so single-merge sites do
-/// not each wait 50 ms.
+/// P2 flush trigger (iv)/(v): a queued merge persists at most this
+/// long after the FIRST push of its batch. The 50 ms initial value was
+/// sized for the 6 ms/merge projection; live (sdd/submitbuild-
+/// exhausted-diag.md § "ResourceExhausted persists on 1abed77ee")
+/// observed N̄=2.63 at 165 ms/merge — the deadline arm fires every
+/// rx-idle gap and batches stay tiny, so phase-5 amortization never
+/// happens. 250 ms gives N̄≈10-15 → real amortization, while still
+/// well under the gateway's SUBMIT_RETRIES 7.5 s budget. SubmitBuild
+/// is synchronous, so this stays tighter than
+/// `REPORT_OUTCOME_FLUSH_DEADLINE`'s ack semantics. Short in tests so
+/// single-merge sites do not each wait 250 ms.
 #[cfg(not(test))]
 pub(super) const MERGE_PERSIST_FLUSH_DEADLINE: std::time::Duration =
-    std::time::Duration::from_millis(50);
+    std::time::Duration::from_millis(250);
 #[cfg(test)]
 pub(super) const MERGE_PERSIST_FLUSH_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(10);
@@ -329,7 +333,7 @@ impl DagActor {
         //
         // sh-027 §3 idiom (s3-interval-reset): the deadline arm's guard
         // is `!pending.is_empty()`; while idle the Interval is unpolled
-        // and goes stale, so the FIRST queue after any idle gap >50ms
+        // and goes stale, so the FIRST queue after any idle gap >250ms
         // would re-enable a guard with an immediately-Ready tick →
         // flushes at N=1. Reset on the empty→nonempty edge.
         if self.pending_merges.is_empty() {

@@ -750,10 +750,14 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
         })
         .await?;
     // P2: intake only queues; the reply.send (and orphan-cancel) fires
-    // from `flush_pending_merges`. Trigger (v) — the inline
-    // post-dispatch `armed_at.elapsed() ≥ 10ms` check — fires after
-    // the sleep + any subsequent command; barrier supplies one.
+    // from `flush_pending_merges`. The first barrier's post-dispatch
+    // trigger-(v) check (inline `armed_at.elapsed() ≥ DEADLINE`)
+    // enters the flush; the second barrier serializes behind the
+    // flush's PG awaits so logs_contain observes the orphan-cancel
+    // line. (Tick-head trigger ii is deleted; the deadline arm (iv) is
+    // racy against the test's sleep on current_thread.)
     tokio::time::sleep(crate::actor::merge::MERGE_PERSIST_FLUSH_DEADLINE).await;
+    barrier(&handle).await;
     barrier(&handle).await;
 
     // Actor should log the orphan cancellation.

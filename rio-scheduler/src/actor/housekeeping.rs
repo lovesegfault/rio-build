@@ -203,7 +203,7 @@ impl DagActor {
         // P2 flush trigger (ii) DELETED (former
         // `self.flush_pending_merges().await` here — see
         // sdd/submitbuild-exhausted-diag.md § "Tick 304ms→2.57s").
-        // Reply latency is bounded by trigger (iv) (the 50ms
+        // Reply latency is bounded by trigger (iv) (the 250ms
         // MERGE_PERSIST_FLUSH_DEADLINE select! arm) when rx idles, and
         // by trigger (v) (the inline post-dispatch armed_at check)
         // when rx is continuously Ready; a Tick-head flush
