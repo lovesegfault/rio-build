@@ -695,7 +695,7 @@ pub struct DagActor {
     /// on the empty→nonempty push; cleared by flush and the
     /// leader-lost drain. ONE field for ONE deadline, read at two
     /// sites: trigger (iv) is the `sleep_until` select! arm (reachable
-    /// only when EVERY higher-biased arm idles); trigger (v) is the
+    /// only when every higher-biased arm idles); trigger (v) is the
     /// loop-top `now ≥ deadline` check, which runs unconditionally
     /// before select! and so is immune to which arm fires — the only
     /// sub-BATCH_MAX drain path under a sustained rx OR fast-lane
