@@ -1164,8 +1164,6 @@ impl russh::server::Server for GatewayServer {
             session_sem: Arc::clone(&self.session_sem),
             max_channels_per_connection: self.max_channels_per_connection,
             open_channels: 0,
-            over_bound_channels: 0,
-            channel_writers: HashMap::new(),
             empty_connection_grace: self.empty_connection_grace,
             handshake_timeout: self.handshake_timeout,
             idle: Arc::new(connection::EmptyConnectionTimer::new(Arc::clone(
