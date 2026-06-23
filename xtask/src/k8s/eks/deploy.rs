@@ -312,15 +312,14 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     ui::step("chart deps", crate::k8s::shared::chart_deps).await?;
 
     // --public-cidr flips internal→internet-facing (immutable — a flip
-    // recreates the NLB) and sets loadBalancerSourceRanges. ip-type
-    // follows scheme: internal-elb private subnets are v6-only, so a
-    // dualstack internal NLB can't get its per-subnet IPv4 and nothing
-    // internal needs v4; the `elb` public subnets have v4, so
-    // internet-facing stays dualstack for IPv4 clients.
-    let (scheme, ip_addr_type) = if opts.public_cidrs.is_empty() {
-        ("internal", "ipv6")
+    // recreates the NLB) and sets loadBalancerSourceRanges. ip-type is
+    // dualstack for both schemes: the `internal-elb` tag lives on the
+    // dual-stack database tier (main.tf), so an internal NLB gets its
+    // per-subnet private v4 there.
+    let scheme = if opts.public_cidrs.is_empty() {
+        "internal"
     } else {
-        ("internet-facing", "dualstack")
+        "internet-facing"
     };
     let mut nlb_ann = json!({
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
@@ -332,7 +331,11 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         // instance targets + v6 listener need a PRIMARY IPv6 on each
         // node (primary-ipv6-init oneshot in the AMI; system nodes
         // excluded from external LBs in main.tf).
-        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": ip_addr_type,
+        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
+        // dualstack listener + v6-only instance TG: v4 clients need
+        // the NLB to source-NAT to an NLB-owned v6 prefix or every v4
+        // connection is RST'd.
+        "service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat": "on",
         "service.beta.kubernetes.io/aws-load-balancer-attributes": "load_balancing.cross_zone.enabled=true",
         // OFF: the default (on) hairpins intra-VPC clients that are
         // themselves targets and defeats v6 source-NAT; Cilium SNAT
@@ -340,13 +343,6 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         "service.beta.kubernetes.io/aws-load-balancer-target-group-attributes": "preserve_client_ip.enabled=false",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });
-    // dualstack-only (aws-lbc rejects on ipv6): source-NAT IPv4
-    // connections to an NLB-owned v6 prefix so they reach the v6-only
-    // TG instead of being RST'd.
-    if ip_addr_type == "dualstack" {
-        nlb_ann["service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat"] =
-            json!("on");
-    }
     // external-dns (dns.tf) reconciles this into a DNS record.
     if let Some(fqdn) = &gateway_dns_fqdn {
         nlb_ann["external-dns.alpha.kubernetes.io/hostname"] = json!(fqdn);
