@@ -6,17 +6,14 @@
 //
 // Nodes with children render as `<details>` accordions; the `open`
 // attribute is set on the path from root to the current page so the
-// active leaf is visible on load without JS.
+// active leaf is visible on load without JS. `trail` is the
+// `crumb-trail` ancestor chain page.typ already computes — its
+// path-membership is exactly the "current is somewhere under this
+// node" predicate, so a second recursive walk over the chapter tree
+// isn't needed.
 #import "meta.typ": chapters, href-for, route-for
 
-// True if `current` is the route of any descendant of `children`.
-#let _contains(current, children) = children.any(
-  ((_, p, c)) => (
-    (p != none and route-for(p) == current) or _contains(current, c)
-  ),
-)
-
-#let _li(current, title, path, children) = {
+#let _li(current, on-trail, title, path, children) = {
   let is-current = path != none and route-for(path) == current
   let label = if path == none {
     html.elem("span", attrs: (class: "section"))[#title]
@@ -29,12 +26,12 @@
     html.elem("li", label)
   } else {
     let kids = html.elem("ul", for (t, p, c) in children {
-      _li(current, t, p, c)
+      _li(current, on-trail, t, p, c)
     })
     let attrs = (class: "rio-nav-group")
-    if is-current or _contains(current, children) {
-      attrs.insert("open", "open")
-    }
+    // A node is on the open path iff it (or its section heading) is in
+    // the crumb trail. `(title, path)` is the trail's pair shape.
+    if (title, path) in on-trail { attrs.insert("open", "open") }
     html.elem("li", html.elem("details", attrs: attrs)[
       #html.elem("summary", label)
       #kids
@@ -42,7 +39,7 @@
   }
 }
 
-#let nav-tree(current) = html.elem(
+#let nav-tree(current, trail) = html.elem(
   "ul",
-  for (t, p, c) in chapters { _li(current, t, p, c) },
+  for (t, p, c) in chapters { _li(current, trail, t, p, c) },
 )

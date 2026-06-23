@@ -186,7 +186,7 @@
             title: "Toggle theme",
           ))[◐]
           #html.elem("div", attrs: (id: "search"))[]
-          #nav-tree(route)
+          #nav-tree(route, trail)
         ]
         #html.elem(
           "main",

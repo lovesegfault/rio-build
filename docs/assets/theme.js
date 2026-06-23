@@ -135,6 +135,7 @@
     // ─── code-block copy button ─────────────────────────────────────
     for (const b of document.querySelectorAll(".rio-copy")) {
       const orig = b.textContent;
+      let resetTimer = 0;
       b.addEventListener("click", () => {
         // The button may be wrapped in an auto-<p> by typst's html
         // export, so parentElement isn't reliably .rio-code — climb.
@@ -142,7 +143,10 @@
         if (!pre) return;
         const flash = (txt) => {
           b.textContent = txt;
-          setTimeout(() => {
+          // Re-arm: an overlapping click must extend, not truncate,
+          // the visual confirmation.
+          clearTimeout(resetTimer);
+          resetTimer = setTimeout(() => {
             b.classList.remove("copied");
             b.textContent = orig;
           }, 1500);
