@@ -77,10 +77,12 @@
       navToggle.addEventListener("click", () =>
         setNavOpen(!document.body.classList.contains("nav-open")),
       );
-      // Click outside the drawer closes it.
+      // Click outside the drawer closes it. `ev.target` is typed
+      // EventTarget (a synthetic dispatch can land it on `document`,
+      // which has no `.closest`), hence the optional-call guard.
       document.addEventListener("click", (ev) => {
         if (!document.body.classList.contains("nav-open")) return;
-        if (ev.target.closest(".rio-nav, .rio-nav-toggle")) return;
+        if (ev.target.closest?.(".rio-nav, .rio-nav-toggle")) return;
         setNavOpen(false);
       });
     }

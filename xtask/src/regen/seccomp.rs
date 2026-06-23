@@ -90,18 +90,25 @@ pub async fn run(tag: &str) -> Result<()> {
 
     info!("fetching moby {tag} default.json");
     let client = reqwest::Client::new();
+    // Per-URL outcomes are folded into the bail!: pre-refactor
+    // `reqwest::get(&url).await?` surfaced transport errors directly;
+    // the fallback loop must not lose them behind "not at any known
+    // path" (which reads as a 404 when the real cause was DNS/TLS).
+    let mut tried: Vec<String> = Vec::with_capacity(urls.len());
     let mut v: Value = 'fetch: {
         for url in &urls {
             let resp = match client.get(url).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     info!("  {url} → transport error ({e}), trying fallback");
+                    tried.push(format!("{url}: transport error: {e}"));
                     continue;
                 }
             };
             let status = resp.status();
             if !status.is_success() {
                 info!("  {url} → {status}, trying fallback");
+                tried.push(format!("{url}: HTTP {status}"));
                 continue;
             }
             // Body-read / JSON-parse errors (truncated body, mid-body
@@ -112,11 +119,15 @@ pub async fn run(tag: &str) -> Result<()> {
                 Ok(v) => break 'fetch v,
                 Err(e) => {
                     info!("  {url} → body error ({e}), trying fallback");
+                    tried.push(format!("{url}: body error: {e}"));
                     continue;
                 }
             }
         }
-        anyhow::bail!("moby {tag}: default.json not at any known path ({urls:?})");
+        anyhow::bail!(
+            "moby {tag}: default.json not fetchable from any known path:\n  {}",
+            tried.join("\n  ")
+        );
     };
 
     // Flatten: keep syscall blocks whose includes.caps ⊆ WORKER_CAPS.
