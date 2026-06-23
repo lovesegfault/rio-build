@@ -44,6 +44,26 @@ pub(super) const MERGE_PERSIST_FLUSH_DEADLINE: std::time::Duration =
 pub(super) const MERGE_PERSIST_FLUSH_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(10);
 
+/// Cross-merge dedup rationale (P2 phase-5 coalesce). Several batch-6
+/// scratch collections inside [`DagActor::persist_merges`] dedup across
+/// the `prepared` set: overlapping closures are the P2 target shape, and
+/// without dedup Σ-per-merge entries inflate the wire payload + PG bind
+/// scan inside the held fenced tx (the deposed-believer window is sized
+/// against this tx's duration). Pre-P2 the implicit dedup was the SERIAL
+/// ordering — `merge[k+1]`'s phase-5 ran AFTER `merge[k]`'s phase-6 had
+/// committed/cleared the relevant in-mem state, so ON CONFLICT and
+/// status gates deduped naturally. Batched phase-5 reads the same
+/// pre-phase-6 state for every merge, so the dedup is explicit. At N=1
+/// every dedup set degenerates to the per-merge intra-lane dedup.
+const _P2_CROSS_MERGE_DEDUP: () = ();
+
+/// `it.collect::<HashSet<_>>().into_iter().collect()` — the
+/// [`_P2_CROSS_MERGE_DEDUP`] idiom for the two `= any($1)` bind sites
+/// where insertion order is immaterial.
+fn dedup_collect<T: Eq + std::hash::Hash>(it: impl IntoIterator<Item = T>) -> Vec<T> {
+    it.into_iter().collect::<HashSet<T>>().into_iter().collect()
+}
+
 /// One queued `ActorCommand::MergeDag` — request and reply, held
 /// between intake and the [`DagActor::flush_pending_merges`] that runs
 /// every per-merge phase 0-4/6+ serially with phase-5 PG persist
@@ -439,6 +459,7 @@ impl DagActor {
             record_merge_phase("0to4-prepare-batched", &mut t);
         }
         if prepared.is_empty() {
+            debug_assert!(self.pending_merges.is_empty());
             return;
         }
 
@@ -451,7 +472,6 @@ impl DagActor {
         // original to `replies[0]` unconditionally delivered
         // INTERNAL:<path it never sent> to the wrong gateway when k>0
         // — see `batch_persist_err_routes_to_culprit_merge`.
-        let mut t_persist = Instant::now();
         let mut culprit = 0usize;
         if let Err(e) = self.persist_merges(&mut prepared, &mut culprit).await {
             // `build_id` is the operator-side join key to the gateway's
@@ -503,9 +523,10 @@ impl DagActor {
                 };
                 let _ = reply.send(Err(err));
             }
+            debug_assert!(self.pending_merges.is_empty());
             return;
         }
-        record_merge_phase("5-persist-and-activate-batched", &mut t_persist);
+        record_merge_phase("5-persist-and-activate-batched", &mut t);
 
         // Phase 6+ per merge, then reply. Every build is now
         // Active+committed; DB writes here are log-and-continue.
@@ -516,6 +537,11 @@ impl DagActor {
             let rx = self.finish_merge_dag(p.ingest).await;
             self.send_merge_reply(build_id, reply, rx).await;
         }
+        // The deadline is armed only on empty→nonempty; if any future
+        // path re-pushes onto `pending_merges` across the awaits above,
+        // the queued merges would wait for trigger-(i) (len≥BATCH_MAX)
+        // alone. This guard makes that regression a debug-time crash.
+        debug_assert!(self.pending_merges.is_empty());
     }
 
     /// Send a `MergeDag` reply; on receiver-dropped (gateway gave up
@@ -614,29 +640,35 @@ impl DagActor {
         // the dedup set is moot (one merge's `nodes` are
         // hash-distinct).
         let n_nodes_est: usize = prepared.iter().map(|p| p.ingest.nodes.len()).sum();
-        let mut seen: HashSet<&str> = HashSet::with_capacity(n_nodes_est);
         let mut node_rows: Vec<crate::db::DerivationRow> = Vec::with_capacity(n_nodes_est);
         // ONE batch-wide path_to_hash, folded into Batch-1's Σ|nodes_i|
         // walk (not a second flat_map pass over the same set inside the
-        // held fenced tx). Populated AFTER the seen-dedup `continue` so
-        // cross-merge duplicate nodes (same hash ⇒ same path, the
-        // validate_node contract) don't re-insert; resolve() needs only
-        // first-wins. The debug_assert catches the inverse — same path,
-        // different hash — i.e., a regression in `ingest::validate_node`.
+        // held fenced tx). It is also the cross-merge dedup gate: the
+        // path↔hash bijection is the `ingest::validate_node` contract,
+        // so an Occupied entry on `drv_path` ⇔ the hash was already
+        // seen — no separate `seen: HashSet<&str>` keyed on hash. The
+        // debug_assert on the Occupied arm catches a bijection
+        // regression (same path, different hash) at validate_node.
         let mut path_to_hash: HashMap<&str, &str> = HashMap::with_capacity(n_nodes_est);
         for p in prepared.iter() {
             for node in &p.ingest.nodes {
-                if !seen.insert(node.drv_hash.as_str()) {
-                    continue;
+                match path_to_hash.entry(node.drv_path.as_str()) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        debug_assert_eq!(
+                            *e.get(),
+                            node.drv_hash.as_str(),
+                            "batch path↔hash conflict: {} → {} vs {} \
+                             (path↔hash validated at ingest::validate_node — regression there)",
+                            node.drv_path,
+                            node.drv_hash,
+                            e.get(),
+                        );
+                        continue;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(node.drv_hash.as_str());
+                    }
                 }
-                let prev = path_to_hash.insert(node.drv_path.as_str(), node.drv_hash.as_str());
-                debug_assert!(
-                    prev.is_none(),
-                    "batch path_to_hash conflict: {} → {} vs {prev:?} \
-                     (path↔hash validated at ingest::validate_node — regression there)",
-                    node.drv_path,
-                    node.drv_hash,
-                );
                 let status = if p
                     .ingest
                     .merge_result
@@ -670,7 +702,6 @@ impl DagActor {
         let id_map =
             crate::db::SchedulerDb::batch_upsert_derivations(tx.conn(), &node_rows).await?;
         drop(node_rows);
-        drop(seen);
 
         // ─── Batch 2/3/4/5: links, edges, activation, wanted ──────
         // r[impl sched.materialize.job+2]
@@ -701,14 +732,9 @@ impl DagActor {
         let n_edges_est: usize = prepared.iter().map(|p| p.edges.len()).sum();
         let mut link_builds: Vec<Uuid> = Vec::with_capacity(n_nodes_est);
         let mut link_drvs: Vec<Uuid> = Vec::with_capacity(n_nodes_est);
-        // Cross-merge dedup (same `seen`/`reset_seen`/`queued`
-        // rationale): edges are the largest per-merge collection (~3×
-        // nodes), and overlapping closures — the P2 target shape —
-        // ship Σ|edges_i| rows through the temp-table COPY otherwise.
-        // ON CONFLICT DO NOTHING makes it semantically correct, but the
-        // wire payload + temp-table scan are inflated inside the held
-        // fenced tx (the deposed-believer window is sized against this
-        // tx's duration).
+        // Cross-merge dedup ([`_P2_CROSS_MERGE_DEDUP`]): edges are the
+        // largest per-merge collection (~3× nodes), so the temp-table
+        // COPY is the highest-weight site.
         // `batch_insert_edges` is `ON CONFLICT DO NOTHING` over an
         // unordered SELECT, so insertion order is immaterial — collect
         // into the dedup set directly and drain to a Vec at the bind
@@ -784,24 +810,16 @@ impl DagActor {
         // member commits in this one tx). A "passes the gate" outcome
         // means "no job created" — there is no resource granted.
         // Pinned by `vouch_gate_is_batch_scoped`.
-        let pruned_ids: Vec<Uuid> = prepared
-            .iter()
-            .flat_map(|p| {
-                // Iterate the (small, often empty) pruned set directly —
-                // the unpruned fall-through walks ≈Σ|nodes| against an
-                // empty set otherwise, inside the held fenced tx.
-                p.pruned_closure_parents
-                    .iter()
-                    .filter_map(|h| id_map.get(h.as_str()).map(|(id, _)| *id))
-            })
-            // Cross-merge dedup (overlapping closures — the P2 target
-            // shape) before the `= any($1::uuid[])` bind; same
-            // rationale as `reset_seen` below. PG's GROUP BY tolerates
-            // dupes but the wire payload + array scan are inflated
-            // inside the held fenced tx.
-            .collect::<HashSet<Uuid>>()
-            .into_iter()
-            .collect();
+        //
+        // Iterate the (small, often empty) pruned set directly — the
+        // unpruned fall-through walks ≈Σ|nodes| against an empty set
+        // otherwise. Cross-merge dedup before the `= any($1::uuid[])`
+        // bind: [`_P2_CROSS_MERGE_DEDUP`].
+        let pruned_ids: Vec<Uuid> = dedup_collect(prepared.iter().flat_map(|p| {
+            p.pruned_closure_parents
+                .iter()
+                .filter_map(|h| id_map.get(h.as_str()).map(|(id, _)| *id))
+        }));
         let vouched =
             crate::db::SchedulerDb::vouched_derivations_in_tx(tx.conn(), &pruned_ids).await?;
 
@@ -822,35 +840,39 @@ impl DagActor {
             .sum();
         let mut job_specs: Vec<(Uuid, DrvHash, Option<Uuid>, crate::state::JobOrigin)> =
             Vec::with_capacity(n_jobs_est);
-        let mut job_spans: Vec<usize> = Vec::with_capacity(prepared.len());
+        let mut job_spans: Vec<std::ops::Range<usize>> = Vec::with_capacity(prepared.len());
         let mut all_reset_hashes: Vec<DrvHash> = Vec::with_capacity(n_reprobe_est);
         let mut all_reset_rows: Vec<crate::db::attempts::AttemptRow> =
             Vec::with_capacity(n_reprobe_est);
-        // Cross-merge AS-5 dedup: pre-P2 merge[k+1]'s phase-5 ran AFTER
-        // merge[k]'s phase-6d cleared the in-mem status, so the
-        // `status() ∈ {Poisoned,DepFailed,Failed}` gate below was an
-        // implicit dedup. Batched phase-5 reads the same pre-phase-6
-        // state for every merge — without an explicit dedup, two
-        // overlapping reprobe lanes would push two `poison_cleared`
-        // ledger rows (each with a fresh attempt_id; the ON CONFLICT
-        // WHERE exec_id IS NOT NULL guard does not apply at
-        // exec_id=None) and double-count the resubmit-cycle clear.
+        // Cross-merge AS-5 dedup ([`_P2_CROSS_MERGE_DEDUP`]): two
+        // overlapping reprobe lanes would otherwise push two
+        // `poison_cleared` ledger rows (each with a fresh attempt_id;
+        // the ON CONFLICT WHERE exec_id IS NOT NULL guard does not
+        // apply at exec_id=None) and double-count the resubmit-cycle
+        // clear.
         let mut reset_seen: HashSet<&str> = HashSet::with_capacity(n_reprobe_est);
-        // Cross-merge job dedup: same drv_hash via two merges' lanes
-        // would push two `job_specs` rows. The partial-unique
-        // `(derivation_id) WHERE status='pending' AND exec_id IS NULL`
-        // index makes the SECOND insert `created=false`, but both rows
-        // still entered `created_jobs` (one per merge) — both reported
-        // `created=true` to their merge's phase-6 (the per-merge slice
-        // re-read `created_iter` in input order, so the first-merge
-        // slice took the `created=true` AND the second-merge slice took
-        // the next `created` row, double-seeding the M-085 reset).
-        // Same batch-scoped pattern as `pruned_ids`/`reset_seen`:
-        // pre-P2 merge[k+1]'s lanes ran AFTER merge[k]'s job had
-        // committed (ON CONFLICT deduped serially). At N=1 the set
-        // degenerates to the per-merge intra-lane dedup.
-        let mut queued: HashSet<&str> = HashSet::with_capacity(n_jobs_est);
-        for p in prepared.iter() {
+        // Cross-merge job dedup ([`_P2_CROSS_MERGE_DEDUP`]): same
+        // drv_hash via two merges' lanes would push two `job_specs`
+        // rows. The partial-unique `(derivation_id) WHERE
+        // status='pending' AND exec_id IS NULL` index makes the SECOND
+        // insert `created=false`, but both rows still entered
+        // `created_jobs` (one per merge) — the per-merge slice re-read
+        // `created` in input order, double-seeding the M-085 reset.
+        //
+        // The dedup MUST NOT drop the later merge's `created_jobs`
+        // entry entirely: phase-6b's `compute_initial` may RAISE the
+        // shared node's priority via merge[k]'s edges, and the post-6b
+        // restamp reads only `created_jobs[k]` — pre-P2 serial,
+        // merge[k]'s per-merge persist returned `created=false` for the
+        // shared job and the GREATEST() ratchet picked up the raise.
+        // `queued` therefore maps drv_hash → its `job_specs` index;
+        // `shadow_jobs[k]` records the merges that ALSO named it so
+        // post-commit each gets a `{created:false}` entry pointing at
+        // the one inserted job_id (sched.materialize.listing-priority).
+        let mut queued: HashMap<&str, usize> = HashMap::with_capacity(n_jobs_est);
+        let mut shadow_jobs: Vec<Vec<(usize, DrvHash, crate::state::JobOrigin)>> =
+            (0..prepared.len()).map(|_| Vec::new()).collect();
+        for (k, p) in prepared.iter().enumerate() {
             let start = job_specs.len();
             // Three lanes share one push body — only `origin` and the
             // pruned lane's extra `!vouched` gate differ. Macro (not a
@@ -863,9 +885,22 @@ impl DagActor {
                 ($h:expr, $origin:expr, $extra_ok:expr) => {
                     if let Some((db_id, _)) = id_map.get($h.as_str())
                         && $extra_ok(db_id)
-                        && queued.insert($h.as_str())
                     {
-                        job_specs.push((*db_id, $h.clone(), p.tenant_id, $origin));
+                        match queued.entry($h.as_str()) {
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(job_specs.len());
+                                job_specs.push((*db_id, $h.clone(), p.tenant_id, $origin));
+                            }
+                            std::collections::hash_map::Entry::Occupied(e) => {
+                                // Intra-merge re-queue (same hash via
+                                // two of THIS merge's lanes) is a
+                                // no-op; only a cross-merge sibling
+                                // gets a shadow restamp entry.
+                                if *e.get() < start {
+                                    shadow_jobs[k].push((*e.get(), $h.clone(), $origin));
+                                }
+                            }
+                        }
                     }
                 };
             }
@@ -912,9 +947,10 @@ impl DagActor {
                     all_reset_hashes.push(h.clone());
                 }
             }
-            job_spans.push(job_specs.len() - start);
+            job_spans.push(start..job_specs.len());
         }
         drop(reset_seen);
+        drop(queued);
         let job_rows: Vec<crate::db::materialization::NewJobRow<'_>> = job_specs
             .iter()
             .map(
@@ -1037,9 +1073,7 @@ impl DagActor {
             }
         }
         // Slice `created` back per-merge (input-order ⇔ result-order).
-        let mut created_iter = created.into_iter();
-        let mut spec_iter = job_specs.into_iter();
-        for (p, span) in prepared.iter_mut().zip(job_spans) {
+        for ((p, span), shadow) in prepared.iter_mut().zip(job_spans).zip(shadow_jobs) {
             // Floor hydration over newly_inserted only (disjoint
             // across merges — `dag.merge` deduplicates). The db_id
             // half is hoisted above (idempotent over the deduped
@@ -1074,21 +1108,34 @@ impl DagActor {
             );
             let _ = applied;
             // This merge's created jobs: `job_specs` and `created` are
-            // input-order ⇔ result-order, so `zip` over the next `span`
-            // pairs encodes the lockstep structurally (no per-step
-            // `.next().unwrap()` × 2 against an unused range index).
-            p.ingest.created_jobs = spec_iter
-                .by_ref()
-                .zip(created_iter.by_ref())
-                .take(span)
-                .map(|((_, h, _, origin), r)| super::materialize::CreatedJob {
-                    drv_hash: h,
-                    job_id: r.job_id,
-                    created: r.created,
-                    upgraded: r.upgraded,
-                    origin,
-                })
-                .collect();
+            // input-order ⇔ result-order, so the per-merge `span` range
+            // encodes the lockstep structurally. Shadow entries are jobs
+            // an EARLIER co-batched merge inserted that THIS merge also
+            // named (the `queued` dedup above) — appended here as
+            // `{created:false, upgraded:false}` so phase-6b's restamp
+            // sees them, mirroring what the pre-P2 serial path's
+            // ON CONFLICT would have returned.
+            p.ingest.created_jobs =
+                job_specs[span.clone()]
+                    .iter()
+                    .zip(&created[span])
+                    .map(|((_, h, _, origin), r)| super::materialize::CreatedJob {
+                        drv_hash: h.clone(),
+                        job_id: r.job_id,
+                        created: r.created,
+                        upgraded: r.upgraded,
+                        origin: *origin,
+                    })
+                    .chain(shadow.into_iter().map(|(i, h, origin)| {
+                        super::materialize::CreatedJob {
+                            drv_hash: h,
+                            job_id: created[i].job_id,
+                            created: false,
+                            upgraded: false,
+                            origin,
+                        }
+                    }))
+                    .collect();
         }
         // I-169: PG-side poison clear for nodes that were reset by the
         // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
@@ -1105,20 +1152,17 @@ impl DagActor {
         // call for the batch (`record_resubmit_resets` already takes a
         // slice and opens its own fenced tx).
         // r[impl sched.db.clear-poison-batch+3]
-        // Cross-merge dedup (same `pruned_ids`/`reset_seen` rationale —
-        // overlapping closures are the P2 target shape): N submissions
+        // Cross-merge dedup ([`_P2_CROSS_MERGE_DEDUP`]): N submissions
         // resetting the same poisoned root in one coalesce window would
         // otherwise write N `resubmit_reset` ledger rows (exec_id=None
         // so the ON CONFLICT guard does not apply) and N×
         // `clear_poison_batch_in_tx` slice entries in the SECOND
         // fenced tx `record_resubmit_resets` opens.
-        let resubmit_resets: Vec<DrvHash> = prepared
-            .iter()
-            .flat_map(|p| p.ingest.merge_result.reset_on_resubmit.iter())
-            .collect::<HashSet<&DrvHash>>()
-            .into_iter()
-            .cloned()
-            .collect();
+        let resubmit_resets: Vec<DrvHash> = dedup_collect(
+            prepared
+                .iter()
+                .flat_map(|p| p.ingest.merge_result.reset_on_resubmit.iter().cloned()),
+        );
         if !resubmit_resets.is_empty()
             && let Err(e) = self.record_resubmit_resets(&resubmit_resets).await
         {
