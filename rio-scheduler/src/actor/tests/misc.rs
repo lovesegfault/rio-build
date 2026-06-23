@@ -1063,7 +1063,7 @@ async fn backpressure_cost_axis_bimodal_mix_does_not_flap() -> TestResult {
     Ok(())
 }
 
-/// `prices_into_drain` is exhaustive: ONLY MergeDag and Tick fold
+/// `prices_into_drain` is exhaustive: only MergeDag and Tick fold
 /// into the cost-axis EWMA. A new variant added without considering
 /// this is the structural seam — the post-P1 re-diagnosis 89s-hold
 /// was 8.8k mid-cost commands inflating an estimator meant to track

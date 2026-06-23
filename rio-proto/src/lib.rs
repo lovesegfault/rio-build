@@ -36,6 +36,11 @@ pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 /// predicate so a third retryable refusal class (or a remap) lands in
 /// one place instead of four.
 // r[impl sched.grpc.fence-retryable]
+// refusal-census: allow(this IS the single fence-retryable definition
+//   the four prior open-coded sites now consume; it is not an
+//   adjudication site — judge_refusal's Undecided is too broad
+//   (DEADLINE_EXCEEDED is Undecided but NOT provably pre-merge), and
+//   the gateway's build_id-header gate is the law this narrows for)
 pub fn is_retryable_refusal_code(code: tonic::Code) -> bool {
     matches!(
         code,

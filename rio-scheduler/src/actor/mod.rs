@@ -2120,7 +2120,7 @@ impl DagActor {
 
     /// Record one MergeDag/Tick handler cost into the per-turn EWMA
     /// (round-9 B6) — the producer side of the cost-axis backpressure
-    /// law. Called by `run_inner` ONLY for the variants
+    /// law. Called by `run_inner` only for the variants
     /// [`ActorCommand::prices_into_drain`] returns true for.
     ///
     /// The estimator tracks the work-class it gates (MergeDag drain
