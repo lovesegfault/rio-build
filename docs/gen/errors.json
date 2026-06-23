@@ -1199,6 +1199,13 @@
     },
     {
       "enum": "ActorError",
+      "name": "BatchSiblingFailed",
+      "crate": "rio-scheduler",
+      "msg": "co-batched submission failed; retrying independently",
+      "doc": "P2 batch-persist fan-out: this merge was an INNOCENT sibling in a coalesced phase-5 transaction that aborted because of ANOTHER merge's data (the culprit got the original typed error). Pre-P2 this merge would have been processed solo and succeeded; the only reason it failed is co-batching. Maps to UNAVAILABLE so the gateway's bounded SubmitBuild retry re-submits — the next batch won't include the culprit (whose own gateway saw a terminal error), so the innocent succeeds. The prior class-preserving fan-out delivered the CULPRIT'S Terminal class to siblings, terminally failing valid requests — a P2 regression vs the serial path. UNIT (no culprit detail): coalesced merges may belong to DIFFERENT TENANTS. Embedding the culprit's error string (which names their drv_path) in a sibling's wire error is a cross-tenant information leak. The culprit detail goes only to `replies[culprit]`; operator diagnosability is the `error!` in `flush_pending_merges`."
+    },
+    {
+      "enum": "ActorError",
       "name": "BuildNotFound",
       "crate": "rio-scheduler",
       "msg": "build not found: {0}",
