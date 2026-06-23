@@ -2000,6 +2000,48 @@ impl ReattachBudget {
     }
 }
 
+/// Max bounded retries for the pre-build_id `SubmitBuild` retry loop
+/// in [`submit_initial`]. `#[doc(hidden)] pub` so the integration test
+/// derives the expected attempt count (`SUBMIT_RETRIES + 1`) instead
+/// of hand-syncing a literal.
+#[doc(hidden)]
+pub const SUBMIT_RETRIES: u32 = 8;
+
+/// Backoff schedule for the pre-build_id `SubmitBuild` retry loop.
+///
+/// Budget covers BOTH refusal classes: the deposed-believer fence
+/// window (≤ ~5s, the original 4×0.5/1/2/4 = 7.5s sizing) AND a
+/// sustained cost-axis backpressure hold — post-P0/P1 re-diagnosis
+/// observed the gate held for 89s before the prices_into_drain fix
+/// landed; the 4-retry/7.5s budget exhausted in 3 of those windows.
+/// 8 retries at 0.5/1/2/4/8/16/16/16/16s ≈ 79.5s sleep + 9 attempts
+/// under the per-attempt timeout covers a ~90s hold without making
+/// a genuine outage hang the client. Proportional jitter so a
+/// nix-fast-build burst's N parallel submits don't herd into the
+/// same backpressure-release instant.
+#[doc(hidden)]
+pub const SUBMIT_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: std::time::Duration::from_millis(500),
+    mult: 2.0,
+    cap: std::time::Duration::from_secs(16),
+    jitter: rio_common::backoff::Jitter::Proportional(0.25),
+};
+
+/// Test-harness seam: when set, [`submit_initial`]'s retry loop uses
+/// this schedule instead of [`SUBMIT_RETRY_BACKOFF`]. The
+/// `wire_opcodes` integration harness sets a 5ms-flat schedule so
+/// `test_build_paths_submit_retry_budget_exhausts` runs in
+/// milliseconds instead of the ~80s real-time budget. Not a Cargo
+/// feature: crate2nix unifies dev-dep-activated features into the
+/// production lib build (`resolvedDefaultFeatures`), so a cfg-gated
+/// const variant would leak the short backoff into release binaries.
+/// Not threaded through `Config`: `Config` does not flow to
+/// `submit_initial`, and the knob is purely a test concern.
+/// Production never sets this → reads `None` → uses the const.
+#[doc(hidden)]
+pub static SUBMIT_RETRY_BACKOFF_OVERRIDE: std::sync::OnceLock<rio_common::backoff::Backoff> =
+    std::sync::OnceLock::new();
+
 /// Issue the `SubmitBuild` RPC and read its initial response metadata
 /// (`x-rio-build-id`, `x-rio-trace-id`). Records `build_id` in
 /// `active_build_ids` so a stream error before event 0 is
@@ -2025,25 +2067,11 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     // refused/fenced merge rolls back — re-submitting is idempotent.
     // Any other code, a timeout (DEADLINE_EXCEEDED — not provably
     // pre-merge), or a retryable code that somehow carries the
-    // build-id header propagates unchanged.
-    //
-    // Budget covers BOTH refusal classes: the deposed-believer fence
-    // window (≤ ~5s, the original 4×0.5/1/2/4 = 7.5s sizing) AND a
-    // sustained cost-axis backpressure hold — post-P0/P1 re-diagnosis
-    // observed the gate held for 89s before the prices_into_drain fix
-    // landed; the 4-retry/7.5s budget exhausted in 3 of those windows.
-    // 8 retries at 0.5/1/2/4/8/16/16/16/16s ≈ 79.5s sleep + 9 attempts
-    // under the per-attempt timeout covers a ~90s hold without making
-    // a genuine outage hang the client. Proportional jitter so a
-    // nix-fast-build burst's N parallel submits don't herd into the
-    // same backpressure-release instant.
-    const SUBMIT_RETRIES: u32 = 8;
-    const SUBMIT_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
-        base: std::time::Duration::from_millis(500),
-        mult: 2.0,
-        cap: std::time::Duration::from_secs(16),
-        jitter: rio_common::backoff::Jitter::Proportional(0.25),
-    };
+    // build-id header propagates unchanged. Budget rationale: see
+    // [`SUBMIT_RETRY_BACKOFF`].
+    let backoff = SUBMIT_RETRY_BACKOFF_OVERRIDE
+        .get()
+        .unwrap_or(&SUBMIT_RETRY_BACKOFF);
     let (meta, _ext, msg) = request.into_parts();
     let mut attempt: u32 = 0;
     let resp = loop {
@@ -2062,17 +2090,12 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
             // RESOURCE_EXHAUSTED: scheduler's cost-axis backpressure
             // gate (scheduler_service.rs) — same idempotency proof as
             // UNAVAILABLE applies (no build_id ⇒ MergeDag rolled back).
-            // The 0.5/1/2/4s backoff covers the observed flap window.
-            // refusal-census: allow(judge_refusal Undecided is too broad
-            //   — DEADLINE_EXCEEDED is Undecided but NOT provably
-            //   pre-merge here; the build_id-header gate is the law,
-            //   the code pair is its narrow trigger set)
             Err(st)
                 if rio_proto::is_retryable_refusal_code(st.code())
                     && st.metadata().get(rio_proto::BUILD_ID_HEADER).is_none()
                     && attempt < SUBMIT_RETRIES =>
             {
-                let delay = SUBMIT_RETRY_BACKOFF.duration(attempt);
+                let delay = backoff.duration(attempt);
                 attempt += 1;
                 tracing::debug!(
                     attempt,

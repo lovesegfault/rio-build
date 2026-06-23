@@ -68,16 +68,6 @@ test-group = "golden-daemon"
 slow-timeout = { period = "60s", terminate-after = 2 }
 priority = 100
 
-# submit-retry-exhaust: exhausts the 8-retry SUBMIT_RETRY_BACKOFF
-# (~63s mean, ~80s max with ±25% jitter) in real time —
-# `start_paused` auto-advance is incompatible with the harness's
-# real-socket GetPath (jumps the 300s stream-idle timeout). High
-# priority so it starts early and overlaps the rest of the suite.
-[[profile.default.overrides]]
-filter = "test(test_build_paths_submit_retry_budget_exhausts)"
-slow-timeout = { period = "120s", terminate-after = 1 }
-priority = 100
-
 # Protocol conformance and integration build tests also use real nix.
 [[profile.default.overrides]]
 filter = "test(/^test_(nix_store_|nix_path_|build_trivial)/)"

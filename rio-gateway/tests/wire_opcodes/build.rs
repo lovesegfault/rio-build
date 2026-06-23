@@ -54,34 +54,6 @@ async fn test_build_paths_success() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// wopBuildPaths with scheduler error: should send STDERR_ERROR.
-/// `Internal` (terminal — `is_retryable_refusal_code` = false) so the
-/// test exercises the diagnostic path without burning the ~80s
-/// SubmitBuild retry budget; retry exhaustion is
-/// `test_build_paths_submit_retry_budget_exhausts` below.
-#[tokio::test]
-async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Result<()> {
-    let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler
-        .set_submit_outcome(SubmitOutcome::Error(tonic::Code::Internal));
-
-    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
-
-    wire_send!(&mut h.stream;
-        u64: 9,                                  // wopBuildPaths
-        strings: &[format!("{drv_path}!out")],
-        u64: 0,
-    );
-
-    let err = drain_stderr_expecting_error(&mut h.stream).await?;
-    assert!(!err.message.is_empty());
-
-    h.finish().await;
-    Ok(())
-}
-
 /// wopBuildPaths when the scheduler stream closes without a terminal event
 /// (BuildCompleted/BuildFailed/BuildCancelled). Regression guard:
 /// process_build_events must NOT send STDERR_ERROR itself — it returns Err
@@ -1849,12 +1821,13 @@ async fn test_build_paths_empty_stream_reconnects_via_header() -> anyhow::Result
     Ok(())
 }
 
-/// SubmitBuild RPC itself fails (terminal — scheduler refused before
-/// accept). Gateway emits "SubmitBuild RPC failed" STDERR_NEXT before
-/// the caller's stderr_err!. No header, no build_id, nothing committed
-/// scheduler-side — correctly NOT a reconnect case. `Internal`
-/// (terminal) so the test asserts the diagnostic without burning the
-/// ~80s retry budget; the Unavailable/retry-exhaustion path is
+/// SubmitBuild RPC itself fails with a terminal code. Gateway emits
+/// "SubmitBuild RPC failed" STDERR_NEXT before the caller's
+/// stderr_err!. The mock returns `Err` before any header — gateway
+/// has no build_id to `WatchBuild` against, so this is correctly NOT
+/// a reconnect case. `Internal` (terminal —
+/// `is_retryable_refusal_code` = false) so the diagnostic surfaces on
+/// the first attempt; the retry-exhaustion path is
 /// `test_build_paths_submit_retry_budget_exhausts`.
 #[tokio::test]
 async fn test_build_paths_submit_rpc_fail_diagnostic() -> anyhow::Result<()> {
@@ -1878,10 +1851,11 @@ async fn test_build_paths_submit_rpc_fail_diagnostic() -> anyhow::Result<()> {
         "expected 'SubmitBuild RPC failed' STDERR_NEXT. frames: {frames:?}"
     );
 
-    // Terminal frame is STDERR_ERROR (opcode 9 stderr_err!).
+    // Terminal frame is STDERR_ERROR (opcode 9 stderr_err!) with a
+    // non-empty message.
     assert!(
-        matches!(frames.last(), Some(StderrMessage::Error(_))),
-        "expected STDERR_ERROR terminal. frames: {frames:?}"
+        matches!(frames.last(), Some(StderrMessage::Error(e)) if !e.message.is_empty()),
+        "expected STDERR_ERROR terminal with non-empty message. frames: {frames:?}"
     );
 
     h.finish().await;
@@ -3649,14 +3623,13 @@ async fn test_build_paths_submit_terminal_code_not_retried() -> anyhow::Result<(
 }
 
 // r[verify sched.grpc.fence-retryable]
-/// Retry exhaustion: UNAVAILABLE on every attempt → 1 + 8 bounded
-/// retries = 9 attempts, then the failure surfaces (no infinite
-/// loop). The SUBMIT_RETRY_BACKOFF schedule is ~63s mean
-/// `tokio::time::sleep`; `start_paused` auto-advance is incompatible
-/// with the harness's real-socket GetPath (it jumps the 300s
-/// stream-idle timeout before the mock store's chunk lands), so this
-/// runs in real time under a widened nextest slow-timeout
-/// (.config/nextest.toml `submit-retry-exhaust`).
+/// Retry exhaustion: UNAVAILABLE on every attempt → 1 initial +
+/// `SUBMIT_RETRIES` bounded retries, then the failure surfaces as
+/// `STDERR_ERROR` (no infinite loop). Runs in real time —
+/// `start_paused` auto-advance is incompatible with the per-attempt
+/// `with_timeout_status(SUBMIT_BUILD_TIMEOUT, …)` wrapper around real
+/// TCP to the mock — but the harness's `SUBMIT_RETRY_BACKOFF_OVERRIDE`
+/// collapses the per-retry sleep to 5ms, so the whole budget is ~40ms.
 #[tokio::test]
 async fn test_build_paths_submit_retry_budget_exhausts() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -3678,10 +3651,17 @@ async fn test_build_paths_submit_retry_budget_exhausts() -> anyhow::Result<()> {
         saw_diag,
         "exhausted retries surface the diagnostic. frames: {frames:?}"
     );
+    // Retryable-code exhaustion terminates with STDERR_ERROR, not
+    // STDERR_LAST — guards against an exhaustion-arm refactor that
+    // emits the diagnostic NEXT then breaks to the success epilogue.
+    assert!(
+        matches!(frames.last(), Some(StderrMessage::Error(_))),
+        "expected STDERR_ERROR terminal on exhaustion. frames: {frames:?}"
+    );
     assert_eq!(
         h.scheduler.submit_calls.read().unwrap().len(),
-        9,
-        "1 initial + 8 bounded retries, then stop"
+        rio_gateway::handler::SUBMIT_RETRIES as usize + 1,
+        "1 initial + SUBMIT_RETRIES bounded retries, then stop"
     );
 
     h.finish().await;

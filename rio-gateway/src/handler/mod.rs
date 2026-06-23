@@ -521,6 +521,8 @@ where
 // ---------------------------------------------------------------------------
 
 mod build;
+#[doc(hidden)]
+pub use build::{SUBMIT_RETRIES, SUBMIT_RETRY_BACKOFF_OVERRIDE};
 pub(crate) mod grpc;
 mod log_tail;
 mod opcodes_read;

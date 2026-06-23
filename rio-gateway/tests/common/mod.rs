@@ -215,6 +215,18 @@ impl GatewaySession {
         // with_test_writer, shown only on failure. Without this,
         // tracing::debug! in run_protocol error-log paths is void.
         init_test_logging();
+        // Idempotent (OnceLock; second set is a no-op Err): collapse
+        // submit_initial's pre-build_id retry backoff to 5ms-flat so
+        // the retry-exhaustion test runs in milliseconds instead of
+        // ~80s real time. Every test in this binary wants the short
+        // schedule; production never sets it.
+        let _ =
+            rio_gateway::handler::SUBMIT_RETRY_BACKOFF_OVERRIDE.set(rio_common::backoff::Backoff {
+                base: std::time::Duration::from_millis(5),
+                mult: 1.0,
+                cap: std::time::Duration::from_millis(5),
+                jitter: rio_common::backoff::Jitter::None,
+            });
         let (store, store_addr, store_handle) = spawn_mock_store().await?;
         let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
