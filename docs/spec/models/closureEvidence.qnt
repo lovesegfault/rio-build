@@ -3,7 +3,7 @@
 // Closure-evidence lifecycle model (the `topdown_pruned` / `closure_hole`
 // campaign, Phase 0b of closure-evidence-formal). Verification subject:
 // the as-built evidence lifecycle on `formal-sprint` — the pruned-merge
-// stamp (S1/S2 in the code inventory; `validate_and_ingest` +
+// stamp (S1/S2 in the code inventory; `prepare_merge_persist` +
 // `batch_upsert_derivations`), the five clears (the merge post-
 // reconciliation pass, the completion-time clear, the recovery gate, the
 // lazy walk-failure clear, the fail-fast consume), the four hole stamps

@@ -1369,7 +1369,7 @@ impl JobView {
 }
 
 /// One job the merge transaction created (or found via the dedup) —
-/// what `persist_merge_to_db` returns to the post-commit phase so the
+/// what `persist_merges` returns to the post-commit phase so the
 /// in-memory view is fed OUTSIDE the transaction (a rolled-back merge
 /// must leave no view entry; the view is a cache, not an authority).
 #[derive(Debug, Clone)]
@@ -1631,7 +1631,7 @@ impl DagActor {
     /// THE single job-creation helper for callers with NO enclosing
     /// transaction (every §2.1 probe-partition site calls this one fn —
     /// the "one helper" the design's B7 disposition requires; the merge
-    /// sites use the in-tx core inside `persist_merge_to_db` instead).
+    /// sites use the in-tx core inside `persist_merges` instead).
     /// No-op on standby. Creates the job row fenced + dedup'd, updates
     /// the in-memory view, and records the wanted relation for the
     /// creating build when one is named.

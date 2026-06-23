@@ -47,6 +47,23 @@ static CLASSIFY_EVIDENCE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
     )
 });
 
+/// Batch form of [`CLASSIFY_EVIDENCE_SQL`]: same per-child predicates,
+/// `GROUP BY parent_id` over `parent_id = ANY($1)`. A childless parent
+/// has no edges row → no group row; the caller treats absence as
+/// `ChildlessLeaf` (which is `!= Vouched`, the only question the merge
+/// path asks).
+static CLASSIFY_EVIDENCE_BATCH_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT e.parent_id, count(*), \
+                bool_and(({CHILD_PRODUCED_SQL}) AND ({CHILD_LIVE_VOUCHER_SQL})), \
+                bool_or(({CHILD_PRODUCED_SQL}) AND NOT ({CHILD_LIVE_VOUCHER_SQL})) \
+         FROM derivation_edges e \
+         JOIN derivations c ON c.derivation_id = e.child_id \
+         WHERE e.parent_id = ANY($1::uuid[]) \
+         GROUP BY e.parent_id",
+    )
+});
+
 impl SchedulerDb {
     /// Load all non-terminal builds. Terminal builds (succeeded/
     /// failed/cancelled) don't need recovery — they're done, and a
@@ -313,6 +330,36 @@ impl SchedulerDb {
             all_strict,
             stale_produced,
         ))
+    }
+
+    /// Batch form of [`Self::classify_durable_evidence_in_tx`] for the
+    /// merge transaction's pruned-origin gate (bug_390): one grouped
+    /// SELECT for the whole batch's pruned-candidate set instead of one
+    /// `fetch_one` per node inside the held fenced tx. Returns the
+    /// subset that classifies as `Vouched`; the caller checks
+    /// `!vouched.contains(id)`. Absent ids (childless — no
+    /// `derivation_edges` row) are NOT vouched, matching
+    /// [`classify_from_durable_row`]'s `ChildlessLeaf` cell.
+    pub(crate) async fn vouched_derivations_in_tx(
+        conn: &mut sqlx::PgConnection,
+        derivation_ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+        if derivation_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<(Uuid, i64, Option<bool>, Option<bool>)> =
+            sqlx::query_as(CLASSIFY_EVIDENCE_BATCH_SQL.as_str())
+                .bind(derivation_ids)
+                .fetch_all(conn)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, n, all_strict, stale)| {
+                classify_from_durable_row(*n, *all_strict, *stale)
+                    == rio_evidence_kernel::ClosureEvidence::Vouched
+            })
+            .map(|(id, _, _, _)| id)
+            .collect())
     }
 
     /// Load (build_id, derivation_id) links for a set of builds.

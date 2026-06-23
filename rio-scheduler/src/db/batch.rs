@@ -1,4 +1,4 @@
-//! Batch operations for `persist_merge_to_db` — build-derivation mapping +
+//! Batch operations for `persist_merges` — build-derivation mapping +
 //! `COPY`-streamed bulk inserts.
 
 use std::collections::HashMap;
@@ -112,7 +112,7 @@ impl SchedulerDb {
     /// `ON COMMIT DROP` temp table, then one `INSERT … SELECT FROM
     /// _merge_derivations ON CONFLICT … RETURNING`. The temp-table DDL
     /// runs here (self-contained) so direct callers — production's
-    /// `persist_merge_to_db` and the eight test sites — need no per-call
+    /// `persist_merges` and the eight test sites — need no per-call
     /// setup; the table is session-scoped to the caller's transaction
     /// connection and dropped at commit.
     ///
@@ -267,29 +267,19 @@ impl SchedulerDb {
             .collect())
     }
 
-    /// Batch-insert build_derivations links.
+    /// Batch-insert build_derivations links. Single-build convenience
+    /// over [`Self::batch_insert_build_derivations_multi`]; the
+    /// scalar-bind micro-optimization (~16·(N-1) wire bytes for the
+    /// repeated build_id) is negligible against a PG round-trip, so
+    /// one SQL string carries both shapes.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn batch_insert_build_derivations(
         tx: &mut PgConnection,
         build_id: Uuid,
         derivation_ids: &[Uuid],
     ) -> Result<(), sqlx::Error> {
-        if derivation_ids.is_empty() {
-            return Ok(());
-        }
-        // build_id is constant across rows — bind once as scalar $1,
-        // cross-join UNNEST of the derivation_id array. Two binds total.
-        sqlx::query(
-            r#"
-            INSERT INTO build_derivations (build_id, derivation_id)
-            SELECT $1, derivation_id FROM UNNEST($2::uuid[]) AS t(derivation_id)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(build_id)
-        .bind(derivation_ids)
-        .execute(&mut *tx)
-        .await?;
-        Ok(())
+        let pairs: Vec<(Uuid, Uuid)> = derivation_ids.iter().map(|&d| (build_id, d)).collect();
+        Self::batch_insert_build_derivations_multi(tx, &pairs).await
     }
 
     /// Multi-build form of [`Self::batch_insert_build_derivations`] —

@@ -138,7 +138,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
 // r[verify sched.db.batch-unnest+2]
 /// P0539 followup: "PG batch insert ~20s for ~1k rows in handle_merge_dag
 /// is FK validation cost." Regression guard at the followup's exact shape
-/// — 1k nodes, full `persist_merge_to_db` order (derivations →
+/// — 1k nodes, full `persist_merges` order (derivations →
 /// build_derivations → edges in one tx) — pinned at <2s.
 ///
 /// Research outcome (see [`rio_migrations::migrations::M_028`]):
@@ -227,7 +227,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
     assert_eq!(id_map.len(), N);
     assert!(
         total.as_secs() < 2,
-        "P0539: 1k-row persist_merge_to_db-shape batch took {total:?} (≥2s). \
+        "P0539: 1k-row persist_merges-shape batch took {total:?} (≥2s). \
          Original symptom was ~20s from per-row FK validation; migration 028 \
          dropped the →derivations FKs. If this fires, an FK or per-row \
          trigger came back on derivation_edges/build_derivations."

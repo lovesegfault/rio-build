@@ -759,7 +759,7 @@ under `docs/spec/models/calibration/` (re-runnable falsification record, not wir
 | CE-22 | WIRED-CHECK | `quint-closure-evidence-witness-downgrade-respawn` (the downgrade re-spawn arm is reachable); A12/A1 model properties; 29b5322e0 tests |
 | CE-23 | RESIDUAL | The accepted forgiveness residual hole — wired witness `quint-closure-evidence-witness-forgiven-residual` (the model REACHES it, negative calibration by design); 9bc7be84a documentation; deployment-checklist CE-D8-adjacent |
 | CE-24 | BY-CONSTRUCTION | The `topdown_pruned` state machine exists end-to-end (migration 063 + the mark lifecycle); WIRED `quint-closure-calib-f8-dispatch-no-evidence` (A1) + `kani-rio-evidence-kernel` (THIS STAGE) |
-| CE-25 | BY-CONSTRUCTION | Production: the stamp is a statement of the merge transaction itself (`persist_merge_to_db`, `sched.evidence.durability+2`); model: all-or-nothing intent (the 0d structural-override-inert record). The deferred structural override is closed as inert-at-abstraction — the abstraction IS the mechanism |
+| CE-25 | BY-CONSTRUCTION | Production: the stamp is a statement of the merge transaction itself (`persist_merges`, `sched.evidence.durability+2`); model: all-or-nothing intent (the 0d structural-override-inert record). The deferred structural override is closed as inert-at-abstraction — the abstraction IS the mechanism |
 | CE-26 | BY-CONSTRUCTION | Activation is the merge transaction's last statement (A13); wired witness `quint-closure-evidence-witness-rollback` |
 | CE-27 | TEST | Stamp gate requires dropped closure (`markImpliesClosureDropped`, A2 holds 0c); 03ff900e6 merge tests |
 | CE-28 | WIRED-CHECK | `quint-closure-calib-f7-clear-unbuilt` (co-rep with CE-30) |

@@ -2,7 +2,7 @@
 //!
 //! The DAG, state machine, and dispatch/completion pipelines operate on
 //! these instead of `rio_proto::types::*` directly. Conversion happens
-//! once at the actor boundary (top of `validate_and_ingest` /
+//! once at the actor boundary (top of `prepare_merge_persist` /
 //! `handle_completion`); everything downstream is wire-agnostic.
 //!
 //! Why a separate layer instead of using proto types end-to-end:

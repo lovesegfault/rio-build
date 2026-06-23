@@ -220,9 +220,9 @@ pub fn describe_metrics() {
     describe_histogram!(
         "rio_scheduler_mergedag_coalesce_batch_size",
         "Count of MergeDag commands drained per flush_pending_merges pass \
-         (P2 phase-5 coalesce). The le=1 bucket is the bit-identical \
-         single-merge fast path; le≥8 is where the per-merge ~13-round-trip \
-         persist transaction amortizes into one fenced batch tx."
+         (P2 phase-5 coalesce). N=1 and N>1 share one persist_merges path; \
+         le≥8 is where the per-merge ~13-round-trip persist transaction \
+         amortizes into one fenced batch tx."
     );
     describe_histogram!(
         "rio_scheduler_merge_phase_seconds",

@@ -168,6 +168,7 @@
     "rio_scheduler_materialization_stalled",
     "rio_scheduler_materialization_view_node_skew_total",
     "rio_scheduler_merge_phase_seconds",
+    "rio_scheduler_mergedag_coalesce_batch_size",
     "rio_scheduler_open_attempts",
     "rio_scheduler_open_materialization_attempts",
     "rio_scheduler_orphan_builds_cancelled_total",
@@ -1181,6 +1182,11 @@
         "name": "rio_scheduler_merge_phase_seconds",
         "kind": "histogram",
         "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+      },
+      {
+        "name": "rio_scheduler_mergedag_coalesce_batch_size",
+        "kind": "histogram",
+        "help": "Count of MergeDag commands drained per flush_pending_merges pass (P2 phase-5 coalesce). N=1 and N>1 share one persist_merges path; le≥8 is where the per-merge ~13-round-trip persist transaction amortizes into one fenced batch tx."
       },
       {
         "name": "rio_scheduler_open_attempts",

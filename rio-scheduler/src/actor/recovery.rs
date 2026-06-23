@@ -904,7 +904,7 @@ impl DagActor {
     /// "last drv → Completed" and "build → Succeeded" leaves the
     /// build Active with all derivations terminal; this fires
     /// `check_build_completion` for it. A crash mid-merge BEFORE
-    /// `persist_merge_to_db` leaves an Active build with ZERO
+    /// `persist_merges` leaves an Active build with ZERO
     /// `build_derivations` rows; this skips it (orphan guard) so it
     /// doesn't emit a spurious BuildCompleted with empty outputs.
     async fn finalize_recovered_builds(&mut self, bd_rows: &[(Uuid, Uuid)]) {

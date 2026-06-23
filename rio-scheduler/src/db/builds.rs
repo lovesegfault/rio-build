@@ -218,7 +218,7 @@ impl SchedulerDb {
     /// succeeded.
     ///
     /// In practice, cleanup_failed_merge calls this BEFORE
-    /// persist_merge_to_db has run, so there are typically no
+    /// persist_merges has run, so there are typically no
     /// build_derivations rows to cascade. The CASCADE is defense-in-depth
     /// for the persist-failed path (where rows exist but the tx rolled
     /// back, so they don't) and for manual admin cleanup.
@@ -251,7 +251,7 @@ impl SchedulerDb {
 
     // r[impl sched.evidence.durability+4]
     /// Flip a build to Active inside an existing transaction. The merge
-    /// path runs this as the LAST statement of `persist_merge_to_db`'s
+    /// path runs this as the LAST statement of `persist_merges`'s
     /// transaction so a committed merge implies an Active build: an
     /// activation failure aborts the whole merge — including the
     /// pruned-origin job rows and the build_derivations links — instead
@@ -268,31 +268,21 @@ impl SchedulerDb {
     /// through the single-threaded actor path today — the same command
     /// inserted the row — but kept as a cheap guard against a silent
     /// half-done commit.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn activate_build_tx(
         tx: &mut PgConnection,
         build_id: Uuid,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE builds SET status = 'active', started_at = now() WHERE build_id = $1",
-        )
-        .bind(build_id)
-        .execute(&mut *tx)
-        .await?;
-        // != 1 rather than == 0: >1 is impossible (build_id is the PK),
-        // but anything other than exactly one activated row means the
-        // merge must not commit.
-        if result.rows_affected() != 1 {
-            return Err(sqlx::Error::RowNotFound);
-        }
-        Ok(())
+        Self::activate_builds_tx(tx, std::slice::from_ref(&build_id)).await
     }
 
     /// Multi-build form of [`Self::activate_build_tx`] (P2 phase-5
-    /// coalesce). Same `rows_affected == len` guard so a missing build
-    /// row aborts the whole batch transaction — every merge in the
-    /// batch has already inserted its row in the same actor turn, so a
-    /// short count is the same "silent half-done commit" guard the
-    /// singular form has.
+    /// coalesce). `rows_affected == len` guard so a missing build row
+    /// aborts the whole batch transaction — every merge in the batch
+    /// has already inserted its row in the same actor turn, so a short
+    /// count is the same "silent half-done commit" guard the singular
+    /// form has. PostgreSQL plans `= ANY(1-element-array)` on a PK
+    /// identically to `= scalar`.
     pub(crate) async fn activate_builds_tx(
         tx: &mut PgConnection,
         build_ids: &[Uuid],

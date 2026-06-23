@@ -159,7 +159,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
 /// When check_cached_outputs fails with StoreUnavailable, the build
 /// row must be cleanly deleted — no orphan left in PG.
 ///
-/// If check_cached_outputs ran AFTER persist_merge_to_db +
+/// If check_cached_outputs ran AFTER persist_merges +
 /// transition_build(Active), cleanup_failed_merge's delete_build
 /// would FK-fail silently because build_derivations rows existed.
 /// On failover, recovery would resurrect the orphan build and run

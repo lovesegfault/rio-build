@@ -387,14 +387,14 @@ pub const M_027: () = ();
 ///
 /// Drop the three FKs referencing `derivations(derivation_id)` from
 /// `derivation_edges` (parent_id, child_id) and `build_derivations`
-/// (derivation_id). [P0539] perf — `persist_merge_to_db` for a
+/// (derivation_id). [P0539] perf — `persist_merges` for a
 /// 1085-node closure spent ~20s in FK validation.
 ///
 /// ## Why drop instead of DEFERRABLE
 ///
 /// `DEFERRABLE INITIALLY DEFERRED` moves the per-row trigger to
 /// COMMIT but still does N PK lookups. The DAG actor is the SOLE
-/// writer (`persist_merge_to_db`, `merge.rs:616-674`): one tx that
+/// writer (`persist_merges`, `merge.rs:616-674`): one tx that
 /// inserts derivations first (line 619) then edges/build_derivations
 /// referencing the just-returned `id_map`. Referential integrity is
 /// structural in that code path; the FK check is redundant validation

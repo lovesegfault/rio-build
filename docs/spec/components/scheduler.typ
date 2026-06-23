@@ -4191,7 +4191,7 @@ backoff. This prevents unbounded request queueing at the gateway layer.
 
 #r("sched.db.tx-commit-before-mutate")[
   In-memory `DerivationState.db_id` MUST NOT be set until the persisting
-  transaction has committed. Edge resolution during `persist_merge_to_db` reads
+  transaction has committed. Edge resolution during `persist_merges` reads
   the transaction-local `id_map` (returned by `RETURNING`), not `self.dag` ---
   decoupling the two eliminates the phantom-`db_id` class of bug where a
   rollback leaves in-memory state pointing at a `derivation_id` that never
@@ -4211,7 +4211,7 @@ backoff. This prevents unbounded request queueing at the gateway layer.
 ]
 
 #r("sched.db.merge-batch-shape")[
-  `persist_merge_to_db` MUST stream `derivations` and `derivation_edges`
+  `persist_merges` MUST stream `derivations` and `derivation_edges`
   via `COPY FROM STDIN` into `ON COMMIT DROP` temp tables before the
   `ON CONFLICT` upsert, so a 14k-derivation merge persists in sub-second
   wall-clock instead of paying the per-row UNNEST decode + upsert cost.
