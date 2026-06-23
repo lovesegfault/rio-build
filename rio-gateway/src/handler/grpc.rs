@@ -482,16 +482,19 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
     let mut req = with_jwt(outbound, jwt_token)?;
     attach_service_token(&mut req, service_signer);
-    // bug_118: with_timeout_status (not with_timeout) so the
-    // store's Status survives to the surfacing fn typed — a timeout
-    // classifies deadline_exceeded instead of laundering through an
-    // anyhow message into "unknown".
-    let rpc: tokio::task::JoinHandle<
+    // I-211: NO whole-stream timeout here — `GRPC_STREAM_TIMEOUT` is a
+    // per-chunk IDLE bound applied in the pump (each `tx.send`) and on
+    // the final response wait below, mirroring GetPath. The previous
+    // whole-stream wrap meant a store parked on `NarBudget` (cold-start
+    // burst, KEDA scaler blind ~2min post-deploy) hit DeadlineExceeded
+    // at 300s regardless of progress; the idle bound trips only when the
+    // store makes no progress on a single chunk for the window.
+    // bug_118: the synthesized timeout below is a typed
+    // `Status::deadline_exceeded` so it classifies, not launders through
+    // anyhow into "unknown".
+    let mut rpc: tokio::task::JoinHandle<
         Result<tonic::Response<types::PutPathResponse>, tonic::Status>,
-    > = tokio::spawn(async move {
-        rio_common::grpc::with_timeout_status("PutPath", GRPC_STREAM_TIMEOUT, client.put_path(req))
-            .await
-    });
+    > = tokio::spawn(async move { client.put_path(req).await });
 
     // Read exactly nar_size bytes in NAR_CHUNK_SIZE chunks, forward each.
     // Backpressure: tx.send blocks when rpc isn't pulling. On a short read
@@ -502,7 +505,10 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // Concurrent-race after `drain_stream` timed out), so the pump must
     // STILL consume nar_size to honor the "reads exactly nar_size bytes"
     // contract callers depend on for wire positioning.
-    let pump_result: anyhow::Result<()> = async {
+    // `Ok(true)` = per-chunk idle bound fired (store parked); reader
+    // drained to `nar_size`. `Ok(false)` = pump completed (or rx dropped
+    // early). `Err` = NarRead.
+    let pump_result: anyhow::Result<bool> = async {
         let mut remaining = nar_size;
         let mut chunk = vec![0u8; NAR_CHUNK_SIZE];
         while remaining > 0 {
@@ -515,54 +521,107 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
                     source: e,
                 })?;
             remaining -= n as u64;
-            if tx
-                .send(types::PutPathRequest {
+            // I-211: per-chunk idle bound. `tx.send` blocks once the
+            // bounded(CHANNEL_BUF) channel is full — i.e. when the rpc
+            // task isn't pulling because the store isn't reading the
+            // stream. A parked store (NarBudget semaphore) shows up as a
+            // stalled send; the store pulling a chunk is progress and
+            // re-arms the deadline. A 4 GiB NAR completes as long as the
+            // store accepts a chunk every <`GRPC_STREAM_TIMEOUT`.
+            match tokio::time::timeout(
+                GRPC_STREAM_TIMEOUT,
+                tx.send(types::PutPathRequest {
                     msg: Some(types::put_path_request::Msg::NarChunk(chunk[..n].to_vec())),
-                })
-                .await
-                .is_err()
+                }),
+            )
+            .await
             {
-                // rx dropped → rpc task already finished. It MAY have
-                // returned Ok(created:false) early, so drain nar_reader
-                // to nar_size before returning Ok — otherwise the
-                // caller's framed reader is left mid-NAR and the next
-                // entry's header parses garbage. If rpc_result is Err,
-                // that surfaces via rpc_result? below regardless.
-                tokio::io::copy(
-                    &mut (&mut *nar_reader).take(remaining),
-                    &mut tokio::io::sink(),
-                )
-                .await
-                .map_err(|e| GatewayError::NarRead {
-                    context: format!("draining {remaining} of {nar_size} after store early-Ok"),
-                    source: e,
-                })?;
-                return Ok(());
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    // rx dropped → rpc task already finished. It MAY have
+                    // returned Ok(created:false) early, so drain nar_reader
+                    // to nar_size before returning Ok — otherwise the
+                    // caller's framed reader is left mid-NAR and the next
+                    // entry's header parses garbage. If rpc_result is Err,
+                    // that surfaces via rpc_result? below regardless.
+                    tokio::io::copy(
+                        &mut (&mut *nar_reader).take(remaining),
+                        &mut tokio::io::sink(),
+                    )
+                    .await
+                    .map_err(|e| GatewayError::NarRead {
+                        context: format!("draining {remaining} of {nar_size} after store early-Ok"),
+                        source: e,
+                    })?;
+                    return Ok(false);
+                }
+                Err(_elapsed) => {
+                    // Idle bound hit. Drain to `nar_size` to honour the
+                    // wire-positioning contract (same as the early-Ok
+                    // arm) before signalling timeout to the caller.
+                    tokio::io::copy(
+                        &mut (&mut *nar_reader).take(remaining),
+                        &mut tokio::io::sink(),
+                    )
+                    .await
+                    .map_err(|e| GatewayError::NarRead {
+                        context: format!("draining {remaining} of {nar_size} after idle timeout"),
+                        source: e,
+                    })?;
+                    return Ok(true);
+                }
             }
         }
 
         // Trailer: client-declared hash. Store validates independently.
-        if tx
-            .send(types::PutPathRequest {
+        match tokio::time::timeout(
+            GRPC_STREAM_TIMEOUT,
+            tx.send(types::PutPathRequest {
                 msg: Some(types::put_path_request::Msg::Trailer(
                     types::PutPathTrailer {
                         nar_hash: client_nar_hash,
                         nar_size,
                     },
                 )),
-            })
-            .await
-            .is_err()
+            }),
+        )
+        .await
         {
-            return Ok(());
+            // Sent, or rx already dropped — either way the pump is done.
+            Ok(_) => Ok(false),
+            Err(_elapsed) => Ok(true),
         }
-        Ok(())
     }
     .await;
 
     drop(tx); // close channel → ReceiverStream yields None → rpc completes
 
-    let rpc_result = rpc.await.map_err(|e| {
+    let pump_idle = matches!(pump_result, Ok(true));
+    // I-211: the per-chunk idle bound also covers the final response
+    // wait — the NarBudget park happens before the first chunk-ack, so a
+    // tiny NAR (fewer than CHANNEL_BUF chunks; no send blocks) observes
+    // the park HERE, not in the pump. On pump idle the store is parked
+    // and won't respond on stream-close: abort the task and synthesize
+    // the typed DeadlineExceeded the surfacing fn expects (bug_118).
+    let rpc_join = if pump_idle {
+        rpc.abort();
+        let _ = rpc.await;
+        Ok(Err(tonic::Status::deadline_exceeded(format!(
+            "PutPath stream idle for {GRPC_STREAM_TIMEOUT:?} (store not pulling chunks)"
+        ))))
+    } else {
+        match tokio::time::timeout(GRPC_STREAM_TIMEOUT, &mut rpc).await {
+            Ok(join) => join,
+            Err(_elapsed) => {
+                rpc.abort();
+                let _ = rpc.await;
+                Ok(Err(tonic::Status::deadline_exceeded(format!(
+                    "PutPath response idle for {GRPC_STREAM_TIMEOUT:?} (store parked)"
+                ))))
+            }
+        }
+    };
+    let rpc_result = rpc_join.map_err(|e| {
         // bug_118: terminal arm (task panic — no store status).
         surface_put_path_failure_any(
             GatewayError::GrpcStream(format!("PutPath task panicked: {e}")).into(),
@@ -579,7 +638,9 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // that SURFACES is the one surfaced through the emit law (a
     // swallowed rpc error behind a winning pump error stays uncounted
     // by design: one operation, one terminal observation).
-    pump_result.map_err(surface_put_path_failure_any)?;
+    if let Err(e) = pump_result {
+        return Err(surface_put_path_failure_any(e));
+    }
     let status = match rpc_result {
         Ok(resp) => return Ok(resp.into_inner().created),
         // bug_118: the surfacing fn IS the emit site — the store's
