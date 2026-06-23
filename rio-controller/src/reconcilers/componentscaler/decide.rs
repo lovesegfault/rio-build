@@ -514,20 +514,8 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_crds::componentscaler::{Replicas, Signal, TargetRef};
-
     fn spec(min: i32, max: i32) -> ComponentScalerSpec {
-        ComponentScalerSpec {
-            target_ref: TargetRef {
-                kind: "Deployment".into(),
-                name: "rio-store".into(),
-            },
-            signal: Signal::SchedulerBuilders,
-            replicas: Replicas { min, max },
-            seed_ratio: 50.0,
-            load_endpoint: "rio-store-headless.rio-store:9002".into(),
-            load_thresholds: LoadThresholds::default(),
-        }
+        ComponentScalerSpec::test_fixture(min, max)
     }
 
     fn status(ratio: Option<f64>, low_ticks: u32) -> ComponentScalerStatus {

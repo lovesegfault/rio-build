@@ -679,17 +679,7 @@ mod tests {
     }
 
     fn cs_spec(min: i32, max: i32) -> ComponentScalerSpec {
-        ComponentScalerSpec {
-            target_ref: rio_crds::componentscaler::TargetRef {
-                kind: "Deployment".into(),
-                name: "rio-store".into(),
-            },
-            signal: Signal::SchedulerBuilders,
-            replicas: rio_crds::componentscaler::Replicas { min, max },
-            seed_ratio: 50.0,
-            load_endpoint: "rio-store-headless:9002".into(),
-            load_thresholds: rio_crds::componentscaler::LoadThresholds::default(),
-        }
+        ComponentScalerSpec::test_fixture(min, max)
     }
 
     fn cs_status(ratio: f64) -> ComponentScalerStatus {

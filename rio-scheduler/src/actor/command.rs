@@ -1211,9 +1211,16 @@ impl ActorError {
     /// `Database(Protocol)` as
     /// RetryClass representatives at the fan-out site would silently
     /// desync if either is ever reclassified; the `debug_assert_eq!`
-    /// here is the structural tie-back. Exhaustive match: a third
+    /// here AND the release-mode `retry_class_code_consistency`
+    /// COUNT-pinned exhaustive test are the structural tie-back (the
+    /// debug_assert alone would not catch a `NotLeader→Terminal`
+    /// reclassification in release). Exhaustive match: a third
     /// RetryClass variant is a compile error here, not a silent
-    /// boolean collapse to Terminal.
+    /// boolean collapse to Terminal. The Retryable arm discards `msg`
+    /// (`NotLeader` is unit) — observability-only: the gateway retries
+    /// on class and never surfaces the sibling error body to the user;
+    /// an `ActorError::BatchSibling { class, msg }` variant is the
+    /// honest API shape if this fn grows a second caller.
     pub(crate) fn synthesize_for_class(class: RetryClass, msg: String) -> Self {
         let out = match class {
             RetryClass::Retryable => Self::NotLeader,

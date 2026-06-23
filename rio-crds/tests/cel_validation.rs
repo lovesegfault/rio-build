@@ -20,9 +20,7 @@
 use std::collections::BTreeMap;
 
 use kube::core::cel::{ValidationErrors, validate_cel};
-use rio_crds::componentscaler::{
-    ComponentScaler, ComponentScalerSpec, LoadThresholds, Replicas, Signal, TargetRef,
-};
+use rio_crds::componentscaler::{ComponentScaler, ComponentScalerSpec, LoadThresholds, Replicas};
 use rio_crds::pool::{ExecutorKind, Pool, PoolSpec, SeccompProfileKind};
 
 /// Minimal valid `PoolSpec` for `kind` — every CEL rule on
@@ -36,18 +34,10 @@ fn pool_spec(kind: ExecutorKind) -> PoolSpec {
 
 /// Minimal valid `ComponentScalerSpec` — every nested CEL rule
 /// (Replicas / TargetRef / LoadThresholds / loadEndpoint) passes.
+/// Delegates to [`ComponentScalerSpec::test_fixture`] (the single
+/// E0063 touch-point shared with rio-controller's fixtures).
 fn cscaler_spec() -> ComponentScalerSpec {
-    ComponentScalerSpec {
-        target_ref: TargetRef {
-            kind: "Deployment".into(),
-            name: "rio-store".into(),
-        },
-        signal: Signal::SchedulerBuilders,
-        replicas: Replicas { min: 2, max: 14 },
-        seed_ratio: 50.0,
-        load_endpoint: "rio-store-headless.rio-store:9002".into(),
-        load_thresholds: LoadThresholds::default(),
-    }
+    ComponentScalerSpec::test_fixture(2, 14)
 }
 
 /// Unwrap-err helper that names which rule under test passed when it

@@ -195,6 +195,31 @@ pub struct ComponentScalerSpec {
     pub load_thresholds: LoadThresholds,
 }
 
+impl ComponentScalerSpec {
+    /// Minimal `ComponentScalerSpec` with `replicas: {min, max}` and
+    /// every nested CEL rule (Replicas / TargetRef / LoadThresholds /
+    /// loadEndpoint) passing.
+    ///
+    /// **NEXT FIELD ADD: touch THIS fn — 1 site.** Single E0063
+    /// touch-point shared by `rio-crds`'s CEL tests and
+    /// `rio-controller`'s reconciler tests; same discipline as
+    /// [`crate::pool::PoolSpec::test_fixture`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_fixture(min: i32, max: i32) -> Self {
+        Self {
+            target_ref: TargetRef {
+                kind: "Deployment".into(),
+                name: "rio-store".into(),
+            },
+            signal: Signal::SchedulerBuilders,
+            replicas: Replicas { min, max },
+            seed_ratio: 50.0,
+            load_endpoint: "rio-store-headless.rio-store:9002".into(),
+            load_thresholds: LoadThresholds::default(),
+        }
+    }
+}
+
 /// ComponentScaler status. The reconciler writes ALL fields (single
 /// SSA field-manager — there's no separate autoscaler task here, the
 /// reconciler IS the autoscaler).

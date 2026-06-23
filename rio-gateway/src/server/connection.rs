@@ -765,9 +765,28 @@ pub struct ConnectionHandler {
     /// at `exec_request` instead. They are NOT in `accepted_channels` and
     /// have NO entry in `channel_writers` (the channel handle is dropped
     /// immediately, both halves), so they never reach the protocol path.
-    /// Bounded by `max_channels_per_connection` — `channel_open_session`
-    /// terminates the connection at `2 * max` total to keep russh-side
-    /// state bounded against a hostile spammer.
+    ///
+    /// Removal MIRRORS russh's own channel-table removal: only on the
+    /// CLIENT-sent `SSH_MSG_CHANNEL_CLOSE` (`Handler::channel_close`).
+    /// `reject_exec`'s server-side close does NOT remove the entry — a
+    /// compliant client answers a server close with its own (RFC 4254
+    /// §5.3), at which point russh frees its table entry and this set
+    /// drains in lockstep. Removing on `reject_exec` would let a
+    /// hostile client that withholds CLOSE (or never execs) grow
+    /// russh's table while this set stays empty, defeating the
+    /// backstop. The set is therefore a proxy for un-reclaimable
+    /// russh-side entries; its `len()` reaching
+    /// `max_channels_per_connection` is the hard backstop in
+    /// `channel_open_session` (a client there is hostile or badly
+    /// leaking, and terminating the connection — accepting the loss of
+    /// up to `max` legitimate in-flight sessions — is the only
+    /// bounded response). `data()` / `channel_eof()` for an over-bound
+    /// id fall through to their unknown-id no-op arms (no
+    /// `accepted_channels`/`channel_writers`/`sessions` entry exists);
+    /// folding this into a single `HashMap<ChannelId, Disposition>`
+    /// alongside `accepted_channels` is forward-work
+    /// (maintainability, not correctness — every fall-through is
+    /// benign today).
     pub(super) over_bound_channels: std::collections::HashSet<ChannelId>,
     /// Window-aware write halves of accepted channels, split off in
     /// `channel_open_session` and held until the channel either execs
@@ -1377,16 +1396,17 @@ impl Handler for ConnectionHandler {
         // sends no CHANNEL_CLOSE for an open that failed, and russh's
         // open-failure removal only covers server-initiated opens. The
         // accept-then-reject-at-exec path keeps russh state bounded by
-        // the hard backstop below: at `2 * max` total open channels
-        // (under-bound + over-bound) the connection IS terminated — a
-        // client that gets there is hostile or badly leaking, not a
-        // legitimate ControlMaster fan-out (a 128-core CI box running
+        // the hard backstop below: when `over_bound_channels` itself
+        // reaches `max` the connection IS terminated — a client that
+        // gets there is hostile or badly leaking, not a legitimate
+        // ControlMaster fan-out (a 128-core CI box running
         // nix-fast-build behind one mux is ~128 channels, ~4× under the
-        // soft bound).
+        // soft bound). `open_channels` cannot exceed `max` (over-bound
+        // opens return before `note_channel_accepted`), so inside this
+        // branch `open_channels == max` and the backstop reduces to the
+        // set length alone — exactly the bound the field doc states.
         if self.open_channels >= self.max_channels_per_connection {
-            if self.open_channels + self.over_bound_channels.len()
-                >= 2 * self.max_channels_per_connection
-            {
+            if self.over_bound_channels.len() >= self.max_channels_per_connection {
                 warn!(
                     peer = ?self.peer_addr,
                     open = self.open_channels,
