@@ -782,7 +782,10 @@ pub struct ConnectionHandler {
     /// up to `max` legitimate in-flight sessions — is the only
     /// bounded response). `data()` / `channel_eof()` for an over-bound
     /// id fall through to their unknown-id no-op arms (no
-    /// `accepted_channels`/`channel_writers`/`sessions` entry exists);
+    /// `accepted_channels`/`channel_writers`/`sessions` entry exists —
+    /// `data()`'s `rio_gateway_bytes_total{rx}` increment is gated on
+    /// the `sessions` lookup so dropped over-bound traffic does NOT
+    /// inflate the throughput counter);
     /// folding this into a single `HashMap<ChannelId, Disposition>`
     /// alongside `accepted_channels` is forward-work
     /// (maintainability, not correctness — every fall-through is
@@ -1757,9 +1760,15 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        metrics::counter!("rio_gateway_bytes_total", "direction" => "rx")
-            .increment(data.len() as u64);
         if let Some(chan_session) = self.sessions.get(&channel) {
+            // Gated on the sessions lookup: an over-bound channel id
+            // (in `over_bound_channels`, never in `sessions`) must NOT
+            // inflate the rx throughput counter — that traffic is
+            // intentionally dropped, and the field doc claims this arm
+            // is a benign no-op. Pre-soft-bound the path was
+            // unreachable (over-bound bailed the connection).
+            metrics::counter!("rio_gateway_bytes_total", "direction" => "rx")
+                .increment(data.len() as u64);
             if let Some(tx) = &chan_session.client_tx {
                 debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
                 if tx.send(data.to_vec()).await.is_err() {
