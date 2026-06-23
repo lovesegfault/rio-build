@@ -2170,6 +2170,58 @@ async fn verify_preexisting_with_poisoned_dep_goes_dependency_failed() -> TestRe
     Ok(())
 }
 
+/// Phase-6c persist is O(1) PG round-trips, not O(reset nodes).
+///
+/// Pre-fix `verify_preexisting_completed` issued one fenced
+/// `update_derivation_status` per reset node + one per demoted parent
+/// — under GC-churn that is N round-trips per merge (the 307ms/merge
+/// tall-pole in the submitbuild-exhausted diag; 170f98983 TODO). With
+/// the batch-by-target persist, N=20 leaf resets must cost ≤3 fenced
+/// batches (one per `revert_target_for` status; here: all Ready → 1).
+// r[verify sched.merge.stale-completed-verify+5]
+#[tokio::test]
+async fn verify_preexisting_reset_persists_batched() -> TestResult {
+    use std::sync::atomic::Ordering;
+    const N: usize = 20;
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // N pre-existing Completed leaves whose recorded output is NOT in
+    // the mock store → FindMissingPaths returns them all as missing →
+    // pass-2 resets every one.
+    let mut nodes = Vec::with_capacity(N);
+    for i in 0..N {
+        let tag = format!("vprb-{i}");
+        let mut n = make_node(&tag);
+        n.expected_output_paths = vec![test_store_path(&format!("{tag}-out"))];
+        nodes.push(n);
+    }
+    merge_dag(&handle, Uuid::new_v4(), nodes.clone(), vec![], false).await?;
+    for n in &nodes {
+        handle
+            .debug_force_status(&n.drv_hash, DerivationStatus::Completed)
+            .await?;
+        handle
+            .debug_set_output_paths(&n.drv_hash, n.expected_output_paths.clone())
+            .await?;
+    }
+    barrier(&handle).await;
+
+    let before = crate::actor::merge::PHASE_6C_PG_AWAITS.load(Ordering::SeqCst);
+    merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    barrier(&handle).await;
+    let delta = crate::actor::merge::PHASE_6C_PG_AWAITS.load(Ordering::SeqCst) - before;
+
+    assert!(
+        delta <= 3,
+        "phase-6c reset persist must be ≤3 fenced batches for N={N} resets \
+         (one per revert_target_for status); pre-fix: {N} round-trips. got {delta}"
+    );
+    // The structural property is the bound; also confirm the batch
+    // actually fired (every reset node IS missing here).
+    assert!(delta >= 1, "at least one batch must fire (N={N} resets)");
+    Ok(())
+}
+
 // D3-retarget (flipped with the walk spawner's deletion): the eager
 // whole-submission probe survives; the routed mechanism is one job per
 // substitutable leaf (in the merge transaction).

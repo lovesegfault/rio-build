@@ -351,8 +351,11 @@ fn dag_authority_single_mint_site() {
 ///
 /// - `completion.rs`: 1 — `persist_status_batch` (the at-transition
 ///   writer; its FAILURE latches into the outbox).
-/// - `merge.rs`: 2 — the merge tail's reset/lane persists (statuses
-///   the merge just decided, same transaction epoch).
+/// - `merge.rs`: 3 — the merge tail's reset/lane persists (statuses
+///   the merge just decided, same transaction epoch): the existing
+///   reprobe/lane batches plus `verify_preexisting_completed`'s
+///   batched stale-reset persist (was per-node `update_derivation_
+///   status` until the 6c 307ms/merge batching).
 ///
 /// `housekeeping.rs` MUST be 0: the outbox flush re-drives through
 /// `replay_status_batch_guarded` (flush-time re-derivation +
@@ -360,7 +363,7 @@ fn dag_authority_single_mint_site() {
 /// stale-replay regression class reopening — route it here by name.
 #[test]
 fn absolute_status_batch_writer_callers_pinned() {
-    const ALLOWED: &[(&str, usize)] = &[("completion.rs", 1), ("merge.rs", 2)];
+    const ALLOWED: &[(&str, usize)] = &[("completion.rs", 1), ("merge.rs", 3)];
     let mut offenders = Vec::new();
     for (file, src) in ACTOR_SOURCES {
         let hits = src

@@ -64,6 +64,16 @@ pub(super) struct PendingMerge {
 #[cfg(test)]
 pub(crate) static FMP_AWAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Phase-6c PG round-trip witness: incremented at each
+/// `update_derivation_status_batch` call inside
+/// [`DagActor::verify_preexisting_completed`]. The 307ms/merge
+/// regression diag (170f98983 TODO) needed a structural assertion
+/// that 6c persists at O(1) round-trips per merge, NOT O(reset
+/// nodes) — `verify_preexisting_reset_persists_batched` pins this.
+#[cfg(test)]
+pub(crate) static PHASE_6C_PG_AWAITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Cross-phase carrier from [`DagActor::prepare_merge_persist`] to
 /// [`DagActor::reconcile_merged_state`].
 ///
@@ -2459,9 +2469,16 @@ impl DagActor {
         // Pass 2: per-node, compute deps_ok against reset_set + DAG
         // state, then transition to Ready (deps ok) or Queued (a dep
         // also reset / not done).
+        //
+        // PG persist is BATCHED by target after the loop (≤3 status
+        // groups → ≤3 fenced round-trips, NOT |reset_set| — the
+        // 307ms/merge tall-pole this phase showed in the
+        // submitbuild-exhausted diag was N round-trips here under
+        // GC-churn; same iter-10 #8/#9 batch-scoped pattern).
         let mut reset = HashSet::new();
         let mut to_spawn: Vec<(DrvHash, Vec<String>)> = Vec::new();
         let mut demote_parents: HashSet<DrvHash> = HashSet::new();
+        let mut to_persist: HashMap<DerivationStatus, Vec<String>> = HashMap::new();
         for (drv_hash, output_paths, unwanted) in candidates {
             let Some(gone) = output_paths
                 .iter()
@@ -2527,22 +2544,7 @@ impl DagActor {
                  (GC'd?); resetting for re-dispatch"
             );
             metrics::counter!("rio_scheduler_stale_completed_reset_total").increment(1);
-
-            match self
-                .db
-                .update_derivation_status(&drv_hash_k, target, None, self.serving_generation())
-                .await
-            {
-                Ok(crate::db::FencedOutcome::Fenced) => {
-                    self.note_fenced_evidence_write("stale-completed reset persist");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    error!(drv_hash = %drv_hash, error = %e, ?target,
-                           "failed to persist stale-completed reset \
-                            (build is Active; continuing)");
-                }
-            }
+            to_persist.entry(target).or_default().push(drv_hash.clone());
             // Substitutable subset: route to a materialization job
             // instead of arming a from-source dispatch — for the
             // !deps_ok arm TOO (merged_bug_257): job creation has no
@@ -2618,23 +2620,37 @@ impl DagActor {
             }
             warn!(drv_hash = %p,
                   "stale-completed verify: demoting Ready parent of reset dep → Queued");
+            to_persist
+                .entry(DerivationStatus::Queued)
+                .or_default()
+                .push(p.to_string());
+        }
+
+        // Batched persist (pass-2 resets + pass-3 demotions): grouped
+        // by target status, ≤3 fenced round-trips for any |reset_set|.
+        // The singular `update_derivation_status` passed
+        // `assigned_executor = None`; the batch helper hard-NULLs
+        // `assigned_builder_id`, so identical row effect. Fence/err
+        // posture matches the per-node form: log-and-continue (build
+        // is Active+committed; DB sync catches up on the next status
+        // update).
+        for (target, hashes) in to_persist {
+            #[cfg(test)]
+            PHASE_6C_PG_AWAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
             match self
                 .db
-                .update_derivation_status(
-                    &p,
-                    DerivationStatus::Queued,
-                    None,
-                    self.serving_generation(),
-                )
+                .update_derivation_status_batch(&refs, target, self.serving_generation())
                 .await
             {
                 Ok(crate::db::FencedOutcome::Fenced) => {
-                    self.note_fenced_evidence_write("Ready-parent demotion persist");
+                    self.note_fenced_evidence_write("stale-completed reset persist");
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    error!(drv_hash = %p, error = %e,
-                           "failed to persist Ready-parent demotion (continuing)");
+                    error!(error = %e, ?target, count = refs.len(),
+                           "failed to persist stale-completed reset batch \
+                            (build is Active; continuing)");
                 }
             }
         }
