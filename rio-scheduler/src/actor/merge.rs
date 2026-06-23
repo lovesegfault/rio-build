@@ -361,10 +361,11 @@ impl DagActor {
     /// the `MergeDag` command itself is now µs-class intake
     /// (`prices_into_drain` no longer folds it), so every flush
     /// trigger — (i) eager here, (iv) the deadline arm, (v) the
-    /// inline post-dispatch check — routes through this wrapper. A
-    /// future flush trigger that calls [`Self::flush_pending_merges`]
-    /// directly silently regresses the cost-axis law on that path
-    /// (the EWMA decays to zero while real merge cost piles up).
+    /// inline post-dispatch check — routes through this wrapper.
+    /// `flush_pending_merges` is module-private so a new flush trigger
+    /// in `mod.rs`/`housekeeping.rs` cannot reach for it directly and
+    /// silently regress the cost-axis law on that path (the EWMA
+    /// decays to zero while real merge cost piles up).
     pub(super) async fn flush_pending_merges_priced(&mut self) {
         let t = std::time::Instant::now();
         self.flush_pending_merges().await;
@@ -386,7 +387,7 @@ impl DagActor {
     /// `removed_retriable`; later merges' `dag.merge` ran on top of
     /// earlier ones, so unwind order matters) and replies `Err` to
     /// each — the gateway's `is_retryable_refusal_code` retries.
-    pub(super) async fn flush_pending_merges(&mut self) {
+    async fn flush_pending_merges(&mut self) {
         if self.pending_merges.is_empty() {
             return;
         }
@@ -639,6 +640,24 @@ impl DagActor {
         // SubmitBuild not in this request's `nodes`). Does NOT read
         // `self.dag.node().db_id` for nodes in THIS batch — that
         // field isn't set until after commit() below.
+        //
+        // ONE batch-wide path_to_hash (not per-merge): merge[k]'s edge
+        // to a node merge[j<k] introduced resolves through `id_map`
+        // (the cross-merge-within-batch case the per-merge map missed
+        // and `self.dag.db_id_for_path` cannot serve until
+        // post-commit), and the held fenced tx no longer rebuilds
+        // O(|nodes_i|) HashMaps × MERGE_PERSIST_BATCH_MAX.
+        let path_to_hash: HashMap<&str, &str> = prepared
+            .iter()
+            .flat_map(|p| p.ingest.nodes.iter())
+            .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
+            .collect();
+        let resolve = |drv_path: &str| -> Option<Uuid> {
+            path_to_hash
+                .get(drv_path)
+                .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
+                .or_else(|| self.dag.db_id_for_path(drv_path))
+        };
         let n_edges_est: usize = prepared.iter().map(|p| p.edges.len()).sum();
         let mut link_builds: Vec<Uuid> = Vec::with_capacity(n_nodes_est);
         let mut link_drvs: Vec<Uuid> = Vec::with_capacity(n_nodes_est);
@@ -651,18 +670,6 @@ impl DagActor {
             // route the original to `replies[k]`, not `replies[0]`.
             *culprit = k;
             build_ids.push(p.ingest.build_id);
-            let path_to_hash: HashMap<&str, &str> = p
-                .ingest
-                .nodes
-                .iter()
-                .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
-                .collect();
-            let resolve = |drv_path: &str| -> Option<Uuid> {
-                path_to_hash
-                    .get(drv_path)
-                    .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
-                    .or_else(|| self.dag.db_id_for_path(drv_path))
-            };
             for node in &p.ingest.nodes {
                 if let Some((id, _)) = id_map.get(node.drv_hash.as_str()) {
                     link_builds.push(p.ingest.build_id);
@@ -732,17 +739,26 @@ impl DagActor {
                     .iter()
                     .filter_map(|h| id_map.get(h.as_str()).map(|(id, _)| *id))
             })
+            // Cross-merge dedup (overlapping closures — the P2 target
+            // shape) before the = ANY($1::uuid[]) bind; same rationale
+            // as `reset_seen` below. PG's GROUP BY tolerates dupes but
+            // the wire payload + ANY() scan are inflated inside the
+            // held fenced tx.
+            .collect::<HashSet<Uuid>>()
+            .into_iter()
             .collect();
         let vouched =
             crate::db::SchedulerDb::vouched_derivations_in_tx(tx.conn(), &pruned_ids).await?;
 
         // Per-merge job-row construction (pruned/new_sub/reprobe
         // lanes), concatenated into ONE
-        // `create_materialization_jobs_in_tx`. Owned drv_hash strings:
+        // `create_materialization_jobs_in_tx`. `DrvHash` (Arc-backed):
         // `NewJobRow` borrows `&str`, and the per-merge lanes it
-        // borrows from would otherwise be three disjoint lifetimes.
+        // borrows from would otherwise be three disjoint lifetimes;
+        // the Arc bump on push and the move into `CreatedJob`
+        // post-commit are both alloc-free.
         // r[impl sched.materialize.job+2]
-        let mut job_specs: Vec<(Uuid, String, Option<Uuid>, crate::state::JobOrigin)> = Vec::new();
+        let mut job_specs: Vec<(Uuid, DrvHash, Option<Uuid>, crate::state::JobOrigin)> = Vec::new();
         let mut job_spans: Vec<usize> = Vec::with_capacity(prepared.len());
         let mut all_reset_hashes: Vec<DrvHash> = Vec::new();
         let mut all_reset_rows: Vec<crate::db::attempts::AttemptRow> = Vec::new();
@@ -766,7 +782,7 @@ impl DagActor {
                     queued.insert(h.as_str());
                     job_specs.push((
                         *db_id,
-                        h.clone(),
+                        DrvHash::from(h.as_str()),
                         p.tenant_id,
                         crate::state::JobOrigin::Pruned,
                     ));
@@ -779,7 +795,7 @@ impl DagActor {
                     queued.insert(h.as_str());
                     job_specs.push((
                         *db_id,
-                        h.as_str().to_owned(),
+                        h.clone(),
                         p.tenant_id,
                         crate::state::JobOrigin::CacheOpportunity,
                     ));
@@ -804,7 +820,7 @@ impl DagActor {
                 {
                     job_specs.push((
                         *db_id,
-                        h.as_str().to_owned(),
+                        h.clone(),
                         p.tenant_id,
                         crate::state::JobOrigin::Reprobe,
                     ));
@@ -997,7 +1013,7 @@ impl DagActor {
                     let (_, h, _, origin) = spec_iter.next().unwrap();
                     let r = created_iter.next().unwrap();
                     super::materialize::CreatedJob {
-                        drv_hash: DrvHash::from(h.as_str()),
+                        drv_hash: h,
                         job_id: r.job_id,
                         created: r.created,
                         upgraded: r.upgraded,
@@ -2520,7 +2536,7 @@ impl DagActor {
         let mut reset = HashSet::new();
         let mut to_spawn: Vec<(DrvHash, Vec<String>)> = Vec::new();
         let mut demote_parents: HashSet<DrvHash> = HashSet::new();
-        let mut to_persist: HashMap<DerivationStatus, Vec<String>> = HashMap::new();
+        let mut to_persist: HashMap<DerivationStatus, Vec<DrvHash>> = HashMap::new();
         for (drv_hash, output_paths, unwanted) in candidates {
             let Some(gone) = output_paths
                 .iter()
@@ -2586,7 +2602,10 @@ impl DagActor {
                  (GC'd?); resetting for re-dispatch"
             );
             metrics::counter!("rio_scheduler_stale_completed_reset_total").increment(1);
-            to_persist.entry(target).or_default().push(drv_hash.clone());
+            to_persist
+                .entry(target)
+                .or_default()
+                .push(drv_hash_k.clone());
             // Substitutable subset: route to a materialization job
             // instead of arming a from-source dispatch — for the
             // !deps_ok arm TOO (merged_bug_257): job creation has no
@@ -2665,7 +2684,7 @@ impl DagActor {
             to_persist
                 .entry(DerivationStatus::Queued)
                 .or_default()
-                .push(p.to_string());
+                .push(p);
         }
 
         // Batched persist (pass-2 resets + pass-3 demotions): grouped
@@ -2681,7 +2700,7 @@ impl DagActor {
         for (target, hashes) in to_persist {
             #[cfg(test)]
             PHASE_6C_PG_AWAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+            let refs: Vec<&str> = hashes.iter().map(DrvHash::as_str).collect();
             self.persist_status_batch(&refs, target).await;
         }
 

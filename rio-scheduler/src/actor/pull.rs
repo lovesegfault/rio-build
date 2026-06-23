@@ -1607,8 +1607,10 @@ impl DagActor {
             reply,
         });
         // Flush trigger (i): eager at the batch cap. Triggers
-        // (ii)/(iii)/(iv) are handle_tick head / handle_leader_lost /
-        // the REPORT_OUTCOME_FLUSH_DEADLINE select! arm.
+        // (iii)/(iv)/(v) are handle_leader_lost / the
+        // REPORT_OUTCOME_FLUSH_DEADLINE select! arm / the inline
+        // post-dispatch deadline check in run_inner. NO handle_tick
+        // head — see the doc-comment on this fn.
         if self.pending_pull_outcomes.len() >= REPORT_OUTCOME_BATCH_MAX {
             self.flush_pending_pull_outcomes().await;
         }
