@@ -61,7 +61,17 @@ fn transient_retry_after(
     attempt: u32,
     status: &tonic::Status,
 ) -> Option<std::time::Duration> {
-    if !rio_common::grpc::is_transient(status.code()) {
+    // DeadlineExceeded: the per-chunk idle bound (I-211) firing — the
+    // store parked (NarBudget under cold-start burst) past one idle
+    // window. With KEDA scaling up, a replay may land on a pod with
+    // budget; the buffered PutPath lane and GetPath both replay cleanly.
+    // NOT in the shared `is_transient` (rio-common documents
+    // DeadlineExceeded as the caller's own timeout, never store-side);
+    // gateway-local here because the gateway IS that caller and the
+    // store's "retry" invitation is the parked semaphore, not a code.
+    if !rio_common::grpc::is_transient(status.code())
+        && status.code() != tonic::Code::DeadlineExceeded
+    {
         return None;
     }
     if attempt >= STORE_TRANSIENT_MAX_ATTEMPTS {
