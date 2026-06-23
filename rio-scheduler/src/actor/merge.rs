@@ -54,25 +54,11 @@ pub(super) struct PendingMerge {
     pub(super) reply: oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>,
 }
 
-/// sh-036.1 red-first witness: incremented at
-/// [`DagActor::find_missing_with_breaker`] entry. With
-/// `precomputed_probe = Some(..)` threaded, phase-4 must apply the
-/// pre-computed response WITHOUT entering the in-actor RPC path —
-/// `merge_phase_4_never_awaits_store_rpc` asserts this stays flat
-/// across a merge. Per-process global; nextest's process-per-test
-/// model keeps it test-isolated.
-#[cfg(test)]
-pub(crate) static FMP_AWAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Phase-6c PG round-trip witness: incremented at each
-/// `update_derivation_status_batch` call inside
-/// [`DagActor::verify_preexisting_completed`]. The 307ms/merge
-/// regression diag (170f98983 TODO) needed a structural assertion
-/// that 6c persists at O(1) round-trips per merge, NOT O(reset
-/// nodes) — `verify_preexisting_reset_persists_batched` pins this.
-#[cfg(test)]
-pub(crate) static PHASE_6C_PG_AWAITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+// FMP_AWAITS / PHASE_6C_PG_AWAITS are per-actor `TestCounters` fields
+// (mod.rs), not module statics: under `cargo test`'s shared-process
+// parallelism a module static's before/after delta races with any
+// concurrent phase-6c-reaching test. nextest's process-per-test model
+// masked this; CLAUDE.md's documented `cargo test` fallback does not.
 
 /// Cross-phase carrier from [`DagActor::prepare_merge_persist`] to
 /// [`DagActor::reconcile_merged_state`].
@@ -2747,7 +2733,9 @@ impl DagActor {
         // Active+committed) is the helper's own posture.
         for (target, hashes) in to_persist {
             #[cfg(test)]
-            PHASE_6C_PG_AWAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.test_counters
+                .phase_6c_pg_awaits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let refs: Vec<&str> = hashes.iter().map(DrvHash::as_str).collect();
             self.persist_status_batch(&refs, target).await;
         }
@@ -3219,7 +3207,9 @@ impl DagActor {
         jwt_token: Option<&str>,
     ) -> Result<Option<rio_proto::types::FindMissingPathsResponse>, ActorError> {
         #[cfg(test)]
-        FMP_AWAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.test_counters
+            .fmp_awaits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let Some(store_client) = &self.store_client else {
             return Ok(None);
         };

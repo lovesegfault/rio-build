@@ -2181,7 +2181,6 @@ async fn verify_preexisting_with_poisoned_dep_goes_dependency_failed() -> TestRe
 // r[verify sched.merge.stale-completed-verify+5]
 #[tokio::test]
 async fn verify_preexisting_reset_persists_batched() -> TestResult {
-    use std::sync::atomic::Ordering;
     const N: usize = 20;
     let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
@@ -2206,10 +2205,10 @@ async fn verify_preexisting_reset_persists_batched() -> TestResult {
     }
     barrier(&handle).await;
 
-    let before = crate::actor::merge::PHASE_6C_PG_AWAITS.load(Ordering::SeqCst);
+    let before = handle.debug_counters().await?.phase_6c_pg_awaits;
     merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
     barrier(&handle).await;
-    let delta = crate::actor::merge::PHASE_6C_PG_AWAITS.load(Ordering::SeqCst) - before;
+    let delta = handle.debug_counters().await?.phase_6c_pg_awaits - before;
 
     assert!(
         delta <= 3,
@@ -2783,7 +2782,8 @@ async fn pruned_gate_uses_durable_evidence_not_truncated_view() -> TestResult {
 /// on the request, phase-4 (`check_cached_outputs`) MUST apply the
 /// pre-computed response without entering the in-actor
 /// `find_missing_with_breaker` path. Structural assertion via the
-/// [`FMP_AWAITS`](crate::actor::merge::FMP_AWAITS) entry counter —
+/// per-actor [`TestCounters::fmp_awaits`](crate::actor::TestCounters)
+/// entry counter —
 /// `setup()` runs without a store client, so `check_roots_topdown`
 /// short-circuits and the in-actor probe early-returns `Ok(None)`; the
 /// counter is fed solely by phase-4's entry into the on-actor path.
@@ -2792,8 +2792,6 @@ async fn pruned_gate_uses_durable_evidence_not_truncated_view() -> TestResult {
 /// newly-inserted → `verify_preexisting_completed` early-returns.
 #[tokio::test]
 async fn merge_phase_4_never_awaits_store_rpc() -> TestResult {
-    use std::sync::atomic::Ordering;
-
     let (_db, handle, _task) = setup().await;
 
     let nodes: Vec<_> = (0..50)
@@ -2808,7 +2806,7 @@ async fn merge_phase_4_never_awaits_store_rpc() -> TestResult {
         .flat_map(|n| n.expected_output_paths.clone())
         .collect();
 
-    let before = crate::actor::merge::FMP_AWAITS.load(Ordering::SeqCst);
+    let before = handle.debug_counters().await?.fmp_awaits;
     let req = MergeDagRequest {
         build_id: Uuid::new_v4(),
         tenant_id: Some(DEFAULT_TEST_TENANT),
@@ -2821,7 +2819,7 @@ async fn merge_phase_4_never_awaits_store_rpc() -> TestResult {
         ..Default::default()
     };
     merge_dag_req(&handle, req).await?;
-    let after = crate::actor::merge::FMP_AWAITS.load(Ordering::SeqCst);
+    let after = handle.debug_counters().await?.fmp_awaits;
     assert_eq!(
         after, before,
         "phase-4 must apply precomputed_probe without entering \

@@ -1163,6 +1163,20 @@ pub(crate) struct TestCounters {
     /// loop collects [`DeferredRelease`](materialize::DeferredRelease)
     /// and runs ONE `companion_release_batch` after.
     pub companion_release_awaits: std::sync::atomic::AtomicU64,
+    /// Incremented at the head of
+    /// [`find_missing_with_breaker`](DagActor::find_missing_with_breaker)
+    /// (sh-036.1). Asserts on the off-actor-probe rule: with
+    /// `precomputed_probe = Some(..)` threaded, phase-4 must NOT enter
+    /// the in-actor RPC path. Per-actor (NOT a module static) so
+    /// `cargo test`'s shared-process parallelism does not race the
+    /// before/after delta read.
+    pub fmp_awaits: std::sync::atomic::AtomicU64,
+    /// Incremented at each `persist_status_batch` call inside
+    /// [`verify_preexisting_completed`](DagActor::verify_preexisting_completed)
+    /// (the 307ms/merge regression diag). Asserts 6c persists at O(1)
+    /// round-trips per merge, not O(reset nodes). Per-actor for the
+    /// same `cargo test` isolation reason as `fmp_awaits`.
+    pub phase_6c_pg_awaits: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -1178,6 +1192,8 @@ impl TestCounters {
             persist_build_counts_calls: self.persist_build_counts_calls.load(SeqCst),
             begin_fenced_calls: self.begin_fenced_calls.load(SeqCst),
             companion_release_awaits: self.companion_release_awaits.load(SeqCst),
+            fmp_awaits: self.fmp_awaits.load(SeqCst),
+            phase_6c_pg_awaits: self.phase_6c_pg_awaits.load(SeqCst),
         }
     }
 }
@@ -1204,6 +1220,10 @@ pub struct TestCountersSnapshot {
     pub begin_fenced_calls: u64,
     /// See [`TestCounters::companion_release_awaits`].
     pub companion_release_awaits: u64,
+    /// See [`TestCounters::fmp_awaits`].
+    pub fmp_awaits: u64,
+    /// See [`TestCounters::phase_6c_pg_awaits`].
+    pub phase_6c_pg_awaits: u64,
 }
 
 impl DagActor {

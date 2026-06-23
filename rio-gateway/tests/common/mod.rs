@@ -218,8 +218,16 @@ impl GatewaySession {
         // Idempotent (OnceLock; second set is a no-op Err): collapse
         // submit_initial's pre-build_id retry backoff to 5ms-flat so
         // the retry-exhaustion test runs in milliseconds instead of
-        // ~80s real time. Every test in this binary wants the short
-        // schedule; production never sets it.
+        // ~80s real time. SCOPE: this helper is `mod common;`-included
+        // by every rio-gateway integration binary that constructs a
+        // GatewaySession (ca_roundtrip / ssh_hardening / wire_opcodes
+        // / functional / integration_distributed today), so the
+        // override is process-global per binary, not per test —
+        // OnceLock has no clear/take. No test currently asserts on
+        // production submit_initial timing; a future one MUST NOT go
+        // through this constructor (it would fail or pass for the
+        // wrong reason with nothing in its own source pointing here).
+        // Production never sets it.
         let _ =
             rio_gateway::handler::SUBMIT_RETRY_BACKOFF_OVERRIDE.set(rio_common::backoff::Backoff {
                 base: std::time::Duration::from_millis(5),
