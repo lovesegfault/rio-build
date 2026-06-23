@@ -7,8 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use tokio::sync::oneshot;
-#[cfg(test)]
-use tracing::instrument;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -35,10 +33,10 @@ pub(super) const MERGE_PERSIST_BATCH_MAX: usize = 32;
 /// observed N̄=2.63 at 165 ms/merge — the deadline arm fires every
 /// rx-idle gap and batches stay tiny, so phase-5 amortization never
 /// happens. 250 ms gives N̄≈10-15 → real amortization, while still
-/// well under the gateway's SUBMIT_RETRIES 7.5 s budget. SubmitBuild
-/// is synchronous, so this stays tighter than
-/// `REPORT_OUTCOME_FLUSH_DEADLINE`'s ack semantics. Short in tests so
-/// single-merge sites do not each wait 250 ms.
+/// well under the gateway's SUBMIT_RETRIES 7.5 s budget (the only
+/// hard ordering — there is no value-ordering invariant against
+/// `REPORT_OUTCOME_FLUSH_DEADLINE`; the two sit at parity). Short in
+/// tests so single-merge sites do not each wait 250 ms.
 #[cfg(not(test))]
 pub(super) const MERGE_PERSIST_FLUSH_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(250);
@@ -145,16 +143,16 @@ impl DagActor {
     // MergeDag
     // -----------------------------------------------------------------------
 
-    #[instrument(skip(self, req), fields(build_id = %req.build_id))]
     // Production routes ActorCommand::MergeDag → handle_merge_dag_intake
-    // → flush_pending_merges; this is the synchronous N=1 entry the
-    // direct &mut DagActor test callers use (mbt_* / sla_contract). It
-    // is NOT a re-implementation: it pushes one PendingMerge and calls
-    // `flush_pending_merges`, so the mbt_*/sla_contract surface
-    // exercises the production orchestration (the only difference vs
-    // intake is no eager-flush trigger / no deadline arm — those need
-    // the run loop). Any post-persist step added between
-    // persist_merges-Ok and finish_merge_dag lands once, in flush.
+    // → flush_pending_merges_priced; this is the synchronous N=1 entry
+    // the direct &mut DagActor test callers use (mbt_* / sla_contract).
+    // It is NOT a re-implementation: it pushes one PendingMerge and
+    // calls `flush_pending_merges_priced`, so the mbt_*/sla_contract
+    // surface exercises the production orchestration including the
+    // cost-axis EWMA feed (the only difference vs intake is no
+    // eager-flush trigger / no deadline arm — those need the run
+    // loop). Any post-persist step added between persist_merges-Ok and
+    // finish_merge_dag lands once, in flush.
     #[cfg(test)]
     pub(super) async fn handle_merge_dag(
         &mut self,
@@ -167,7 +165,7 @@ impl DagActor {
         );
         let (tx, rx) = oneshot::channel();
         self.pending_merges.push(PendingMerge { req, reply: tx });
-        self.flush_pending_merges().await;
+        self.flush_pending_merges_priced().await;
         rx.await.map_err(|_| ActorError::ChannelSend)?
     }
 
@@ -377,11 +375,15 @@ impl DagActor {
     /// earlier ones, so unwind order matters) and replies `Err` to
     /// each — the gateway's `is_retryable_refusal_code` retries.
     async fn flush_pending_merges(&mut self) {
+        // Self-consistency: clear the deadline unconditionally so flush
+        // is the unambiguous None⇐empty owner regardless of which
+        // trigger reached it (a future caller draining pending_merges
+        // out-of-band cannot leave a stale Some).
+        self.merge_flush_deadline = None;
         if self.pending_merges.is_empty() {
             return;
         }
         let batch = std::mem::take(&mut self.pending_merges);
-        self.merge_flush_deadline = None;
         metrics::histogram!("rio_scheduler_mergedag_coalesce_batch_size")
             .record(batch.len() as f64);
 
@@ -497,8 +499,9 @@ impl DagActor {
 
     /// Send a `MergeDag` reply; on receiver-dropped (gateway gave up
     /// while the merge was queued/running), cancel the now-orphaned
-    /// build. Extracted from the run-loop `MergeDag` arm so the flush's
-    /// N=1 and N>1 paths share the orphan-cancel.
+    /// build. Single caller (the per-merge tail of
+    /// `flush_pending_merges`); kept extracted so the orphan-cancel is
+    /// the named operation a future flush trigger would reach for.
     async fn send_merge_reply(
         &mut self,
         build_id: Uuid,

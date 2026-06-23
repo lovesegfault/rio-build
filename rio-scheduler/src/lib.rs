@@ -233,8 +233,8 @@ pub fn describe_metrics() {
          flush_pending_merges, NOT the MergeDag command arm — post-P2 the \
          arm is µs-class intake for 31/32 turns and \
          actor_cmd_seconds{cmd=MergeDag} samples NONE of the flush work \
-         (flush fires via trigger iv with no cmd sample, or trigger v under \
-         whatever cmd dequeued). Compare phases against each other, not \
+         (flush fires via trigger i eager or trigger iv deadline arm, neither \
+         a cmd sample). Compare phases against each other, not \
          against actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the \
          I-139 signal — N sequential PG awaits in the actor."
     );

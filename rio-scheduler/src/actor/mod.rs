@@ -1815,20 +1815,27 @@ impl DagActor {
         // fresh `sleep_until` per select! poll (the prior
         // `coalesce_due` shape, which the move-before-rx would
         // otherwise put in the polled-every-iteration position).
-        let pull_due = tokio::time::sleep(std::time::Duration::MAX);
-        let merge_due = tokio::time::sleep(std::time::Duration::MAX);
+        // Mirror `Option<Instant>` → pinned Sleep. `None` resets to a
+        // fixed far-future instant so the Sleep never reads as elapsed
+        // outside the `is_some()`-guarded arm; `Some(d)` resets iff the
+        // deadline changed. One helper so a robustness tweak lands once.
+        let far_future = tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365);
+        fn sync_due(
+            sleep: std::pin::Pin<&mut tokio::time::Sleep>,
+            deadline: Option<tokio::time::Instant>,
+            far: tokio::time::Instant,
+        ) {
+            let want = deadline.unwrap_or(far);
+            if sleep.deadline() != want {
+                sleep.reset(want);
+            }
+        }
+        let pull_due = tokio::time::sleep_until(far_future);
+        let merge_due = tokio::time::sleep_until(far_future);
         tokio::pin!(pull_due, merge_due);
         loop {
-            if let Some(d) = self.pull_flush_deadline
-                && pull_due.deadline() != d
-            {
-                pull_due.as_mut().reset(d);
-            }
-            if let Some(d) = self.merge_flush_deadline
-                && merge_due.deadline() != d
-            {
-                merge_due.as_mut().reset(d);
-            }
+            sync_due(pull_due.as_mut(), self.pull_flush_deadline, far_future);
+            sync_due(merge_due.as_mut(), self.merge_flush_deadline, far_future);
             if consecutive_fast >= ADMIN_FAST_LANE_DRAIN_QUOTA && rx.is_empty() {
                 consecutive_fast = 0;
             }

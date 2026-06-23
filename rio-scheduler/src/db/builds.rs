@@ -249,25 +249,7 @@ impl SchedulerDb {
         Ok(FencedOutcome::Applied(n))
     }
 
-    // r[impl sched.evidence.durability+4]
-    /// Flip a build to Active inside an existing transaction. The merge
-    /// path runs this as the LAST statement of `persist_merges`'s
-    /// transaction so a committed merge implies an Active build: an
-    /// activation failure aborts the whole merge — including the
-    /// pruned-origin job rows and the build_derivations links — instead
-    /// of leaving committed side effects behind for a build the caller
-    /// is about to reject and roll back in memory. Mirrors the
-    /// `BuildState::Active` arm of [`Self::update_build_status`]; all
-    /// other (non-merge) status transitions keep going through that
-    /// pool-level method via `transition_build`.
-    ///
-    /// Errors with [`sqlx::Error::RowNotFound`] if the UPDATE touches
-    /// anything other than exactly one row (i.e. the build row is
-    /// missing), so the caller's transaction aborts instead of
-    /// committing a merge whose build was never activated. Unreachable
-    /// through the single-threaded actor path today — the same command
-    /// inserted the row — but kept as a cheap guard against a silent
-    /// half-done commit.
+    /// Single-build test convenience for [`Self::activate_builds_tx`].
     #[cfg(test)]
     pub(crate) async fn activate_build_tx(
         tx: &mut PgConnection,
@@ -276,13 +258,27 @@ impl SchedulerDb {
         Self::activate_builds_tx(tx, std::slice::from_ref(&build_id)).await
     }
 
-    /// Pending→Active for N builds in one round-trip (P2 phase-5
-    /// coalesce). `rows_affected == len` guard so a missing build row
-    /// aborts the whole batch transaction — every merge in the batch
-    /// has already inserted its row in the same actor turn, so a short
-    /// count is the same "silent half-done commit" guard the singular
-    /// form has. PostgreSQL plans `= any(1-element-array)` on a PK
-    /// identically to `= scalar`.
+    // r[impl sched.evidence.durability+4]
+    /// Pending→Active for N builds inside an existing transaction (P2
+    /// phase-5 coalesce). The merge path runs this as the LAST
+    /// statement of `persist_merges`'s transaction so a committed
+    /// merge implies an Active build: an activation failure aborts the
+    /// whole merge — including the pruned-origin job rows and the
+    /// build_derivations links — instead of leaving committed side
+    /// effects behind for a build the caller is about to reject and
+    /// roll back in memory. Mirrors the `BuildState::Active` arm of
+    /// [`Self::update_build_status`]; all other (non-merge) status
+    /// transitions keep going through that pool-level method via
+    /// `transition_build`.
+    ///
+    /// Errors with [`sqlx::Error::RowNotFound`] if the UPDATE touches
+    /// anything other than exactly `len` rows, so the caller's
+    /// transaction aborts instead of committing a merge whose build
+    /// was never activated. Unreachable through the single-threaded
+    /// actor path today — the same actor turn inserted every row — but
+    /// kept as a cheap guard against a silent half-done commit.
+    /// PostgreSQL plans `= any(1-element-array)` on a PK identically
+    /// to `= scalar`.
     pub(crate) async fn activate_builds_tx(
         tx: &mut PgConnection,
         build_ids: &[Uuid],

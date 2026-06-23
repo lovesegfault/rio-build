@@ -860,8 +860,9 @@ async fn merge_coalesce_deadline_survives_fast_lane_flood() -> TestResult {
 
     // 3. Reply must arrive within DEADLINE (10ms) + flush cost. 2s is
     //    the structural-vs-timeout discriminant: with the bug the
-    //    flood holds the merge forever (timeout); with loop-top (v)
-    //    the very next fast-arm iteration past 10ms flushes.
+    //    flood holds the merge forever (timeout); with the deadline
+    //    arm biased BEFORE the fast lane, the very next select! poll
+    //    past 10ms flushes.
     let r = tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx).await;
     stop.store(true, Ordering::Relaxed);
     let _ = flood.await;
@@ -869,7 +870,8 @@ async fn merge_coalesce_deadline_survives_fast_lane_flood() -> TestResult {
     let r = r.unwrap_or_else(|_| {
         panic!(
             "merge reply starved under fast-lane flood ({n} fast sends accepted): \
-             trigger-(v) must run at loop top, immune to the fast arm's `continue`"
+             the deadline arm (trigger iv) must be biased BEFORE the fast lane \
+             so a passed deadline wins over the fast arm's `continue`"
         )
     });
     assert!(

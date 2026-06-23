@@ -1662,6 +1662,10 @@ impl DagActor {
         use crate::db::open_attempts::AttemptRef;
         use rio_evidence_kernel::pull::ReportAdmission;
 
+        // Self-consistency: clear the deadline unconditionally so flush
+        // is the unambiguous None⇐empty owner regardless of which
+        // trigger reached it (mirrors `flush_pending_merges`).
+        self.pull_flush_deadline = None;
         if self.pending_pull_outcomes.is_empty() {
             return;
         }
@@ -1671,7 +1675,6 @@ impl DagActor {
              tail of every flush and nowhere else"
         );
         let pending = std::mem::take(&mut self.pending_pull_outcomes);
-        self.pull_flush_deadline = None;
         // sh-027 §3: the prod N̄ signal — `begin_fenced_calls` is
         // `#[cfg(test)]` only, so the sh-007c S6 design's core
         // assumption (N̄≥20) was unverifiable in prod. Buckets at
