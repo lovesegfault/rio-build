@@ -816,6 +816,10 @@ DURATION_CENSUS_ROWS = {
         "wall (tokio Interval at the actor select! loop — reset() on the empty→nonempty transition; the flush trigger-(iv) deadline)",
         "sh-027 §3: 250ms << store-side report_until_acked DEFAULT_GRPC_TIMEOUT=30s (the ack-latency ceiling); coalesces min(64, reports_per_250ms) toward N̄≥20 vs the retired mailbox-empty trigger's measured N̄≈5.5",
     ),
+    ("rio-scheduler/src/actor/merge.rs", "MERGE_PERSIST_FLUSH_DEADLINE"): (
+        "wall (tokio Interval at the actor select! loop — reset() on the empty→nonempty transition; the P2 flush trigger-(iv) deadline)",
+        "P2: 50ms — SubmitBuild is a synchronous RPC the gateway awaits, so an order of magnitude tighter than REPORT_OUTCOME_FLUSH_DEADLINE; at the 256-merge burst's ~800/s arrival a 50ms window coalesces ~40, capped at MERGE_PERSIST_BATCH_MAX=32",
+    ),
     ("rio-store/src/materialize/client.rs", "RESOLVED_ANSWER_REMINT_COOLDOWN"): (
         "wall (tokio Instant at the resume ledger's cooldown stamp)",
         "WO-S9-3 (A3): W12-S9E — the K-stuck deterministic bound (6 passes at slots=1 with a 4-row stuck head deliver exactly 4)",

@@ -1171,7 +1171,6 @@ rio-scheduler/src/actor/materialize.rs	/// the probe could not answer (no store 
 rio-scheduler/src/actor/materialize.rs	/// unreliable, so no pod aggregation exists anywhere.
 rio-scheduler/src/actor/materialize.rs	/// writable ONLY while `Held` — an unclaimed entry has no claim to
 rio-scheduler/src/actor/materialize.rs	/// writable ONLY while `Unclaimed` — a held entry's node is
-rio-scheduler/src/actor/merge.rs	// Batch 4: Pending→Active for the build, in the SAME transaction.
 rio-scheduler/src/actor/merge.rs	// Conservative: ANY CA demanded node → fall through entirely.
 rio-scheduler/src/actor/merge.rs	// In-mem db_id write ONLY after the tx is durable. If anything
 rio-scheduler/src/actor/merge.rs	// SAME as substitutable here: optimistically route to a
@@ -1183,9 +1182,6 @@ rio-scheduler/src/actor/merge.rs	// probe set stays ALL recorded paths (probing 
 rio-scheduler/src/actor/merge.rs	// skips it; reconcile_preexisting skips ALL cached_hits keys
 rio-scheduler/src/actor/merge.rs	// wanted subset yields ALL declared paths when the wanted set
 rio-scheduler/src/actor/merge.rs	/// Returns `Some(demand set)` if ALL demanded derivations' IA
-rio-scheduler/src/actor/merge.rs	/// The PG side of Pending→Active rides the SAME transaction
-rio-scheduler/src/actor/merge.rs	/// committed one can never lose it to a failover racing the
-rio-scheduler/src/actor/merge.rs	/// merge can never leak the pruned classification into PG, and a
 rio-scheduler/src/actor/merge.rs	/// persist as three batched ANY($1::text[]) updates.
 rio-scheduler/src/actor/mod.rs	//   TTL'd — 60s self-heals (true for the ladder ONLY).
 rio-scheduler/src/actor/mod.rs	// ALL `mod` decls here so the submodule list is discoverable in one

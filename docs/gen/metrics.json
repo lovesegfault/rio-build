@@ -1181,7 +1181,7 @@
       {
         "name": "rio_scheduler_merge_phase_seconds",
         "kind": "histogram",
-        "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+        "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f, plus the P2 coalesce labels 0to4-prepare-batched / 5-persist-and-activate / 5-persist-and-activate-batched — the single-merge handle_merge_dag and the flush_pending_merges batch persist respectively). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
       },
       {
         "name": "rio_scheduler_mergedag_coalesce_batch_size",

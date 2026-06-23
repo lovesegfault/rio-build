@@ -268,7 +268,7 @@ impl SchedulerDb {
     /// through the single-threaded actor path today — the same command
     /// inserted the row — but kept as a cheap guard against a silent
     /// half-done commit.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn activate_build_tx(
         tx: &mut PgConnection,
         build_id: Uuid,
@@ -276,12 +276,12 @@ impl SchedulerDb {
         Self::activate_builds_tx(tx, std::slice::from_ref(&build_id)).await
     }
 
-    /// Multi-build form of [`Self::activate_build_tx`] (P2 phase-5
+    /// Pending→Active for N builds in one round-trip (P2 phase-5
     /// coalesce). `rows_affected == len` guard so a missing build row
     /// aborts the whole batch transaction — every merge in the batch
     /// has already inserted its row in the same actor turn, so a short
     /// count is the same "silent half-done commit" guard the singular
-    /// form has. PostgreSQL plans `= ANY(1-element-array)` on a PK
+    /// form has. PostgreSQL plans `= any(1-element-array)` on a PK
     /// identically to `= scalar`.
     pub(crate) async fn activate_builds_tx(
         tx: &mut PgConnection,

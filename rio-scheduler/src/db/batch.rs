@@ -267,12 +267,10 @@ impl SchedulerDb {
             .collect())
     }
 
-    /// Batch-insert build_derivations links. Single-build convenience
-    /// over [`Self::batch_insert_build_derivations_multi`]; the
-    /// scalar-bind micro-optimization (~16·(N-1) wire bytes for the
-    /// repeated build_id) is negligible against a PG round-trip, so
-    /// one SQL string carries both shapes.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Single-build convenience over
+    /// [`Self::batch_insert_build_derivations_multi`] for test sites
+    /// that hold one `build_id` and a derivation_id slice.
+    #[cfg(test)]
     pub(crate) async fn batch_insert_build_derivations(
         tx: &mut PgConnection,
         build_id: Uuid,
@@ -282,11 +280,11 @@ impl SchedulerDb {
         Self::batch_insert_build_derivations_multi(tx, &pairs).await
     }
 
-    /// Multi-build form of [`Self::batch_insert_build_derivations`] —
-    /// `(build_id, derivation_id)` pairs from N merges in one round-trip
-    /// (P2 phase-5 coalesce). Two parallel-array binds; same `ON
-    /// CONFLICT DO NOTHING` so a shared derivation linked by two builds
-    /// in one batch is benign.
+    /// Batch-insert build_derivations links — `(build_id,
+    /// derivation_id)` pairs from N merges in one round-trip (P2
+    /// phase-5 coalesce). Two parallel-array binds; same `ON CONFLICT
+    /// DO NOTHING` so a shared derivation linked by two builds in one
+    /// batch is benign.
     pub(crate) async fn batch_insert_build_derivations_multi(
         tx: &mut PgConnection,
         pairs: &[(Uuid, Uuid)],

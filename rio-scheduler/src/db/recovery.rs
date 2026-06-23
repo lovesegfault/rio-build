@@ -48,7 +48,7 @@ static CLASSIFY_EVIDENCE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
 });
 
 /// Batch form of [`CLASSIFY_EVIDENCE_SQL`]: same per-child predicates,
-/// `GROUP BY parent_id` over `parent_id = ANY($1)`. A childless parent
+/// `GROUP BY parent_id` over `parent_id = any($1)`. A childless parent
 /// has no edges row → no group row; the caller treats absence as
 /// `ChildlessLeaf` (which is `!= Vouched`, the only question the merge
 /// path asks).
