@@ -12,7 +12,7 @@ pub use keys::{
     spawn_authorized_keys_watcher,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1153,7 +1153,7 @@ impl russh::server::Server for GatewayServer {
             service_signer: self.service_signer.clone(),
             limiter: self.limiter.clone(),
             quota_cache: self.quota_cache.clone(),
-            sessions: HashMap::new(),
+            channels: HashMap::new(),
             tenant_name: None,
             jwt_token: None,
             auth_attempted: false,
@@ -1164,8 +1164,7 @@ impl russh::server::Server for GatewayServer {
             session_sem: Arc::clone(&self.session_sem),
             max_channels_per_connection: self.max_channels_per_connection,
             open_channels: 0,
-            accepted_channels: HashSet::new(),
-            over_bound_channels: HashSet::new(),
+            over_bound_channels: 0,
             channel_writers: HashMap::new(),
             empty_connection_grace: self.empty_connection_grace,
             handshake_timeout: self.handshake_timeout,

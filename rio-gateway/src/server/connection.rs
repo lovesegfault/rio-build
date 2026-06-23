@@ -2,9 +2,10 @@
 //!
 //! [`ConnectionHandler`] is the `russh::server::Handler` impl — one per
 //! accepted TCP stream, constructed by `GatewayServer::new_client` in
-//! `mod.rs`. [`ChannelSession`] tracks each open SSH channel's protocol
-//! task. Split out of `server/mod.rs` so the server-wide accept loop and
-//! the per-connection state machine live in separate files.
+//! `mod.rs`. [`ChannelDisposition`] tracks each open SSH channel's state
+//! (accepted / exec'd / over-bound) and, for exec'd channels, the
+//! protocol task. Split out of `server/mod.rs` so the server-wide accept
+//! loop and the per-connection state machine live in separate files.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -62,6 +63,41 @@ impl ConnStage {
             3 => "channel-open",
             _ => "?",
         }
+    }
+}
+
+/// Per-channel state for the SSH-layer callbacks. One entry per channel
+/// id russh has accepted on this connection — the callbacks key every
+/// decision on this map alone, so a forged or duplicate id is a `None`
+/// lookup and a no-op (russh dispatches per-channel callbacks for any
+/// well-formed id the peer puts on the wire). Replaces the prior
+/// `accepted_channels` / `over_bound_channels` / `sessions` parallel
+/// sets, whose lack of a single "what disposition is this channel"
+/// lookup pushed `data()` to use `sessions.get` as a strictly-narrower
+/// proxy and under-count rx bytes for pre-exec and dead-session traffic
+/// on accepted channels.
+pub(super) enum ChannelDisposition {
+    /// Accepted in `channel_open_session`, not yet exec'd. Counted in
+    /// `open_channels`; the channel's write half is parked in
+    /// `channel_writers` until `exec_request` consumes it.
+    Accepted,
+    /// Exec'd; protocol session running.
+    Session(ChannelSession),
+    /// Opened over the per-connection bound. Accepted at the SSH level
+    /// only so an OpenSSH mux master sees `MUX_S_SESSION_OPENED`;
+    /// rejected at `exec_request`. NOT counted in `open_channels`, no
+    /// `channel_writers` entry. See [`ConnectionHandler::channels`].
+    OverBound,
+}
+
+impl ChannelDisposition {
+    /// True for variants this connection counts toward
+    /// `r[gw.conn.channel-limit+4]`'s `open_channels` and toward the
+    /// `rio_gateway_bytes_total{direction=rx}` counter — i.e., every
+    /// disposition except [`Self::OverBound`], whose traffic is
+    /// intentionally dropped.
+    fn is_accepted(&self) -> bool {
+        !matches!(self, Self::OverBound)
     }
 }
 
@@ -655,8 +691,13 @@ pub struct ConnectionHandler {
     /// rotated mid-handshake (between TCP accept and `auth_publickey`)
     /// is judged against the current set.
     pub(super) authorized_keys: AuthorizedKeys,
-    /// Active protocol sessions, indexed by channel ID.
-    pub(super) sessions: HashMap<ChannelId, ChannelSession>,
+    /// Per-channel disposition for every SSH channel id this handler
+    /// has seen via `channel_open_session`. Single source of truth for
+    /// the per-channel callbacks: a `None` lookup is a forged/duplicate
+    /// id (russh dispatches per-channel callbacks for any well-formed
+    /// id the peer puts on the wire) and a no-op. See
+    /// [`ChannelDisposition`].
+    pub(super) channels: HashMap<ChannelId, ChannelDisposition>,
     /// JWT signing key, cloned from `GatewayServer`. `None` → mint
     /// skipped in `auth_publickey`. Arc because `SigningKey` isn't
     /// `Clone` (zeroize-on-drop semantics) but we need one per
@@ -742,63 +783,50 @@ pub struct ConnectionHandler {
     /// [`super::DEFAULT_MAX_CHANNELS_PER_CONNECTION`].
     pub(super) max_channels_per_connection: usize,
     /// SSH-level open channel count: incremented when
-    /// `channel_open_session` accepts, decremented in `channel_close`
-    /// for channels in [`Self::accepted_channels`]. NOT `sessions.len()`
-    /// — a channel that has been opened but not yet exec'd is counted
-    /// here and invisible there, so a burst of opens with no execs is
-    /// still bounded.
+    /// `channel_open_session` accepts (a [`ChannelDisposition::Accepted`]
+    /// entry), decremented in `channel_close` for those channels. A
+    /// channel that has been opened but not yet exec'd is counted here, so
+    /// a burst of opens with no execs is still bounded. Derivable from
+    /// [`Self::channels`] but kept as a counter so the per-open bound
+    /// check is O(1).
     pub(super) open_channels: usize,
-    /// Channel ids this connection actually ACCEPTED in
-    /// `channel_open_session`. russh invokes the per-channel handler
-    /// callbacks for any well-formed channel id a peer puts on the wire
-    /// — including ids that were never opened or are already closed — so
-    /// the close-side bookkeeping for `r[gw.conn.channel-limit+4]` must
-    /// be keyed on our own record, not on the peer's claim. Bounded by
-    /// `max_channels_per_connection` (only accepted opens insert; closes
-    /// remove).
-    pub(super) accepted_channels: std::collections::HashSet<ChannelId>,
-    /// Channel ids whose `channel_open_session` arrived with
+    /// Count of [`ChannelDisposition::OverBound`] entries in
+    /// [`Self::channels`]: ids whose `channel_open_session` arrived with
     /// `open_channels >= max_channels_per_connection`. They are ACCEPTED
     /// at the SSH level (`Ok(true)`) so a stock OpenSSH mux master sees
     /// `MUX_S_SESSION_OPENED` and never falls back to a corrupted direct
     /// connection (`r[gw.conn.session-cap+2]`); the rejection is delivered
-    /// at `exec_request` instead. They are NOT in `accepted_channels` and
-    /// have NO entry in `channel_writers` (the channel handle is dropped
-    /// immediately, both halves), so they never reach the protocol path.
+    /// at `exec_request` instead. They have NO entry in `channel_writers`
+    /// (the channel handle is dropped immediately, both halves), so they
+    /// never reach the protocol path.
     ///
     /// Removal MIRRORS russh's own channel-table removal: only on the
     /// CLIENT-sent `SSH_MSG_CHANNEL_CLOSE` (`Handler::channel_close`).
     /// `reject_exec`'s server-side close does NOT remove the entry — a
     /// compliant client answers a server close with its own (RFC 4254
-    /// §5.3), at which point russh frees its table entry and this set
+    /// §5.3), at which point russh frees its table entry and this count
     /// drains in lockstep. Removing on `reject_exec` would let a
     /// hostile client that withholds CLOSE (or never execs) grow
-    /// russh's table while this set stays empty, defeating the
-    /// backstop. The set is therefore a proxy for un-reclaimable
-    /// russh-side entries; its `len()` reaching
-    /// `max_channels_per_connection` is the hard backstop in
-    /// `channel_open_session` (a client there is hostile or badly
-    /// leaking, and terminating the connection — accepting the loss of
-    /// up to `max` legitimate in-flight sessions — is the only
-    /// bounded response). `data()` / `channel_eof()` for an over-bound
-    /// id fall through to their unknown-id no-op arms (no
-    /// `accepted_channels`/`channel_writers`/`sessions` entry exists —
-    /// `data()`'s `rio_gateway_bytes_total{rx}` increment is gated on
-    /// the `sessions` lookup so dropped over-bound traffic does NOT
-    /// inflate the throughput counter);
-    /// folding this into a single `HashMap<ChannelId, Disposition>`
-    /// alongside `accepted_channels` is forward-work
-    /// (maintainability, not correctness — every fall-through is
-    /// benign today).
-    pub(super) over_bound_channels: std::collections::HashSet<ChannelId>,
+    /// russh's table while this count stays low, defeating the
+    /// backstop. The count is therefore a proxy for un-reclaimable
+    /// russh-side entries; reaching `max_channels_per_connection` is the
+    /// hard backstop in `channel_open_session` (a client there is hostile
+    /// or badly leaking, and terminating the connection — accepting the
+    /// loss of up to `max` legitimate in-flight sessions — is the only
+    /// bounded response). `data()` / `channel_eof()` for an over-bound id
+    /// see `ChannelDisposition::OverBound` and no-op (the
+    /// `rio_gateway_bytes_total{rx}` increment is gated on
+    /// [`ChannelDisposition::is_accepted`] so dropped over-bound traffic
+    /// does NOT inflate the throughput counter).
+    pub(super) over_bound_channels: usize,
     /// Window-aware write halves of accepted channels, split off in
     /// `channel_open_session` and held until the channel either execs
     /// (`exec_request` moves the half into the session's response pump —
     /// its [`SessionSink`]) or closes un-exec'd (`channel_close` discards
-    /// it). One entry per accepted, not-yet-exec'd channel, so it shares
-    /// the `accepted_channels` bound; connection teardown drops the map
-    /// with the handler. A channel whose half has already been consumed
-    /// cannot exec again — see `exec_request`.
+    /// it). One entry per [`ChannelDisposition::Accepted`] channel, so it
+    /// shares the `open_channels` bound; connection teardown drops the
+    /// map with the handler. A channel whose half has already been
+    /// consumed cannot exec again — see `exec_request`.
     pub(super) channel_writers: HashMap<ChannelId, ChannelWriteHalf<Msg>>,
     /// Grace period a connection may sit with zero active protocol
     /// sessions — from authentication (nothing exec'd yet) or from the
@@ -963,35 +991,43 @@ impl ConnectionHandler {
 
     // r[impl gw.conn.channel-limit+4]
     /// Record an accepted `channel_open_session` toward the
-    /// per-connection channel bound. The set membership is what later
+    /// per-connection channel bound. The map entry is what later
     /// authorizes the matching close (and exec) to be acted on.
     fn note_channel_accepted(&mut self, channel: ChannelId) {
-        if self.accepted_channels.insert(channel) {
+        if self
+            .channels
+            .insert(channel, ChannelDisposition::Accepted)
+            .is_none()
+        {
             self.open_channels += 1;
         }
     }
 
     // r[impl gw.conn.channel-limit+4]
-    /// Record a `CHANNEL_CLOSE` for `channel`. Returns `true` if the
-    /// channel was one this connection actually accepted (now untracked
-    /// and decremented); `false` for ids that were never accepted or are
+    /// Record a `CHANNEL_CLOSE` for `channel`. Returns the disposition
+    /// the channel had (now untracked and counter-decremented), or
+    /// `None` for ids that were never opened on this connection or are
     /// already closed — the caller must treat those as no-ops. russh
     /// dispatches the close callback for ANY well-formed id the peer
     /// puts on the wire, so without this gate an authenticated client
     /// could interleave real opens with forged or duplicate closes to
     /// hold `open_channels` near zero while russh's channel table keeps
     /// growing, defeating the absurdity bound.
-    fn note_channel_closed(&mut self, channel: ChannelId) -> bool {
-        if !self.accepted_channels.remove(&channel) {
+    fn note_channel_closed(&mut self, channel: ChannelId) -> Option<ChannelDisposition> {
+        let Some(d) = self.channels.remove(&channel) else {
             debug!(
                 channel = ?channel,
                 "ignoring CHANNEL_CLOSE for a channel this connection never accepted \
                  (forged or duplicate)"
             );
-            return false;
+            return None;
+        };
+        if d.is_accepted() {
+            self.open_channels = self.open_channels.saturating_sub(1);
+        } else {
+            self.over_bound_channels = self.over_bound_channels.saturating_sub(1);
         }
-        self.open_channels = self.open_channels.saturating_sub(1);
-        true
+        Some(d)
     }
 
     // r[impl gw.conn.channel-types]
@@ -1036,7 +1072,7 @@ impl Drop for ConnectionHandler {
         // (the map below clears, aborting their response tasks) from
         // arming fresh timers against a dead connection.
         //
-        // sh-009: dropping `self.sessions` below runs N×
+        // sh-009: dropping `self.channels` below runs N×
         // `ChannelSession::Drop`, each firing its per-channel
         // `shutdown.cancel()`; each detached `_proto_task` reaches the
         // unconditional `cancel_active_builds` chokepoint with THAT
@@ -1053,10 +1089,10 @@ impl Drop for ConnectionHandler {
             self.active_conns.fetch_sub(1, Ordering::Relaxed);
             metrics::gauge!("rio_gateway_connections_active").decrement(1.0);
             // Channel gauge decrement is handled by ChannelSession::Drop
-            // when the sessions HashMap is cleared.
+            // when the channels HashMap is cleared.
             debug!(
                 peer = ?self.peer_addr,
-                remaining_channels = self.sessions.len(),
+                remaining_channels = self.channels.len(),
                 "SSH connection handler dropped"
             );
         } else {
@@ -1386,10 +1422,10 @@ impl Handler for ConnectionHandler {
         // and the rejection is deferred to `exec_request`, which is the
         // safe shed point for the same reason as the global session cap.
         // The channel handle is dropped immediately (no write half kept,
-        // no `accepted_channels` entry, no `open_channels` increment) so
-        // the only per-channel cost is the russh table entry; the id is
-        // recorded in `over_bound_channels` for the exec-time refusal
-        // and `channel_close` cleanup.
+        // no `open_channels` increment) so the only per-channel cost is
+        // the russh table entry; the id is recorded as
+        // `ChannelDisposition::OverBound` for the exec-time refusal and
+        // `channel_close` cleanup.
         //
         // A per-open `Ok(false)` would also leak russh-side state: russh
         // allocates the channel's state (an eager mpsc plus window ref)
@@ -1409,11 +1445,11 @@ impl Handler for ConnectionHandler {
         // branch `open_channels == max` and the backstop reduces to the
         // set length alone — exactly the bound the field doc states.
         if self.open_channels >= self.max_channels_per_connection {
-            if self.over_bound_channels.len() >= self.max_channels_per_connection {
+            if self.over_bound_channels >= self.max_channels_per_connection {
                 warn!(
                     peer = ?self.peer_addr,
                     open = self.open_channels,
-                    over_bound = self.over_bound_channels.len(),
+                    over_bound = self.over_bound_channels,
                     limit = self.max_channels_per_connection,
                     "closing SSH connection: per-connection channel hard backstop (2×bound) exceeded"
                 );
@@ -1422,7 +1458,7 @@ impl Handler for ConnectionHandler {
                 anyhow::bail!(
                     "per-connection channel hard backstop exceeded ({} open + {} over-bound, limit 2×{})",
                     self.open_channels,
-                    self.over_bound_channels.len(),
+                    self.over_bound_channels,
                     self.max_channels_per_connection
                 );
             }
@@ -1442,7 +1478,9 @@ impl Handler for ConnectionHandler {
             // connection kills).
             metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit_soft")
                 .increment(1);
-            self.over_bound_channels.insert(channel_id);
+            self.channels
+                .insert(channel_id, ChannelDisposition::OverBound);
+            self.over_bound_channels += 1;
             // Drop both halves — no protocol path for this channel. The
             // russh table entry stays until the client (or our
             // exec-time `reject_exec`) closes it.
@@ -1536,20 +1574,44 @@ impl Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         // r[impl gw.conn.channel-limit+4]
         // r[impl gw.conn.session-cap+2]
-        // The over-bound open was accepted only so the mux client would
-        // see `MUX_S_SESSION_OPENED`; THIS is where it is refused — a
-        // clean `channel_failure` + exit-status 1, same as the global
-        // session cap below. Checked before everything else (including
-        // the `accepted_channels` gate, which would also reject it but
-        // with the wrong reason logged) and before `session_sem` so the
-        // refusal costs no permit.
-        if self.over_bound_channels.contains(&channel_id) {
-            warn!(
-                peer = ?self.peer_addr,
-                channel = ?channel_id,
-                "rejecting exec request: channel was opened over the per-connection bound"
-            );
-            return reject_exec(session, channel_id);
+        // Single disposition lookup. russh dispatches exec_request for
+        // any well-formed channel id; only `Accepted` proceeds.
+        // `OverBound` is the deferred refusal: the open was accepted
+        // only so the mux client would see `MUX_S_SESSION_OPENED`, and
+        // THIS is where it is refused — a clean `channel_failure` +
+        // exit-status 1, same as the global session cap below. Checked
+        // before `session_sem` so the refusal costs no permit.
+        match self.channels.get(&channel_id) {
+            Some(ChannelDisposition::Accepted) => {}
+            Some(ChannelDisposition::OverBound) => {
+                warn!(
+                    peer = ?self.peer_addr,
+                    channel = ?channel_id,
+                    "rejecting exec request: channel was opened over the per-connection bound"
+                );
+                return reject_exec(session, channel_id);
+            }
+            Some(ChannelDisposition::Session(_)) => {
+                // RFC 4254 sessions run one command, and OpenSSH never
+                // re-execs a channel — refuse rather than spawn a second
+                // protocol session whose output could not be delivered
+                // (the write half was consumed by the first exec).
+                warn!(
+                    channel = ?channel_id,
+                    "rejecting exec request: channel already ran an exec"
+                );
+                return reject_exec(session, channel_id);
+            }
+            None => {
+                // Same unvalidated-id exposure as channel_close: don't
+                // spawn a protocol session (and consume a global session
+                // permit) for a channel this connection never accepted.
+                warn!(
+                    channel = ?channel_id,
+                    "rejecting exec request on a channel this connection never accepted"
+                );
+                return reject_exec(session, channel_id);
+            }
         }
 
         let Ok(command) = String::from_utf8(data.to_vec()) else {
@@ -1564,20 +1626,6 @@ impl Handler for ConnectionHandler {
             && args[args.len() - 1] == "--stdio";
         if !is_nix_daemon {
             warn!(command = %command, "rejecting non-nix-daemon exec request");
-            return reject_exec(session, channel_id);
-        }
-
-        // r[impl gw.conn.channel-limit+4]
-        // Same unvalidated-id exposure as channel_close: russh dispatches
-        // exec_request for any well-formed channel id, including ones
-        // that were never opened at all. Don't spawn a protocol session
-        // (and consume a global session permit) for a channel this
-        // connection never accepted.
-        if !self.accepted_channels.contains(&channel_id) {
-            warn!(
-                channel = ?channel_id,
-                "rejecting exec request on a channel this connection never accepted"
-            );
             return reject_exec(session, channel_id);
         }
 
@@ -1610,18 +1658,12 @@ impl Handler for ConnectionHandler {
 
         // The channel's write half is what the response pump sends through
         // (see [`SessionSink`]); each accepted channel has exactly one,
-        // and the first admitted exec consumes it. No half left means this
-        // channel already exec'd — RFC 4254 sessions run one command, and
-        // OpenSSH never re-execs a channel — so refuse rather than spawn a
-        // second protocol session whose output could not be delivered.
-        // The just-acquired permit is released by the early return.
-        let Some(write_half) = self.channel_writers.remove(&channel_id) else {
-            warn!(
-                channel = ?channel_id,
-                "rejecting exec request: channel already ran an exec"
-            );
-            return reject_exec(session, channel_id);
-        };
+        // parked at open time and consumed here. The disposition match
+        // above returned `Accepted`, so the entry exists.
+        let write_half = self
+            .channel_writers
+            .remove(&channel_id)
+            .expect("ChannelDisposition::Accepted ⇒ channel_writers entry");
 
         // r[impl gw.conn.exit-status+3]
         // An admitted exec creates a protocol session — the connection
@@ -1741,14 +1783,14 @@ impl Handler for ConnectionHandler {
             .await;
         });
 
-        self.sessions.insert(
+        self.channels.insert(
             channel_id,
-            ChannelSession {
+            ChannelDisposition::Session(ChannelSession {
                 client_tx: Some(client_tx),
                 _proto_task: proto_task,
                 response_task,
                 shutdown,
-            },
+            }),
         );
 
         Ok(())
@@ -1760,31 +1802,40 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(chan_session) = self.sessions.get(&channel) {
-            // Gated on the sessions lookup: an over-bound channel id
-            // (in `over_bound_channels`, never in `sessions`) must NOT
-            // inflate the rx throughput counter — that traffic is
-            // intentionally dropped, and the field doc claims this arm
-            // is a benign no-op. Pre-soft-bound the path was
-            // unreachable (over-bound bailed the connection).
-            metrics::counter!("rio_gateway_bytes_total", "direction" => "rx")
-                .increment(data.len() as u64);
-            if let Some(tx) = &chan_session.client_tx {
-                debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
-                if tx.send(data.to_vec()).await.is_err() {
-                    warn!(channel = ?channel, "protocol session dead, closing channel");
-                    // Bookkeeping cleanup only: the dead session's permit,
-                    // gauge slot, and live-session count were already
-                    // released when its tasks ended (SessionGuard), and the
-                    // empty-connection grace clock started then if this was
-                    // the last live session — client data on the dead
-                    // channel must not extend anything.
-                    self.sessions.remove(&channel);
-                    return Ok(());
+        // Gated on the disposition lookup: only `OverBound` traffic is
+        // excluded from the rx throughput counter (intentionally
+        // dropped — pre-soft-bound the path was unreachable). Pre-exec
+        // and dead-session tail data on accepted channels still count,
+        // preserving rx/tx parity with the unconditional tx increment.
+        let tx = match self.channels.get_mut(&channel) {
+            None => {
+                debug!(channel = ?channel, len = data.len(), "data for unknown channel");
+                return Ok(());
+            }
+            Some(ChannelDisposition::OverBound) => return Ok(()),
+            Some(d) => {
+                metrics::counter!("rio_gateway_bytes_total", "direction" => "rx")
+                    .increment(data.len() as u64);
+                match d {
+                    ChannelDisposition::Session(s) => s.client_tx.take(),
+                    _ => return Ok(()),
                 }
             }
-        } else {
-            debug!(channel = ?channel, len = data.len(), "data for channel with no session");
+        };
+        let Some(tx) = tx else { return Ok(()) };
+        debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
+        if tx.send(data.to_vec()).await.is_err() {
+            // Keep the `Session` entry, drop the forward path: the dead
+            // session's permit, gauge slot, and live-session count were
+            // already released when its tasks ended (SessionGuard), and
+            // the empty-connection grace clock started then if this was
+            // the last live session — client data on the dead channel
+            // must not extend anything. The entry stays so further tail
+            // data is still rx-counted and a re-exec on this channel is
+            // refused; `channel_close` decrements `open_channels`.
+            warn!(channel = ?channel, "protocol session dead");
+        } else if let Some(ChannelDisposition::Session(s)) = self.channels.get_mut(&channel) {
+            s.client_tx = Some(tx);
         }
         Ok(())
     }
@@ -1795,8 +1846,8 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel EOF");
-        if let Some(session) = self.sessions.get_mut(&channel) {
-            session.client_tx.take();
+        if let Some(ChannelDisposition::Session(s)) = self.channels.get_mut(&channel) {
+            s.client_tx.take();
         }
         Ok(())
     }
@@ -1807,18 +1858,17 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         // r[impl gw.conn.channel-limit+4]
-        // Over-bound channels are tracked only in `over_bound_channels`
-        // (no `accepted_channels`/`open_channels`/`channel_writers`
-        // entry); a close for one is pure set removal.
-        if self.over_bound_channels.remove(&channel) {
-            return Ok(());
-        }
-        // Only act on closes for channels this connection actually
-        // accepted (see note_channel_closed): russh hands us a close for
-        // any id the peer claims, and trusting it would let forged or
+        // Only act on closes for channels this connection actually saw
+        // open (see note_channel_closed): russh hands us a close for any
+        // id the peer claims, and trusting it would let forged or
         // duplicate closes drain `open_channels` while russh's own
-        // channel table keeps growing.
-        if !self.note_channel_closed(channel) {
+        // channel table keeps growing. An over-bound close is pure
+        // counter decrement (no `open_channels`/`channel_writers`
+        // entry).
+        if !self
+            .note_channel_closed(channel)
+            .is_some_and(|d| d.is_accepted())
+        {
             return Ok(());
         }
         debug!(channel = ?channel, "SSH channel closed");
@@ -1827,19 +1877,19 @@ impl Handler for ConnectionHandler {
         // into their response pump at exec time, so this is a no-op for
         // them.
         self.channel_writers.remove(&channel);
-        // Removing the entry aborts the response task (ChannelSession::
-        // Drop), whose SessionGuard then releases the permit/gauge/live
-        // count if the session was still live. r[gw.conn.exit-status+3]:
-        // if that was the connection's last LIVE session, the guard's
-        // drop arms the empty-connection grace — NOT an immediate
-        // disconnect, because a ControlMaster's in-flight session count
-        // legitimately transits through zero between builds, and killing
-        // the transport there poisons the rest of the batch (the master
-        // exits, OpenSSH unlinks the "stale" control socket, every
-        // remaining nix process falls back to a corrupted direct
-        // connection). A session that already ended server-side released
-        // its slot back then; this close is pure bookkeeping.
-        self.sessions.remove(&channel);
+        // Dropping the removed `ChannelDisposition::Session` aborts the
+        // response task (ChannelSession::Drop), whose SessionGuard then
+        // releases the permit/gauge/live count if the session was still
+        // live. r[gw.conn.exit-status+3]: if that was the connection's
+        // last LIVE session, the guard's drop arms the empty-connection
+        // grace — NOT an immediate disconnect, because a ControlMaster's
+        // in-flight session count legitimately transits through zero
+        // between builds, and killing the transport there poisons the
+        // rest of the batch (the master exits, OpenSSH unlinks the
+        // "stale" control socket, every remaining nix process falls back
+        // to a corrupted direct connection). A session that already ended
+        // server-side released its slot back then; this close is pure
+        // bookkeeping.
         Ok(())
     }
 }
@@ -1947,7 +1997,7 @@ mod tests {
 
         // A close for a channel that was never accepted must be ignored.
         assert!(
-            !handler.note_channel_closed(forged),
+            handler.note_channel_closed(forged).is_none(),
             "a CHANNEL_CLOSE for a never-accepted channel must be ignored"
         );
         assert_eq!(
@@ -1957,18 +2007,20 @@ mod tests {
 
         // The real close is counted exactly once and stops being tracked.
         assert!(
-            handler.note_channel_closed(real),
+            handler
+                .note_channel_closed(real)
+                .is_some_and(|d| d.is_accepted()),
             "the close of an accepted channel must be counted"
         );
         assert_eq!(handler.open_channels, 0);
         assert!(
-            handler.accepted_channels.is_empty(),
+            handler.channels.is_empty(),
             "closing must remove the tracking entry"
         );
 
         // A duplicate close of the already-closed channel must be ignored.
         assert!(
-            !handler.note_channel_closed(real),
+            handler.note_channel_closed(real).is_none(),
             "a duplicate CHANNEL_CLOSE must be ignored"
         );
         assert_eq!(
