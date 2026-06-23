@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use rio_proto::types::{FindMissingPathsRequest, FindMissingPathsResponse};
@@ -190,6 +190,16 @@ impl DagActor {
     /// every DB write here is log-and-continue. Extracted from
     /// `handle_merge_dag` so the P2 batched-flush path can run phase 5
     /// for N merges in one transaction, then this per-merge.
+    ///
+    /// `#[instrument(fields(build_id))]` carries the per-build join key
+    /// into every `record_merge_phase` debug line and `error!`/`warn!`
+    /// below — the production intake→flush route bypasses the
+    /// `#[cfg(test)] handle_merge_dag` span the pre-P2 path used, and
+    /// the I-139 phase-timing diagnostic depends on `grep build_id=` of
+    /// the JSON log surfacing the per-phase debug stream (Observability
+    /// checklist: handlers carry `#[instrument]` spans with meaningful
+    /// fields).
+    #[instrument(skip(self, ingest), fields(build_id = %ingest.build_id))]
     async fn finish_merge_dag(&mut self, ingest: MergeIngest) -> super::BuildEventReceivers {
         let t_phase6 = Instant::now();
         let build_id = ingest.build_id;
@@ -442,11 +452,12 @@ impl DagActor {
         let mut culprit = 0usize;
         if let Err(e) = self.persist_merges(&mut prepared, &mut culprit).await {
             // `build_id` is the operator-side join key to the gateway's
-            // SubmitBuild error (the pre-P2 inline path's
-            // `#[instrument(fields(build_id))]` carried it; the
-            // production intake→flush route bypasses that span and
-            // `cleanup_failed_merge` logs nothing on the common Ok
-            // rollback). Siblings get no per-build line — the
+            // SubmitBuild error. The per-merge phases each carry a
+            // `#[instrument(fields(build_id))]` span; `persist_merges`
+            // is batch-scoped (no single build_id) so the culprit is
+            // named explicitly here (`cleanup_failed_merge` logs
+            // nothing on the common Ok rollback). Siblings get no
+            // per-build line — the
             // `BatchSiblingFailed` they receive is intentionally
             // detail-free (cross-tenant), so the culprit's id is the
             // one anchor a `grep build_id=<uuid>` needs.
@@ -1120,6 +1131,7 @@ impl DagActor {
     /// build is in-memory-merged and PG has a Pending build row; the
     /// caller MUST either run phase 5 (and on its failure
     /// `cleanup_failed_merge`) or `cleanup_failed_merge` directly.
+    #[instrument(skip(self, req), fields(build_id = %req.build_id))]
     async fn prepare_merge_persist(
         &mut self,
         req: MergeDagRequest,
@@ -1409,6 +1421,7 @@ impl DagActor {
     /// DB write failures are log-and-continue (build is already Active;
     /// DB sync catches up on the next status update).
     // r[impl sched.merge.reconcile-order+2]
+    #[instrument(skip(self, ingest), fields(build_id = %ingest.build_id))]
     async fn reconcile_merged_state(&mut self, ingest: &MergeIngest) -> MergeReconcile {
         let MergeIngest {
             nodes,

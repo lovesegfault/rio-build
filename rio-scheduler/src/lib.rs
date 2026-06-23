@@ -231,10 +231,12 @@ pub fn describe_metrics() {
          5-persist-and-activate-batched — the flush_pending_merges batch \
          persist; N=1 and N>1 share one path). Emitted from \
          flush_pending_merges, NOT the MergeDag command arm — post-P2 the \
-         arm is µs-class intake for 31/32 turns and \
-         actor_cmd_seconds{cmd=MergeDag} samples NONE of the flush work \
-         (flush fires via trigger i eager or trigger iv deadline arm, neither \
-         a cmd sample). Compare phases against each other, not \
+         arm is µs-class intake for 31/32 turns. \
+         actor_cmd_seconds{cmd=MergeDag} samples the flush only on the \
+         BATCH_MAX-th turn (trigger i eager flush is awaited inside \
+         intake — bimodal: 31× µs + 1× the batch flush per 32-burst); \
+         trigger iv (the deadline select! arm) bypasses the cmd \
+         sample. Compare phases against each other, not \
          against actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the \
          I-139 signal — N sequential PG awaits in the actor."
     );
