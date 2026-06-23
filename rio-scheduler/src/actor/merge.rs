@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, instrument, warn};
+#[cfg(test)]
+use tracing::instrument;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use rio_proto::types::{FindMissingPathsRequest, FindMissingPathsResponse};
@@ -119,7 +121,7 @@ pub(super) struct PreparedMerge {
     pub ingest: MergeIngest,
     pub tenant_id: Option<Uuid>,
     pub edges: Vec<crate::domain::DerivationEdge>,
-    pub pruned_closure_parents: HashSet<String>,
+    pub pruned_closure_parents: HashSet<DrvHash>,
     pub new_sub_lane: Vec<DrvHash>,
     pub reprobe_sub_lane: Vec<DrvHash>,
 }
@@ -153,7 +155,7 @@ impl DagActor {
     // intake is no eager-flush trigger / no deadline arm — those need
     // the run loop). Any post-persist step added between
     // persist_merges-Ok and finish_merge_dag lands once, in flush.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) async fn handle_merge_dag(
         &mut self,
         req: MergeDagRequest,
@@ -590,8 +592,23 @@ impl DagActor {
         let n_nodes_est: usize = prepared.iter().map(|p| p.ingest.nodes.len()).sum();
         let mut seen: HashSet<&str> = HashSet::with_capacity(n_nodes_est);
         let mut node_rows: Vec<crate::db::DerivationRow> = Vec::with_capacity(n_nodes_est);
+        // ONE batch-wide path_to_hash, folded into Batch-1's Σ|nodes_i|
+        // walk (not a second flat_map pass over the same set inside the
+        // held fenced tx). Populated BEFORE the seen-dedup `continue`:
+        // last-write-wins is benign by construction (debug_assert
+        // below), and the per-row body reads only fields
+        // batch_upsert_derivations does not mutate.
+        let mut path_to_hash: HashMap<&str, &str> = HashMap::with_capacity(n_nodes_est);
         for p in prepared.iter() {
             for node in &p.ingest.nodes {
+                let prev = path_to_hash.insert(node.drv_path.as_str(), node.drv_hash.as_str());
+                debug_assert!(
+                    prev.is_none_or(|v| v == node.drv_hash.as_str()),
+                    "batch path_to_hash conflict: {} → {} vs {prev:?} \
+                     (path↔hash validated at ingest::validate_node — regression there)",
+                    node.drv_path,
+                    node.drv_hash,
+                );
                 if !seen.insert(node.drv_hash.as_str()) {
                     continue;
                 }
@@ -641,33 +658,18 @@ impl DagActor {
         // `self.dag.node().db_id` for nodes in THIS batch — that
         // field isn't set until after commit() below.
         //
-        // ONE batch-wide path_to_hash (not per-merge): merge[k]'s edge
-        // to a node merge[j<k] introduced resolves through `id_map`
-        // (the cross-merge-within-batch case the per-merge map missed
-        // and `self.dag.db_id_for_path` cannot serve until
-        // post-commit), and the held fenced tx no longer rebuilds
-        // O(|nodes_i|) HashMaps × MERGE_PERSIST_BATCH_MAX.
-        //
-        // Last-write-wins is BENIGN by construction: drv_hash is the
-        // content hash of the .drv at drv_path, so two nodes with the
-        // same drv_path carry the same drv_hash unless a client lied.
-        // Path↔hash consistency is the gRPC ingest layer's contract
-        // (`ingest::validate_node`); the debug_assert below catches a
-        // regression there. No release-mode rejection — adversarial
-        // input that slips ingest validation is a separate concern.
-        let path_to_hash: HashMap<&str, &str> = prepared
-            .iter()
-            .flat_map(|p| p.ingest.nodes.iter())
-            .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
-            .fold(HashMap::with_capacity(n_nodes_est), |mut m, (p, h)| {
-                let prev = m.insert(p, h);
-                debug_assert!(
-                    prev.is_none_or(|v| v == h),
-                    "batch path_to_hash conflict: {p} → {h} vs {prev:?} \
-                     (path↔hash validated at ingest::validate_node — regression there)"
-                );
-                m
-            });
+        // `path_to_hash` (built in Batch-1's loop above): merge[k]'s
+        // edge to a node merge[j<k] introduced resolves through
+        // `id_map` (the cross-merge-within-batch case a per-merge map
+        // missed and `self.dag.db_id_for_path` cannot serve until
+        // post-commit). Last-write-wins is benign by construction:
+        // drv_hash is the content hash of the .drv at drv_path, so two
+        // nodes with the same drv_path carry the same drv_hash unless
+        // a client lied. Path↔hash consistency is the gRPC ingest
+        // layer's contract (`ingest::validate_node`); the debug_assert
+        // in Batch-1 catches a regression there. No release-mode
+        // rejection — adversarial input that slips ingest validation
+        // is a separate concern.
         let resolve = |drv_path: &str| -> Option<Uuid> {
             path_to_hash
                 .get(drv_path)
@@ -804,30 +806,29 @@ impl DagActor {
         let mut queued: HashSet<&str> = HashSet::new();
         for p in prepared.iter() {
             let start = job_specs.len();
+            // Three lanes share one push body — only `origin` and the
+            // pruned lane's extra `!vouched` gate differ. Macro (not a
+            // closure) so the &mut job_specs / &mut queued borrows are
+            // released between calls and the reprobe lane's reset
+            // block below can read self.dag/reset_row_for in the same
+            // for-body. A future change to the gate (e.g. also
+            // checking dag membership) lands once.
+            macro_rules! push_lane {
+                ($h:expr, $origin:expr, $extra_ok:expr) => {
+                    if let Some((db_id, _)) = id_map.get($h.as_str())
+                        && $extra_ok(db_id)
+                        && queued.insert($h.as_str())
+                    {
+                        job_specs.push((*db_id, $h.clone(), p.tenant_id, $origin));
+                    }
+                };
+            }
             for h in &p.pruned_closure_parents {
-                if let Some((db_id, _)) = id_map.get(h.as_str())
-                    && !vouched.contains(db_id)
-                    && queued.insert(h.as_str())
-                {
-                    job_specs.push((
-                        *db_id,
-                        DrvHash::from(h.as_str()),
-                        p.tenant_id,
-                        crate::state::JobOrigin::Pruned,
-                    ));
-                }
+                push_lane!(h, crate::state::JobOrigin::Pruned, |id| !vouched
+                    .contains(id));
             }
             for h in &p.new_sub_lane {
-                if let Some((db_id, _)) = id_map.get(h.as_str())
-                    && queued.insert(h.as_str())
-                {
-                    job_specs.push((
-                        *db_id,
-                        h.clone(),
-                        p.tenant_id,
-                        crate::state::JobOrigin::CacheOpportunity,
-                    ));
-                }
+                push_lane!(h, crate::state::JobOrigin::CacheOpportunity, |_| true);
             }
             // PD-17 (Phase B): reprobe-lane jobs (origin=reprobe) +
             // the AS-5 durable reset, riding the same transaction. The
@@ -843,16 +844,7 @@ impl DagActor {
             // seed_initial_states reads dep statuses (the
             // bug_089/bug_132 phase-ordering invariant).
             for h in &p.reprobe_sub_lane {
-                if let Some((db_id, _)) = id_map.get(h.as_str())
-                    && queued.insert(h.as_str())
-                {
-                    job_specs.push((
-                        *db_id,
-                        h.clone(),
-                        p.tenant_id,
-                        crate::state::JobOrigin::Reprobe,
-                    ));
-                }
+                push_lane!(h, crate::state::JobOrigin::Reprobe, |_| true);
                 if reset_seen.insert(h.as_str())
                     && self.dag.node(h).is_some_and(|s| {
                         matches!(
@@ -1200,10 +1192,10 @@ impl DagActor {
                     .iter()
                     .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
                     .collect();
-                let parents: HashSet<String> = edges
+                let parents: HashSet<DrvHash> = edges
                     .iter()
                     .filter_map(|e| kept_path_to_hash.get(e.parent_drv_path.as_str()))
-                    .map(|h| (*h).to_string())
+                    .map(|h| DrvHash::from(*h))
                     .collect();
                 (demanded, Vec::new(), parents)
             }
@@ -1348,11 +1340,6 @@ impl DagActor {
         // in-tx job creation (adjudication PDQ-9) can ride the merge
         // transaction. Flag-off the lane is passed but the in-tx block
         // never reads it.
-        let new_sub_lane: Vec<DrvHash> = pending_substitute
-            .iter()
-            .filter(|(h, _)| !existing_reprobe.contains(h))
-            .map(|(h, _)| h.clone())
-            .collect();
         // Phase B (PD-17): the REPROBE lane subset (pre-existing nodes
         // the probe re-classified substitutable), hoisted pre-tx — the
         // reconcile phase derives the same partition at its 6d slot, but
@@ -1360,12 +1347,15 @@ impl DagActor {
         // ordering reality), so the flag-on job rows (origin=reprobe) +
         // the AS-5 durable reset must be computed HERE to ride batch 5.
         // Flag-off the lane is passed but never read in-tx, and the 6d
-        // slot stays byte-identical (it spawns the as-built walks).
-        let reprobe_sub_lane: Vec<DrvHash> = pending_substitute
+        // slot stays byte-identical (it spawns the as-built walks). One
+        // partition() (matching the in-file precedent at the 6d split)
+        // makes the new_sub/reprobe complementarity structural — two
+        // inverted filter passes risk a future second condition on one
+        // leaving nodes in neither lane or both.
+        let (reprobe_sub_lane, new_sub_lane): (Vec<DrvHash>, Vec<DrvHash>) = pending_substitute
             .iter()
-            .filter(|(h, _)| existing_reprobe.contains(h))
             .map(|(h, _)| h.clone())
-            .collect();
+            .partition(|h| existing_reprobe.contains(h));
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
         Ok(PreparedMerge {
