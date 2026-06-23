@@ -200,10 +200,16 @@ impl DagActor {
         // misattributed to the estimator phase; the per-phase budget
         // WARN (S2's defense-in-depth) wraps it once that lands.
         self.flush_pending_pull_outcomes().await;
-        // P2 flush trigger (ii): drain any merges queued since the
-        // last flush — defense-in-depth behind trigger (iv) (the 50ms
-        // MERGE_PERSIST_FLUSH_DEADLINE select! arm).
-        self.flush_pending_merges().await;
+        // P2 flush trigger (ii) DELETED (former
+        // `self.flush_pending_merges().await` here — see
+        // sdd/submitbuild-exhausted-diag.md § "Tick 304ms→2.57s").
+        // Reply latency is already bounded by trigger (iv) (the 50ms
+        // MERGE_PERSIST_FLUSH_DEADLINE select! arm); a Tick-head flush
+        // synchronously drains an 8-16 batch (94% of Tick cost over 46
+        // live Ticks, one Tick at 2.5-5s) and — because the biased
+        // select! orders rx before the deadline arms — a Tick queued
+        // DURING a deadline-arm flush re-flushes the next batch at its
+        // head. Tick must never block on the merge buffer.
         // Per-phase attribution (round-9 dossier B2 — the merge.rs
         // `phase!` pattern verbatim, leader-only by the early-return
         // above). live_053's 134.65s Tick was log-silent for its

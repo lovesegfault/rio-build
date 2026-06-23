@@ -337,10 +337,11 @@ impl DagActor {
     /// reply-after-durable contract `handle_merge_dag` always had —
     /// `cleanup_failed_merge` is the rollback if the batch tx fails).
     ///
-    /// Flush triggers (mirrors [`Self::handle_report_outcome`]):
-    /// (i) `len ≥ MERGE_PERSIST_BATCH_MAX` here; (ii) `handle_tick`
-    /// head; (iii) `handle_leader_lost` (drains with `NotLeader`);
-    /// (iv) the [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm.
+    /// Flush triggers: (i) `len ≥ MERGE_PERSIST_BATCH_MAX` here;
+    /// (iii) `handle_leader_lost` (drains with `NotLeader`); (iv) the
+    /// [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm. NO `handle_tick`
+    /// head — Tick must never synchronously drain the merge buffer
+    /// (Tick 304ms→2.57s regression; see `housekeeping.rs`).
     pub(super) async fn handle_merge_dag_intake(
         &mut self,
         req: MergeDagRequest,
