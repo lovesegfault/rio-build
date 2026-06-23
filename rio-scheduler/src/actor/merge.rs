@@ -161,13 +161,13 @@ impl DagActor {
     // Production routes ActorCommand::MergeDag → handle_merge_dag_intake
     // → flush_pending_merges_priced; this is the synchronous N=1 entry
     // the direct &mut DagActor test callers use (mbt_* / sla_contract).
-    // It is NOT a re-implementation: it pushes one PendingMerge and
-    // calls `flush_pending_merges_priced`, so the mbt_*/sla_contract
-    // surface exercises the production orchestration including the
-    // cost-axis EWMA feed (the only difference vs intake is no
-    // eager-flush trigger / no deadline arm — those need the run
-    // loop). Any post-persist step added between persist_merges-Ok and
-    // finish_merge_dag lands once, in flush.
+    // It is NOT a re-implementation: it delegates to intake then
+    // immediately flushes, so the mbt_*/sla_contract surface exercises
+    // the production orchestration including the cost-axis EWMA feed.
+    // Intake's deadline arm is harmlessly set then cleared by the flush
+    // below (no run loop reads it between). Any post-persist step added
+    // between persist_merges-Ok and finish_merge_dag lands once, in
+    // flush.
     #[cfg(test)]
     pub(super) async fn handle_merge_dag(
         &mut self,
@@ -179,7 +179,7 @@ impl DagActor {
              pending_merges here means a test mixed it with intake"
         );
         let (tx, rx) = oneshot::channel();
-        self.pending_merges.push(PendingMerge { req, reply: tx });
+        self.handle_merge_dag_intake(req, tx).await;
         self.flush_pending_merges_priced().await;
         rx.await.map_err(|_| ActorError::ChannelSend)?
     }

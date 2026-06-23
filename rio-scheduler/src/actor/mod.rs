@@ -2133,10 +2133,13 @@ impl DagActor {
                     // with it. Tick is the only variant-routed feed:
                     // the periodic dispatch sweep blocks the queue at
                     // the same scale as a merge flush and has no
-                    // `_priced` wrapper. Every other 100ms+ handler
-                    // routes through one (the cost-axis input model is
-                    // flush-driven, not variant-driven — see
-                    // `note_turn_cost`).
+                    // `_priced` wrapper. The cost-axis input model is
+                    // Tick + merge-flush ONLY (see `note_turn_cost`):
+                    // the estimator tracks the work-class it gates
+                    // (MergeDag drain). `flush_pending_pull_outcomes`
+                    // is the same multi-RTT shape but DELIBERATELY does
+                    // not feed — folding it would re-introduce the
+                    // mid-cost decay the Tick/flush-only model fixed.
                     self.note_turn_cost(t_cmd.elapsed());
                 }
                 ActorCommand::QueryBuildStatus {
