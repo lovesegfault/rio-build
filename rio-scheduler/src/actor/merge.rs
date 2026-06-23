@@ -326,11 +326,11 @@ impl DagActor {
     /// Flush triggers: (i) `len ≥ MERGE_PERSIST_BATCH_MAX` here;
     /// (iii) `handle_leader_lost` (drains with `NotLeader`); (iv) the
     /// [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm; (v) the inline
-    /// post-dispatch `merge_flush_armed_at.elapsed() ≥ DEADLINE` check
-    /// in `run_inner` — the only sub-BATCH_MAX drain path while rx is
-    /// continuously Ready (biased select! starves trigger iv). NO
-    /// `handle_tick` head — Tick must never synchronously drain the
-    /// merge buffer (Tick 304ms→2.57s regression; `housekeeping.rs`).
+    /// post-dispatch `now ≥ merge_flush_deadline` check in `run_inner`
+    /// — the only sub-BATCH_MAX drain path while rx is continuously
+    /// Ready (biased select! starves trigger iv). NO `handle_tick`
+    /// head — Tick must never synchronously drain the merge buffer
+    /// (Tick 304ms→2.57s regression; `housekeeping.rs`).
     pub(super) async fn handle_merge_dag_intake(
         &mut self,
         req: MergeDagRequest,
@@ -341,14 +341,13 @@ impl DagActor {
         // deposed-believer window is fenced at phase-5 commit (the
         // claims-floor re-check), same as the pre-P2 inline path.
         //
-        // sh-027 §3 idiom (s3-interval-reset): the deadline arm's guard
-        // is `!pending.is_empty()`; while idle the Interval is unpolled
-        // and goes stale, so the FIRST queue after any idle gap >250ms
-        // would re-enable a guard with an immediately-Ready tick →
-        // flushes at N=1. Reset on the empty→nonempty edge.
+        // Arm the deadline on the empty→nonempty edge: `None` while
+        // idle, so trigger (iv)'s arm is `pending()` and trigger (v)
+        // is a no-op. One `tokio::time::Instant` field — same clock
+        // base for both read sites.
         if self.pending_merges.is_empty() {
-            self.merge_flush_deadline.reset();
-            self.merge_flush_armed_at = Some(std::time::Instant::now());
+            self.merge_flush_deadline =
+                Some(tokio::time::Instant::now() + MERGE_PERSIST_FLUSH_DEADLINE);
         }
         self.pending_merges.push(PendingMerge { req, reply });
         if self.pending_merges.len() >= MERGE_PERSIST_BATCH_MAX {
@@ -392,7 +391,7 @@ impl DagActor {
             return;
         }
         let batch = std::mem::take(&mut self.pending_merges);
-        self.merge_flush_armed_at = None;
+        self.merge_flush_deadline = None;
         metrics::histogram!("rio_scheduler_mergedag_coalesce_batch_size")
             .record(batch.len() as f64);
 

@@ -140,13 +140,14 @@ CLOCK_ROWS = {
     # partition predicate AND the post-loop stalled-gauge recount —
     # both compare the same created_at against the same age_out_after.
     "mat-unclaimed-age-out": ("landed", "sh044", "rio-scheduler/src/actor/materialize.rs", r"age_out_after"),
-    # P2 trigger (v): the inline post-dispatch merge-flush deadline
-    # check — deadline-shaped on the actor's own monotonic Instant
-    # (merge_flush_armed_at.elapsed() vs MERGE_PERSIST_FLUSH_DEADLINE;
-    # same Instant domain as the empty→nonempty intake stamp). Bounds
-    # SubmitBuild reply latency under sustained-Ready rx where the
-    # biased select! starves trigger (iv).
-    "merge-flush-armed-at": ("landed", "P2", "rio-scheduler/src/actor/mod.rs", r"merge_flush_armed_at"),
+    # Coalesce trigger (v): the inline post-dispatch flush-deadline
+    # check — deadline-shaped on tokio::time::Instant (now ≥
+    # merge_flush_deadline / pull_flush_deadline; same clock base as
+    # the trigger-(iv) sleep_until arm so the two read sites agree
+    # under start_paused). Bounds SubmitBuild / ReportPullOutcome
+    # reply latency under sustained-Ready rx where the biased select!
+    # starves trigger (iv).
+    "merge-flush-armed-at": ("landed", "P2", "rio-scheduler/src/actor/mod.rs", r"merge_flush_deadline"),
 }
 
 # The lossy-witness-arithmetic grammar (live from birth): seconds

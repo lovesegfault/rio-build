@@ -1033,7 +1033,8 @@ impl DagActor {
         for super::merge::PendingMerge { reply, .. } in self.pending_merges.drain(..) {
             let _ = reply.send(Err(super::ActorError::NotLeader));
         }
-        self.merge_flush_armed_at = None;
+        self.merge_flush_deadline = None;
+        self.pull_flush_deadline = None;
         debug_assert!(
             self.pending_walk_completed.is_empty(),
             "pending_walk_completed is flush-scoped — a non-empty vec \

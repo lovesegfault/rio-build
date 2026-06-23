@@ -1561,10 +1561,13 @@ impl DagActor {
     /// in classification terms.
     ///
     /// Flush triggers: (i) `len ≥ REPORT_OUTCOME_BATCH_MAX` here;
-    /// (ii) `handle_tick` head; (iii) `handle_leader_lost` (drains
-    /// with `NotLeader`); (iv) the [`REPORT_OUTCOME_FLUSH_DEADLINE`]
-    /// select! arm — a 250ms-bounded ack latency, decoupled from
-    /// `tick_interval`. The retired mailbox-empty signal (sh-002
+    /// (iii) `handle_leader_lost` (drains with `NotLeader`); (iv) the
+    /// [`REPORT_OUTCOME_FLUSH_DEADLINE`] select! arm; (v) the inline
+    /// post-dispatch `now ≥ pull_flush_deadline` check in `run_inner`
+    /// — a 250ms-bounded ack latency, decoupled from `tick_interval`.
+    /// NO `handle_tick` head — same Tick-must-never-block-on-a-
+    /// coalesce-buffer rationale as the merge side; trigger (v) is
+    /// the starvation backstop. The retired mailbox-empty signal (sh-002
     /// trigger iv) interleaved with `ListMaterializationJobs` /
     /// `SubstituteProgress` and degraded N̄ to ~5.5 (sh-027 §3); the
     /// deadline arm coalesces up to `min(64, reports_per_250ms)` and
@@ -1585,19 +1588,17 @@ impl DagActor {
             let _ = reply.send(Err(PullRejection::NotLeader));
             return;
         }
-        // sh-027 §3 (s3-interval-reset): the deadline arm's guard is
-        // `!pending.is_empty()`, so while idle the Interval is
-        // unpolled and its internal deadline goes stale. Without this
-        // reset, the FIRST report after any idle gap >250ms would
-        // re-enable the guard with an immediately-Ready tick →
-        // flushes at N=1 — the exact N̄ degradation this slot exists
-        // to fix. `MissedTickBehavior` does not help (it governs the
-        // NEXT tick after a late fire; the first late tick still
-        // fires immediately). The `biased;` arm placement (AFTER
-        // `rx.recv()`) is the second half: it lets the queued burst
-        // dequeue before the deadline arm is even considered.
+        // Arm the deadline on the empty→nonempty edge: `None` while
+        // idle (trigger (iv)'s arm is `pending()`, trigger (v) is a
+        // no-op), so the FIRST report after any idle gap arms a fresh
+        // 250ms-out deadline — never an immediately-Ready stale tick
+        // that would flush at N=1 (the N̄ degradation this slot exists
+        // to fix). The `biased;` arm placement (AFTER `rx.recv()`) is
+        // the second half: it lets the queued burst dequeue before the
+        // deadline arm is even considered.
         if self.pending_pull_outcomes.is_empty() {
-            self.pull_flush_deadline.reset();
+            self.pull_flush_deadline =
+                Some(tokio::time::Instant::now() + REPORT_OUTCOME_FLUSH_DEADLINE);
         }
         self.pending_pull_outcomes.push(PendingReport {
             exec_id,
@@ -1667,6 +1668,7 @@ impl DagActor {
              tail of every flush and nowhere else"
         );
         let pending = std::mem::take(&mut self.pending_pull_outcomes);
+        self.pull_flush_deadline = None;
         // sh-027 §3: the prod N̄ signal — `begin_fenced_calls` is
         // `#[cfg(test)]` only, so the sh-007c S6 design's core
         // assumption (N̄≥20) was unverifiable in prod. Buckets at

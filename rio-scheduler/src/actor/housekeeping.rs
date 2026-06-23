@@ -193,25 +193,20 @@ impl DagActor {
                                    keeping cached value (PG-side fence is the hard gate)");
             }
         }
-        // sh-002 flush trigger (ii): drain any reports queued since
-        // the last flush — defense-in-depth behind trigger (iv) (the
-        // 250ms REPORT_OUTCOME_FLUSH_DEADLINE select! arm, sh-027
-        // §3). Runs BEFORE the phase!-attributed body so its cost is not
-        // misattributed to the estimator phase; the per-phase budget
-        // WARN (S2's defense-in-depth) wraps it once that lands.
-        self.flush_pending_pull_outcomes().await;
-        // P2 flush trigger (ii) DELETED (former
-        // `self.flush_pending_merges().await` here — see
-        // sdd/submitbuild-exhausted-diag.md § "Tick 304ms→2.57s").
-        // Reply latency is bounded by trigger (iv) (the 250ms
-        // MERGE_PERSIST_FLUSH_DEADLINE select! arm) when rx idles, and
-        // by trigger (v) (the inline post-dispatch armed_at check)
-        // when rx is continuously Ready; a Tick-head flush
-        // synchronously drains an 8-16 batch (94% of Tick cost over 46
-        // live Ticks, one Tick at 2.5-5s) and — because the biased
-        // select! orders rx before the deadline arms — a Tick queued
-        // DURING a deadline-arm flush re-flushes the next batch at its
-        // head. Tick must never block on the merge buffer.
+        // Coalesce flush trigger (ii) DELETED for BOTH buffers
+        // (former `flush_pending_pull_outcomes` + the already-deleted
+        // `flush_pending_merges` here — see sdd/submitbuild-exhausted-
+        // diag.md § "Tick 304ms→2.57s"). Reply latency is bounded by
+        // trigger (iv) (the 250ms `coalesce_due` select! arm) when rx
+        // idles, and by trigger (v) (the inline post-dispatch `now ≥
+        // deadline` check, which now consults BOTH buffers) when rx
+        // is continuously Ready. A Tick-head flush synchronously
+        // drains an 8-16 batch (94% of Tick cost over 46 live Ticks
+        // for merge; pull's S6 batched completion is the same
+        // multi-RTT shape) and — because the biased select! orders rx
+        // before the deadline arms — a Tick queued DURING a
+        // deadline-arm flush re-flushes the next batch at its head.
+        // Tick must never block on either coalesce buffer.
         // Per-phase attribution (round-9 dossier B2 — the merge.rs
         // `phase!` pattern verbatim, leader-only by the early-return
         // above). live_053's 134.65s Tick was log-silent for its

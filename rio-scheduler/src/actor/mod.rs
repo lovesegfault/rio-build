@@ -118,6 +118,19 @@ pub(crate) const ADMIN_FAST_LANE_CAPACITY: usize = 256;
 /// dashboard reads per second).
 pub(crate) const ADMIN_FAST_LANE_DRAIN_QUOTA: usize = 16;
 
+/// Select!-arm helper for the coalesce-buffer deadline (trigger iv):
+/// `Some(d)` → resolve at `d`; `None` → never (the buffer is empty,
+/// so the arm is dormant and the actor never wakes on it). One
+/// `Option<tokio::time::Instant>` per buffer is the whole deadline
+/// state — the prior Interval+armed_at pair encoded the same instant
+/// twice on two clock bases.
+async fn coalesce_due(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// EWMA weight for the per-turn cost estimate feeding the cost-axis
 /// backpressure law (round-9 B6, re-derived sh-024 §S2). The EWMA is
 /// FED by [`ActorCommand::prices_into_drain`] variants (Tick) and
@@ -673,38 +686,31 @@ pub struct DagActor {
     /// `clear()` — the gateway's retry loop re-submits to the new
     /// leader). Same `pending_pull_outcomes` discipline.
     pending_merges: Vec<merge::PendingMerge>,
-    /// P2 flush trigger (iv): the
-    /// [`MERGE_PERSIST_FLUSH_DEADLINE`](merge::MERGE_PERSIST_FLUSH_DEADLINE)
-    /// (250ms) select! arm — bounds SubmitBuild reply latency for
-    /// sub-BATCH_MAX inbound rates. Same `MissedTickBehavior::Delay`
-    /// and `reset()` on empty→nonempty discipline as
-    /// `pull_flush_deadline`.
-    merge_flush_deadline: tokio::time::Interval,
-    /// P2 flush trigger (v): wall-clock instant of the empty→nonempty
-    /// push. The biased select! orders `rx.recv()` before the
-    /// `merge_flush_deadline` arm, so under sustained mailbox pressure
-    /// (the documented 8.8k PullAssignment×12ms ≈105s case, or a 65k
-    /// SubstituteProgress backlog) trigger (iv) is unreachable and —
-    /// since the Tick-head flush was deleted — a sub-BATCH_MAX batch
-    /// would have NO drain path. The run loop checks
-    /// `armed_at.elapsed() ≥ DEADLINE` inline AFTER every command
-    /// dispatch (not as a select! arm) so the latency bound holds
-    /// regardless of rx readiness. `None` while `pending_merges` is
-    /// empty; set by intake, cleared by flush and the leader-lost
-    /// drain.
-    merge_flush_armed_at: Option<std::time::Instant>,
-    /// sh-027 §3, flush trigger (iv): the
-    /// [`REPORT_OUTCOME_FLUSH_DEADLINE`](pull::REPORT_OUTCOME_FLUSH_DEADLINE)
-    /// (250ms) select! arm — bounds ack latency for sub-BATCH_MAX
-    /// inbound rates without coupling to `tick_interval`. Replaces
-    /// the retired mailbox-empty signal (sh-002 trigger iv), which
-    /// degraded N̄ to ~5.5 under interleaving with
-    /// `ListMaterializationJobs`/`SubstituteProgress`.
-    /// `MissedTickBehavior::Delay` (house style — every long-lived
-    /// Interval in-tree sets it explicitly); `reset()` on the
-    /// empty→nonempty transition (`handle_report_outcome`) so an
-    /// idle-stale deadline cannot flush the first report at N=1.
-    pull_flush_deadline: tokio::time::Interval,
+    /// P2 flush trigger (iv)+(v): `tokio::time` instant at which a
+    /// queued sub-BATCH_MAX merge batch flushes — `None` while
+    /// `pending_merges` is empty; set to `now +
+    /// `[`MERGE_PERSIST_FLUSH_DEADLINE`](merge::MERGE_PERSIST_FLUSH_DEADLINE)
+    /// on the empty→nonempty push; cleared by flush and the
+    /// leader-lost drain. ONE field for ONE deadline, read at two
+    /// sites: trigger (iv) is the `sleep_until` select! arm (reachable
+    /// when rx idles); trigger (v) is the inline post-dispatch `now ≥
+    /// deadline` check (the only sub-BATCH_MAX drain path while rx is
+    /// continuously Ready — biased select! orders rx before (iv)).
+    /// `tokio::time::Instant`, not `std::`, so the two read sites
+    /// agree under `start_paused` (the std-vs-tokio split made batch
+    /// size non-deterministic across debug/CI runs).
+    merge_flush_deadline: Option<tokio::time::Instant>,
+    /// sh-027 §3, flush trigger (iv)+(v): same one-`Option<Instant>`
+    /// shape as [`Self::merge_flush_deadline`] — `None` while
+    /// `pending_pull_outcomes` is empty; set to `now +
+    /// `[`REPORT_OUTCOME_FLUSH_DEADLINE`](pull::REPORT_OUTCOME_FLUSH_DEADLINE)
+    /// on the empty→nonempty push (`handle_report_outcome`); cleared
+    /// by flush. Bounds ack latency for sub-BATCH_MAX inbound rates
+    /// without coupling to `tick_interval`. Replaces the retired
+    /// mailbox-empty signal (sh-002 trigger iv), which degraded N̄ to
+    /// ~5.5 under interleaving with `ListMaterializationJobs`/
+    /// `SubstituteProgress`.
+    pull_flush_deadline: Option<tokio::time::Instant>,
     /// sh-002 row 4, the SECOND-level (flush-scoped) accumulator:
     /// `(drv_hash, WalkVerified(..))` pairs the Success consumption
     /// arm pushes INSTEAD of calling
@@ -1294,18 +1300,9 @@ impl DagActor {
             },
             pending_carriers: Vec::new(),
             pending_pull_outcomes: Vec::new(),
-            pull_flush_deadline: {
-                let mut iv = tokio::time::interval(pull::REPORT_OUTCOME_FLUSH_DEADLINE);
-                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                iv
-            },
+            pull_flush_deadline: None,
             pending_merges: Vec::new(),
-            merge_flush_deadline: {
-                let mut iv = tokio::time::interval(merge::MERGE_PERSIST_FLUSH_DEADLINE);
-                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                iv
-            },
-            merge_flush_armed_at: None,
+            merge_flush_deadline: None,
             pending_walk_completed: Vec::new(),
             status_outbox: std::collections::VecDeque::new(),
             db,
@@ -1486,9 +1483,9 @@ impl DagActor {
             // where `handle_report_outcome`'s inline `is_leader()`
             // gate has been replying NotLeader and never pushed.
             pending_pull_outcomes: _,
-            // Retained: an Interval is stateless across leadership;
-            // `handle_report_outcome` resets it on the next first
-            // push regardless.
+            // Retained: `None` while `pending_pull_outcomes` is empty
+            // (which the Hazard-L drain just made it); intake re-arms
+            // on the next first push regardless.
             pull_flush_deadline: _,
             // Retained: same drain-with-NotLeader-before-wipe
             // discipline as `pending_pull_outcomes` (Hazard L). NO
@@ -1500,7 +1497,6 @@ impl DagActor {
             // stale-tenure entry surviving this wipe is safe.
             pending_merges: _,
             merge_flush_deadline: _,
-            merge_flush_armed_at: _,
             // Retained: flush-scoped (always empty between flushes;
             // `flush_pending_pull_outcomes` and `handle_leader_lost`
             // both `debug_assert!` it).
@@ -1817,34 +1813,25 @@ impl DagActor {
                     Some(c) => c,
                     None => break,
                 },
-                // sh-027 §3, flush trigger (iv): the
-                // REPORT_OUTCOME_FLUSH_DEADLINE backstop. Placed
+                // Coalesce flush trigger (iv): the deadline backstop
+                // for BOTH buffers (sh-027 §3 pull / P2 merge). Placed
                 // AFTER `rx.recv()` so the `biased;` order drains
                 // every queued mailbox command (and so every
-                // ReportPullOutcome in a burst) BEFORE this arm is
-                // considered — placement BEFORE rx would flush at
-                // N=1 after any idle (the burst is still queued when
-                // the stale tick fires). The guard means an idle
-                // actor never wakes on this arm (unpolled → no
-                // waker). `handle_report_outcome` resets the
-                // Interval on the empty→nonempty transition, so the
-                // first poll after idle is always 250ms out.
-                _ = self.pull_flush_deadline.tick(),
-                    if !self.pending_pull_outcomes.is_empty() =>
-                {
+                // ReportPullOutcome / MergeDag in a burst) BEFORE
+                // this arm is considered — placement BEFORE rx would
+                // flush at N=1 after any idle. `Some(d)` is set on
+                // the empty→nonempty push, so the first poll after
+                // idle is always 250ms out; `None` (buffer empty)
+                // means `coalesce_due` is `pending()` and the actor
+                // never wakes on this arm. The merge half routes
+                // through `_priced` so the cost-axis EWMA sees the
+                // flush (intake MergeDag turns are ~µs and
+                // `prices_into_drain` no longer folds them).
+                () = coalesce_due(self.pull_flush_deadline) => {
                     self.flush_pending_pull_outcomes().await;
                     continue;
                 }
-                // P2 flush trigger (iv): same placement-after-rx +
-                // guard + reset-on-first-push discipline as the
-                // pull_flush_deadline arm above. Routes through the
-                // `_priced` wrapper so the cost-axis EWMA sees the
-                // flush (the queued-intake MergeDag turns themselves
-                // are ~µs and `prices_into_drain` no longer folds
-                // them — flush-driven, not variant-driven).
-                _ = self.merge_flush_deadline.tick(),
-                    if !self.pending_merges.is_empty() =>
-                {
+                () = coalesce_due(self.merge_flush_deadline) => {
                     self.flush_pending_merges_priced().await;
                     continue;
                 }
@@ -2163,16 +2150,20 @@ impl DagActor {
             if prices_into_drain {
                 self.note_turn_cost(cmd_elapsed);
             }
-            // P2 flush trigger (v): inline post-dispatch deadline check.
-            // The biased select! orders rx before the trigger-(iv) arm,
-            // so a sustained-Ready rx starves it; this check runs AFTER
-            // every command regardless of rx readiness and is the only
-            // sub-BATCH_MAX drain path while rx never empties. Routes
-            // through `_priced` so the cost-axis EWMA sees the flush.
-            if self
-                .merge_flush_armed_at
-                .is_some_and(|t| t.elapsed() >= merge::MERGE_PERSIST_FLUSH_DEADLINE)
-            {
+            // Coalesce flush trigger (v): inline post-dispatch deadline
+            // check for BOTH buffers. The biased select! orders rx
+            // before the trigger-(iv) arm, so a sustained-Ready rx
+            // starves it; this check runs AFTER every command
+            // regardless of rx readiness and is the only sub-BATCH_MAX
+            // drain path while rx never empties. Same `tokio::time`
+            // clock as trigger (iv) — the prior `std::time::Instant`
+            // disagreed under `start_paused` and a slow debug run
+            // could fire at N=1 even though the (iv) arm hadn't.
+            let now = tokio::time::Instant::now();
+            if self.pull_flush_deadline.is_some_and(|d| now >= d) {
+                self.flush_pending_pull_outcomes().await;
+            }
+            if self.merge_flush_deadline.is_some_and(|d| now >= d) {
                 self.flush_pending_merges_priced().await;
             }
             metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => cmd_name)
