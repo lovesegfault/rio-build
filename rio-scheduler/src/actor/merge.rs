@@ -651,11 +651,27 @@ impl DagActor {
         // and `self.dag.db_id_for_path` cannot serve until
         // post-commit), and the held fenced tx no longer rebuilds
         // O(|nodes_i|) HashMaps × MERGE_PERSIST_BATCH_MAX.
+        //
+        // Last-write-wins is BENIGN by construction: drv_hash is the
+        // content hash of the .drv at drv_path, so two nodes with the
+        // same drv_path carry the same drv_hash unless a client lied.
+        // Path↔hash consistency is the gRPC ingest layer's contract
+        // (`ingest::validate_node`); the debug_assert below catches a
+        // regression there. No release-mode rejection — adversarial
+        // input that slips ingest validation is a separate concern.
         let path_to_hash: HashMap<&str, &str> = prepared
             .iter()
             .flat_map(|p| p.ingest.nodes.iter())
             .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
-            .collect();
+            .fold(HashMap::with_capacity(n_nodes_est), |mut m, (p, h)| {
+                let prev = m.insert(p, h);
+                debug_assert!(
+                    prev.is_none_or(|v| v == h),
+                    "batch path_to_hash conflict: {p} → {h} vs {prev:?} \
+                     (path↔hash validated at ingest::validate_node — regression there)"
+                );
+                m
+            });
         let resolve = |drv_path: &str| -> Option<Uuid> {
             path_to_hash
                 .get(drv_path)
