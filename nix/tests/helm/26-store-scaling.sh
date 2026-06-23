@@ -81,13 +81,15 @@ test "$reps" = "null" || {
   exit 1
 }
 
-# Floor 2; ceiling 173 = the PG-connection safety backstop (the
-# values.yaml formula comment carries the derivation against the
-# 32-ACU Aurora parameter), NOT a product cap — Karpenter binds first.
+# Floor 4 (raised from 2: KEDA scaler is blind ~2min post-deploy and a
+# cold-start burst parked PutPath on NarBudget at floor=2); ceiling
+# 173 = the PG-connection safety backstop (the values.yaml formula
+# comment carries the derivation against the 32-ACU Aurora parameter),
+# NOT a product cap — Karpenter binds first.
 minr=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.minReplicaCount' "$out")
 maxr=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.maxReplicaCount' "$out")
-test "$minr" = "2" && test "$maxr" = "173" || {
-  echo "FAIL: store ScaledObject floor/ceiling = $minr/$maxr, expected 2/173 (PG backstop: modeled 5,000 max_connections at min 1 / max 32 ACU; see values.yaml formula + infra/eks/rds.tf)" >&2
+test "$minr" = "4" && test "$maxr" = "173" || {
+  echo "FAIL: store ScaledObject floor/ceiling = $minr/$maxr, expected 4/173 (PG backstop: modeled 5,000 max_connections at min 1 / max 32 ACU; see values.yaml formula + infra/eks/rds.tf)" >&2
   exit 1
 }
 

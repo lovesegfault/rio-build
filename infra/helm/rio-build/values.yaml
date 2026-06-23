@@ -288,12 +288,15 @@ store:
   # templates/store-scaledobject.yaml.
   autoscaling:
     enabled: true
-    # Production floor — inherited from the retired ComponentScaler
-    # CR's min: 2. Carries the first ~1-4 min of a post-wipe
-    # substitution wave at reduced throughput until scale-out lands;
-    # raising it is a cost decision (store pods request 16 CPU / 8 Gi
-    # on EKS).
-    minReplicas: 2
+    # Production floor. Raised from 2 (the retired ComponentScaler CR's
+    # min) after a 370-channel cold-start burst parked PutPath on
+    # NarBudget for >300s: the prometheus scaler is blind ~2min
+    # post-deploy (`no route to host`) and KEDA's 2→7 scale-out lagged
+    # ~9min. 4 absorbs the cold-start window at reduced throughput
+    # until the leading triggers (substitution backlog, busy builders)
+    # are observable. Raising further is a cost decision (store pods
+    # request 16 CPU / 8 Gi on EKS).
+    minReplicas: 4
     # PG-connection SAFETY BACKSTOP, NOT a product cap (owner decision
     # 2026-06-02: store scale is Karpenter-bounded; the operative scale
     # knob is karpenter.nodePools[rio-store].limits.cpu below — D1:
