@@ -26,7 +26,7 @@ use super::{ActorError, DagActor, MergeDagRequest};
 /// nodes ≈ ~30 nix-fast-build-scale submissions).
 pub(super) const MERGE_PERSIST_BATCH_MAX: usize = 32;
 
-/// P2 flush trigger (iv)/(v): a queued merge persists at most this
+/// P2 flush trigger (iv): a queued merge persists at most this
 /// long after the FIRST push of its batch. The 50 ms initial value was
 /// sized for the 6 ms/merge projection; live (sdd/submitbuild-
 /// exhausted-diag.md § "ResourceExhausted persists on 1abed77ee")
@@ -311,13 +311,13 @@ impl DagActor {
     ///
     /// Flush triggers: (i) `len ≥ MERGE_PERSIST_BATCH_MAX` here;
     /// (iii) `handle_leader_lost` (drains with `NotLeader`); (iv) the
-    /// [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm; (v) the loop-top
-    /// `now ≥ merge_flush_deadline` check in `run_inner` — runs
-    /// unconditionally before select! so it is immune to which arm
-    /// fires (the only sub-BATCH_MAX drain path under a sustained rx
-    /// OR fast-lane flood, both biased before (iv)). NO `handle_tick`
-    /// head — Tick must never synchronously drain the merge buffer
-    /// (Tick 304ms→2.57s regression; `housekeeping.rs`).
+    /// [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm — biased BEFORE
+    /// the fast lane and `rx.recv()`, so a passed deadline is the
+    /// sub-BATCH_MAX drain path under a sustained rx OR fast-lane
+    /// flood (the loop-top trigger-(v) backstop is folded into this).
+    /// NO `handle_tick` head — Tick must never synchronously drain
+    /// the merge buffer (Tick 304ms→2.57s regression;
+    /// `housekeeping.rs`).
     pub(super) async fn handle_merge_dag_intake(
         &mut self,
         req: MergeDagRequest,
@@ -329,9 +329,9 @@ impl DagActor {
         // claims-floor re-check), same as the pre-P2 inline path.
         //
         // Arm the deadline on the empty→nonempty edge: `None` while
-        // idle, so trigger (iv)'s arm is `pending()` and trigger (v)
-        // is a no-op. One `tokio::time::Instant` field — same clock
-        // base for both read sites.
+        // idle, so trigger (iv)'s arm is guard-disabled. One
+        // `tokio::time::Instant` field — the run loop mirrors it into
+        // a long-lived pinned Sleep at loop-top.
         if self.pending_merges.is_empty() {
             self.merge_flush_deadline =
                 Some(tokio::time::Instant::now() + MERGE_PERSIST_FLUSH_DEADLINE);
@@ -347,8 +347,8 @@ impl DagActor {
     /// MergeDag-class work the cost-axis backpressure law gates on;
     /// the `MergeDag` command itself is now µs-class intake
     /// (`prices_into_drain` no longer folds it), so every flush
-    /// trigger — (i) eager here, (iv) the deadline arm, (v) the
-    /// loop-top check — routes through this wrapper.
+    /// trigger — (i) eager here, (iv) the deadline arm — routes
+    /// through this wrapper.
     /// `flush_pending_merges` is module-private so a new flush trigger
     /// in `mod.rs`/`housekeeping.rs` cannot reach for it directly and
     /// silently regress the cost-axis law on that path (the EWMA

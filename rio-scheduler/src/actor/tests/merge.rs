@@ -2830,7 +2830,7 @@ async fn merge_phase_4_never_awaits_store_rpc() -> TestResult {
 }
 
 // ===========================================================================
-// P2 flush trigger (v): inline post-dispatch deadline — starvation regression
+// P2 flush trigger (iv): deadline arm biased before rx — starvation regression
 // ===========================================================================
 
 /// Regression: with the Tick-head flush deleted (9fdd3947f) AND the
@@ -2838,9 +2838,11 @@ async fn merge_phase_4_never_awaits_store_rpc() -> TestResult {
 /// `pending_merges` batch had NO drain path while rx is continuously
 /// Ready. Five MergeDags + a sustained non-MergeDag flood: under the
 /// bug the deadline arm is starved and replies arrive only when the
-/// flood stops; under the inline post-dispatch check (trigger v) the
-/// flush fires after `MERGE_PERSIST_FLUSH_DEADLINE` (10ms in test)
-/// regardless of rx readiness.
+/// flood stops; with the deadline arm biased BEFORE rx (and BEFORE
+/// the fast lane) the flush fires after
+/// `MERGE_PERSIST_FLUSH_DEADLINE` (10ms in test) regardless of rx
+/// readiness — one mechanism encodes one law (the loop-top
+/// trigger-(v) backstop is folded into this).
 ///
 /// Structural property under test: replies arrive WHILE the flood is
 /// still running. The flood task does not stop until the replies have
@@ -2914,9 +2916,8 @@ async fn merge_flush_not_starved_under_sustained_rx() -> TestResult {
     assert!(
         res.is_ok(),
         "sub-BATCH_MAX merge batch starved under sustained rx pressure: \
-         biased select! orders rx before the deadline arm, and with the \
-         Tick-head flush deleted there is no other drain path — the \
-         inline post-dispatch check (trigger v) must fire"
+         the trigger-(iv) deadline arm is biased BEFORE rx, so a passed \
+         deadline must win over a continuously-Ready mailbox"
     );
     Ok(())
 }

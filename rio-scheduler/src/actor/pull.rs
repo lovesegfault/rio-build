@@ -1562,12 +1562,14 @@ impl DagActor {
     ///
     /// Flush triggers: (i) `len ≥ REPORT_OUTCOME_BATCH_MAX` here;
     /// (iii) `handle_leader_lost` (drains with `NotLeader`); (iv) the
-    /// [`REPORT_OUTCOME_FLUSH_DEADLINE`] select! arm; (v) the inline
-    /// post-dispatch `now ≥ pull_flush_deadline` check in `run_inner`
-    /// — a 250ms-bounded ack latency, decoupled from `tick_interval`.
-    /// NO `handle_tick` head — same Tick-must-never-block-on-a-
-    /// coalesce-buffer rationale as the merge side; trigger (v) is
-    /// the starvation backstop. The retired mailbox-empty signal (sh-002
+    /// [`REPORT_OUTCOME_FLUSH_DEADLINE`] select! arm — biased BEFORE
+    /// the fast lane and `rx.recv()` in `run_inner`, so a passed
+    /// deadline is the sub-BATCH_MAX drain path under sustained rx
+    /// OR fast-lane flood (the loop-top trigger-(v) backstop is
+    /// folded into this). A 250ms-bounded ack latency, decoupled from
+    /// `tick_interval`. NO `handle_tick` head — same
+    /// Tick-must-never-block-on-a-coalesce-buffer rationale as the
+    /// merge side. The retired mailbox-empty signal (sh-002
     /// trigger iv) interleaved with `ListMaterializationJobs` /
     /// `SubstituteProgress` and degraded N̄ to ~5.5 (sh-027 §3); the
     /// deadline arm coalesces up to `min(64, reports_per_250ms)` and
@@ -1589,13 +1591,13 @@ impl DagActor {
             return;
         }
         // Arm the deadline on the empty→nonempty edge: `None` while
-        // idle (trigger (iv)'s arm is `pending()`, trigger (v) is a
-        // no-op), so the FIRST report after any idle gap arms a fresh
-        // 250ms-out deadline — never an immediately-Ready stale tick
-        // that would flush at N=1 (the N̄ degradation this slot exists
-        // to fix). The `biased;` arm placement (AFTER `rx.recv()`) is
-        // the second half: it lets the queued burst dequeue before the
-        // deadline arm is even considered.
+        // idle (trigger (iv)'s arm guard is false), so the FIRST
+        // report after any idle gap arms a fresh 250ms-out deadline —
+        // never an immediately-Ready stale tick that would flush at
+        // N=1 (the N̄ degradation this slot exists to fix; the
+        // `None`-while-empty + arm-on-first-push is what makes
+        // before-rx placement safe — the Interval-era stale-tick
+        // hazard is gone).
         if self.pending_pull_outcomes.is_empty() {
             self.pull_flush_deadline =
                 Some(tokio::time::Instant::now() + REPORT_OUTCOME_FLUSH_DEADLINE);
@@ -1607,9 +1609,8 @@ impl DagActor {
             reply,
         });
         // Flush trigger (i): eager at the batch cap. Triggers
-        // (iii)/(iv)/(v) are handle_leader_lost / the
-        // REPORT_OUTCOME_FLUSH_DEADLINE select! arm / the inline
-        // post-dispatch deadline check in run_inner. NO handle_tick
+        // (iii)/(iv) are handle_leader_lost / the
+        // REPORT_OUTCOME_FLUSH_DEADLINE select! arm. NO handle_tick
         // head — see the doc-comment on this fn.
         if self.pending_pull_outcomes.len() >= REPORT_OUTCOME_BATCH_MAX {
             self.flush_pending_pull_outcomes().await;

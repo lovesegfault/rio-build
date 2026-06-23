@@ -750,12 +750,12 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
         })
         .await?;
     // P2: intake only queues; the reply.send (and orphan-cancel) fires
-    // from `flush_pending_merges`. The first barrier's loop-top
-    // trigger-(v) check (`now ≥ merge_flush_deadline`) enters the
-    // flush; the second barrier serializes behind the flush's PG
-    // awaits so logs_contain observes the orphan-cancel line.
-    // (Tick-head trigger ii is deleted; the deadline arm (iv) is racy
-    // against the test's sleep on current_thread.)
+    // from `flush_pending_merges`. After this sleep the trigger-(iv)
+    // deadline arm is Ready and biased before rx, so the actor
+    // flushes before serving the first barrier; the second barrier
+    // serializes behind the flush's PG awaits so logs_contain
+    // observes the orphan-cancel line. (Tick-head trigger ii is
+    // deleted.)
     tokio::time::sleep(crate::actor::merge::MERGE_PERSIST_FLUSH_DEADLINE).await;
     barrier(&handle).await;
     barrier(&handle).await;
@@ -789,18 +789,16 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
 /// 5th select!-starvation variant: a sustained admin fast-lane flood
 /// (with `rx` empty so the `consecutive_fast` quota keeps resetting)
 /// must NOT starve the merge-coalesce deadline. The biased select!
-/// orders the fast arm before the trigger-(iv) `coalesce_due` arm, and
-/// the fast arm `continue`s — so a flood that keeps the fast lane
-/// non-empty starves (iv) AND skips any post-select! check. Loop-top
-/// trigger-(v) is the chokepoint: it runs unconditionally before
-/// select! every iteration, so the next fast-arm iteration past
-/// `MERGE_PERSIST_FLUSH_DEADLINE` flushes regardless.
+/// orders the trigger-(iv) deadline arm BEFORE the fast arm, so once
+/// `MERGE_PERSIST_FLUSH_DEADLINE` passes the deadline arm wins over
+/// the always-Ready fast lane and flushes. RED at iter-14 base
+/// (deadline arm was after the fast arm; loop-top trigger-(v) was
+/// post-dispatch only): the 2s timeout fires with `sent` in the
+/// hundreds of thousands.
 ///
 /// multi_thread so the flood refills the fast lane CONCURRENTLY with
 /// the actor's serve loop — on current_thread the actor drains the
 /// lane in a sync burst, parks, and trigger-(iv) fires (bug masked).
-/// RED at iter-14 base (post-dispatch trigger-(v)): the 2s timeout
-/// fires with `sent` in the hundreds of thousands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_coalesce_deadline_survives_fast_lane_flood() -> TestResult {
     use std::sync::atomic::{AtomicUsize, Ordering};

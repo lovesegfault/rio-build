@@ -118,14 +118,12 @@ pub(crate) const ADMIN_FAST_LANE_CAPACITY: usize = 256;
 /// dashboard reads per second).
 pub(crate) const ADMIN_FAST_LANE_DRAIN_QUOTA: usize = 16;
 
-/// Select!-arm helper for the coalesce-buffer deadline (trigger iv):
-/// `Some(d)` → resolve at `d`; `None` → never (the buffer is empty,
-/// so the arm is dormant and the actor never wakes on it). One
-/// `Option<tokio::time::Instant>` per buffer is the whole deadline
-/// state — the prior Interval+armed_at pair encoded the same instant
-/// twice on two clock bases. `pub(crate)` so the cost-poller select!
-/// (`sla/cost.rs`) reuses the same `None ⇒ pending()` shape instead
-/// of open-coding `.unwrap()` under an `is_some()` guard.
+/// `Option<Instant>` select!-arm helper: `Some(d)` → resolve at `d`;
+/// `None` → never. The actor's run loop no longer uses this (it holds
+/// long-lived pinned `Sleep`s reset at loop-top — one timer-wheel
+/// entry per buffer instead of a fresh one per poll); kept for the
+/// cost-poller select! (`sla/cost.rs`) where the `None ⇒ pending()`
+/// shape is one-shot per retry and the per-poll cost is moot.
 pub(crate) async fn coalesce_due(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(d) => tokio::time::sleep_until(d).await,
@@ -688,23 +686,24 @@ pub struct DagActor {
     /// `clear()` — the gateway's retry loop re-submits to the new
     /// leader). Same `pending_pull_outcomes` discipline.
     pending_merges: Vec<merge::PendingMerge>,
-    /// P2 flush trigger (iv)+(v): `tokio::time` instant at which a
+    /// P2 flush trigger (iv): `tokio::time` instant at which a
     /// queued sub-BATCH_MAX merge batch flushes — `None` while
     /// `pending_merges` is empty; set to `now +
     /// `[`MERGE_PERSIST_FLUSH_DEADLINE`](merge::MERGE_PERSIST_FLUSH_DEADLINE)
     /// on the empty→nonempty push; cleared by flush and the
-    /// leader-lost drain. ONE field for ONE deadline, read at two
-    /// sites: trigger (iv) is the `sleep_until` select! arm (reachable
-    /// only when every higher-biased arm idles); trigger (v) is the
-    /// loop-top `now ≥ deadline` check, which runs unconditionally
-    /// before select! and so is immune to which arm fires — the only
-    /// sub-BATCH_MAX drain path under a sustained rx OR fast-lane
-    /// flood (both biased before (iv); the fast arm `continue`s).
-    /// `tokio::time::Instant`, not `std::`, so the two read sites
-    /// agree under `start_paused` (the std-vs-tokio split made batch
-    /// size non-deterministic across debug/CI runs).
+    /// leader-lost drain. ONE field for ONE deadline, read at ONE
+    /// site: the select! arm biased BEFORE the fast lane and
+    /// `rx.recv()`, so a passed deadline wins over a sustained rx OR
+    /// fast-lane flood (the loop-top trigger-(v) backstop is folded
+    /// into this — the prior after-rx placement that needed (v) was
+    /// guarding against a stale-Interval N=1 flush that the
+    /// `None`-while-empty + arm-on-first-push shape made
+    /// unreachable). `tokio::time::Instant`, not `std::`, so the
+    /// loop-top Sleep `reset()` and intake's `now()` agree under
+    /// `start_paused` (the std-vs-tokio split made batch size
+    /// non-deterministic across debug/CI runs).
     merge_flush_deadline: Option<tokio::time::Instant>,
-    /// sh-027 §3, flush trigger (iv)+(v): same one-`Option<Instant>`
+    /// sh-027 §3, flush trigger (iv): same one-`Option<Instant>`
     /// shape as [`Self::merge_flush_deadline`] — `None` while
     /// `pending_pull_outcomes` is empty; set to `now +
     /// `[`REPORT_OUTCOME_FLUSH_DEADLINE`](pull::REPORT_OUTCOME_FLUSH_DEADLINE)
@@ -1806,25 +1805,30 @@ impl DagActor {
         // when a main command is served, or vacuously when the
         // mailbox is empty (no main work to be fair to).
         let mut consecutive_fast: usize = 0;
+        // Coalesce flush trigger (iv): one long-lived `Sleep` per
+        // buffer, polled by `&mut` in the select! arm. Mirrors the
+        // `Option<Instant>` field at loop-top (intake arms it, flush
+        // clears it; this is the run-loop's view of that state) so the
+        // arm/clear sites in pull.rs/merge.rs stay field-based. The
+        // arm guard is `is_some()` — `None` ⇒ arm disabled, `Some(d)`
+        // ⇒ the loop-top sync resets the Sleep iff the deadline
+        // changed. ONE timer-wheel entry per buffer instead of a
+        // fresh `sleep_until` per select! poll (the prior
+        // `coalesce_due` shape, which the move-before-rx would
+        // otherwise put in the polled-every-iteration position).
+        let pull_due = tokio::time::sleep(std::time::Duration::MAX);
+        let merge_due = tokio::time::sleep(std::time::Duration::MAX);
+        tokio::pin!(pull_due, merge_due);
         loop {
-            // Coalesce flush trigger (v): the loop-top deadline backstop
-            // for BOTH buffers. Runs UNCONDITIONALLY before select! so it
-            // is immune to which arm fires (and to that arm's `continue`):
-            // the biased select! orders the fast lane AND `rx.recv()`
-            // before the trigger-(iv) `coalesce_due` arms, so a sustained
-            // fast-lane flood (with the `rx.is_empty()` quota reset
-            // below) OR a sustained-Ready rx starves (iv) — this check is
-            // the only sub-BATCH_MAX drain path under either flood. Same
-            // `tokio::time` clock as (iv) so the two read sites agree
-            // under `start_paused`. Placed BEFORE the quota reset so a
-            // 16-serve fast burst that crosses the deadline flushes on
-            // the 17th iteration regardless of the reset.
-            let now = tokio::time::Instant::now();
-            if self.pull_flush_deadline.is_some_and(|d| now >= d) {
-                self.flush_pending_pull_outcomes().await;
+            if let Some(d) = self.pull_flush_deadline
+                && pull_due.deadline() != d
+            {
+                pull_due.as_mut().reset(d);
             }
-            if self.merge_flush_deadline.is_some_and(|d| now >= d) {
-                self.flush_pending_merges_priced().await;
+            if let Some(d) = self.merge_flush_deadline
+                && merge_due.deadline() != d
+            {
+                merge_due.as_mut().reset(d);
             }
             if consecutive_fast >= ADMIN_FAST_LANE_DRAIN_QUOTA && rx.is_empty() {
                 consecutive_fast = 0;
@@ -1839,6 +1843,29 @@ impl DagActor {
                 _ = self.shutdown.cancelled() => {
                     info!("actor shutting down");
                     break;
+                }
+                // Coalesce flush trigger (iv): the SOLE deadline arm
+                // for BOTH buffers (sh-027 §3 pull / P2 merge). Placed
+                // BEFORE the fast lane and `rx.recv()` so the `biased;`
+                // order makes a passed deadline win over a sustained
+                // rx OR fast-lane flood — one mechanism encodes one
+                // law (the loop-top trigger-(v) `now ≥ d` backstop and
+                // (iv)'s after-rx placement encoded it twice; the
+                // "before-rx would flush at N=1" rationale was stale
+                // Interval-era reasoning: with `None`-while-empty +
+                // arm-on-first-push, the arm is dormant until 250ms
+                // after the FIRST push, so the burst still drains
+                // before this arm is Ready). The merge half routes
+                // through `_priced` so the cost-axis EWMA sees the
+                // flush (intake MergeDag turns are ~µs and
+                // `prices_into_drain` no longer folds them).
+                () = &mut pull_due, if self.pull_flush_deadline.is_some() => {
+                    self.flush_pending_pull_outcomes().await;
+                    continue;
+                }
+                () = &mut merge_due, if self.merge_flush_deadline.is_some() => {
+                    self.flush_pending_merges_priced().await;
+                    continue;
                 }
                 fast = self.admin_fast_rx.recv(),
                     if consecutive_fast < ADMIN_FAST_LANE_DRAIN_QUOTA =>
@@ -1856,28 +1883,6 @@ impl DagActor {
                     Some(c) => c,
                     None => break,
                 },
-                // Coalesce flush trigger (iv): the deadline backstop
-                // for BOTH buffers (sh-027 §3 pull / P2 merge). Placed
-                // AFTER `rx.recv()` so the `biased;` order drains
-                // every queued mailbox command (and so every
-                // ReportPullOutcome / MergeDag in a burst) BEFORE
-                // this arm is considered — placement BEFORE rx would
-                // flush at N=1 after any idle. `Some(d)` is set on
-                // the empty→nonempty push, so the first poll after
-                // idle is always 250ms out; `None` (buffer empty)
-                // means `coalesce_due` is `pending()` and the actor
-                // never wakes on this arm. The merge half routes
-                // through `_priced` so the cost-axis EWMA sees the
-                // flush (intake MergeDag turns are ~µs and
-                // `prices_into_drain` no longer folds them).
-                () = coalesce_due(self.pull_flush_deadline) => {
-                    self.flush_pending_pull_outcomes().await;
-                    continue;
-                }
-                () = coalesce_due(self.merge_flush_deadline) => {
-                    self.flush_pending_merges_priced().await;
-                    continue;
-                }
             };
             consecutive_fast = 0;
 
