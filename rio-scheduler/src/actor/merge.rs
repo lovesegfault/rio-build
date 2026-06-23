@@ -446,29 +446,26 @@ impl DagActor {
             // merge[N-1] would deliver INTERNAL: <path it never sent>
             // to the wrong gateway. Remaining replies get a
             // synthesised per-merge error of the same retry class
-            // (single-source `retry_class()`, not an inline matches!):
-            // Retryable → `NotLeader` (the gateway's retry guard keys
-            // on UNAVAILABLE/RESOURCE_EXHAUSTED); Terminal →
-            // `Database(Protocol(..))`. At N=1 the original is exact.
+            // (single-source `synthesize_same_class()` — its
+            // debug_assert is the structural tie-back to
+            // `retry_class()`): the gateway's retry guard keys on
+            // UNAVAILABLE/RESOURCE_EXHAUSTED. At N=1 the original is
+            // exact.
             let msg = e.to_string();
             // refusal-census: derives from retry_class() — not an
             // adjudication site (the source-of-truth match lives in
             // `ActorError::retry_class`).
-            let retryable = e.retry_class() == super::command::RetryClass::Retryable;
+            let class = e.retry_class();
             for p in prepared.into_iter().rev() {
                 self.cleanup_failed_merge(p.ingest.build_id, p.ingest.merge_result)
                     .await;
             }
-            let mut original = Some(e);
+            let mut replies = replies.into_iter();
+            if let Some(first) = replies.next() {
+                let _ = first.send(Err(e));
+            }
             for reply in replies {
-                let per = original.take().unwrap_or_else(|| {
-                    if retryable {
-                        ActorError::NotLeader
-                    } else {
-                        ActorError::Database(sqlx::Error::Protocol(msg.clone()))
-                    }
-                });
-                let _ = reply.send(Err(per));
+                let _ = reply.send(Err(ActorError::synthesize_for_class(class, msg.clone())));
             }
             return;
         }
@@ -626,7 +623,8 @@ impl DagActor {
         // `self.dag.node().db_id` for nodes in THIS batch — that
         // field isn't set until after commit() below.
         let n_edges_est: usize = prepared.iter().map(|p| p.edges.len()).sum();
-        let mut all_links: Vec<(Uuid, Uuid)> = Vec::with_capacity(n_nodes_est);
+        let mut link_builds: Vec<Uuid> = Vec::with_capacity(n_nodes_est);
+        let mut link_drvs: Vec<Uuid> = Vec::with_capacity(n_nodes_est);
         let mut all_edges: Vec<(Uuid, Uuid)> = Vec::with_capacity(n_edges_est);
         let mut build_ids: Vec<Uuid> = Vec::with_capacity(prepared.len());
         let mut all_wanted: Vec<crate::db::wanted::WantedRow<'_>> = Vec::with_capacity(n_nodes_est);
@@ -646,7 +644,8 @@ impl DagActor {
             };
             for node in &p.ingest.nodes {
                 if let Some((id, _)) = id_map.get(node.drv_hash.as_str()) {
-                    all_links.push((p.ingest.build_id, *id));
+                    link_builds.push(p.ingest.build_id);
+                    link_drvs.push(*id);
                     all_wanted.push(crate::db::wanted::WantedRow {
                         build_id: p.ingest.build_id,
                         derivation_id: *id,
@@ -665,11 +664,17 @@ impl DagActor {
                 all_edges.push((parent, child));
             }
         }
-        crate::db::SchedulerDb::batch_insert_build_derivations_multi(tx.conn(), &all_links).await?;
+        crate::db::SchedulerDb::batch_insert_build_derivations_multi(
+            tx.conn(),
+            &link_builds,
+            &link_drvs,
+        )
+        .await?;
         crate::db::SchedulerDb::batch_insert_edges(tx.conn(), &all_edges).await?;
         crate::db::SchedulerDb::activate_builds_tx(tx.conn(), &build_ids).await?;
         crate::db::SchedulerDb::record_wanted_in_tx(tx.conn(), &all_wanted).await?;
-        drop(all_links);
+        drop(link_builds);
+        drop(link_drvs);
         drop(all_edges);
         drop(all_wanted);
 
@@ -2645,29 +2650,17 @@ impl DagActor {
         // by target status, ≤3 fenced round-trips for any |reset_set|.
         // The singular `update_derivation_status` passed
         // `assigned_executor = None`; the batch helper hard-NULLs
-        // `assigned_builder_id`, so identical row effect. Fence/err
-        // posture matches the per-node form: log-and-continue (build
-        // is Active+committed; DB sync catches up on the next status
-        // update).
+        // `assigned_builder_id`, so identical row effect. Same
+        // canonical helper as :1957/:1962 — its Err arm outbox-latches
+        // for housekeeping retry (mod.rs:386: "every persist_status
+        // batch status latches on failure"); the prior hand-rolled
+        // copy only error!-logged. Log-and-continue posture (build is
+        // Active+committed) is the helper's own posture.
         for (target, hashes) in to_persist {
             #[cfg(test)]
             PHASE_6C_PG_AWAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
-            match self
-                .db
-                .update_derivation_status_batch(&refs, target, self.serving_generation())
-                .await
-            {
-                Ok(crate::db::FencedOutcome::Fenced) => {
-                    self.note_fenced_evidence_write("stale-completed reset persist");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    error!(error = %e, ?target, count = refs.len(),
-                           "failed to persist stale-completed reset batch \
-                            (build is Active; continuing)");
-                }
-            }
+            self.persist_status_batch(&refs, target).await;
         }
 
         if !to_spawn.is_empty() {

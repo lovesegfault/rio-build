@@ -663,9 +663,9 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // and won't respond on stream-close: fire `idle_tx` (bounded_open's
     // abort) and synthesize the typed DeadlineExceeded the surfacing fn
     // expects (bug_118). One abort+synthesize tail; the two idle paths
-    // differ only in the message — both feed `surface_put_path_failure`
-    // and `transient_retry_after` keys on Code::DeadlineExceeded for
-    // retry classification, so they MUST share one synthesis site.
+    // differ only in the message — both feed the surfacing fn and
+    // `transient_retry_after` keys on Code::DeadlineExceeded for retry
+    // classification, so they MUST share one synthesis site.
     let mut rpc_join = if matches!(pump, Pump::Idle) {
         None
     } else {

@@ -1201,6 +1201,26 @@ impl ActorError {
             | Self::PermissionDenied { .. } => RetryClass::Terminal,
         }
     }
+
+    /// A fresh `ActorError` of the given [`RetryClass`], carrying
+    /// `msg`. Single-sources the class-preservation rule for the batch
+    /// error fan-out (`flush_pending_merges`): replies[1..N] get a
+    /// synthesised per-merge error whose class — and therefore gRPC
+    /// code, per `retry_class_code_consistency` — matches replies[0]'s
+    /// original. Hard-coding `NotLeader` / `Database(Protocol)` as
+    /// RetryClass representatives at the fan-out site would silently
+    /// desync if either is ever reclassified; the `debug_assert_eq!`
+    /// here is the structural tie-back. Exhaustive match: a third
+    /// RetryClass variant is a compile error here, not a silent
+    /// boolean collapse to Terminal.
+    pub(crate) fn synthesize_for_class(class: RetryClass, msg: String) -> Self {
+        let out = match class {
+            RetryClass::Retryable => Self::NotLeader,
+            RetryClass::Terminal => Self::Database(sqlx::Error::Protocol(msg)),
+        };
+        debug_assert_eq!(class, out.retry_class());
+        out
+    }
 }
 
 /// Read-only view of the actor's backpressure state.

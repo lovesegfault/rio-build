@@ -276,24 +276,27 @@ impl SchedulerDb {
         build_id: Uuid,
         derivation_ids: &[Uuid],
     ) -> Result<(), sqlx::Error> {
-        let pairs: Vec<(Uuid, Uuid)> = derivation_ids.iter().map(|&d| (build_id, d)).collect();
-        Self::batch_insert_build_derivations_multi(tx, &pairs).await
+        let builds: Vec<Uuid> = vec![build_id; derivation_ids.len()];
+        Self::batch_insert_build_derivations_multi(tx, &builds, derivation_ids).await
     }
 
     /// Batch-insert build_derivations links — `(build_id,
     /// derivation_id)` pairs from N merges in one round-trip (P2
     /// phase-5 coalesce). Two parallel-array binds; same `ON CONFLICT
     /// DO NOTHING` so a shared derivation linked by two builds in one
-    /// batch is benign.
+    /// batch is benign. Caller passes the parallel arrays directly
+    /// (`persist_merges` already iterates per-node and pushes both in
+    /// one pass) — no zip/unzip intermediate inside the held fenced
+    /// tx the coalesce shortens.
     pub(crate) async fn batch_insert_build_derivations_multi(
         tx: &mut PgConnection,
-        pairs: &[(Uuid, Uuid)],
+        builds: &[Uuid],
+        drvs: &[Uuid],
     ) -> Result<(), sqlx::Error> {
-        if pairs.is_empty() {
+        debug_assert_eq!(builds.len(), drvs.len());
+        if builds.is_empty() {
             return Ok(());
         }
-        let builds: Vec<Uuid> = pairs.iter().map(|(b, _)| *b).collect();
-        let drvs: Vec<Uuid> = pairs.iter().map(|(_, d)| *d).collect();
         sqlx::query(
             r#"
             INSERT INTO build_derivations (build_id, derivation_id)
@@ -301,8 +304,8 @@ impl SchedulerDb {
             ON CONFLICT DO NOTHING
             "#,
         )
-        .bind(&builds)
-        .bind(&drvs)
+        .bind(builds)
+        .bind(drvs)
         .execute(&mut *tx)
         .await?;
         Ok(())

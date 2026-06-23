@@ -228,9 +228,8 @@ pub fn describe_metrics() {
         "rio_scheduler_merge_phase_seconds",
         "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f, \
          plus the P2 coalesce labels 0to4-prepare-batched / \
-         5-persist-and-activate / 5-persist-and-activate-batched — the \
-         single-merge handle_merge_dag and the flush_pending_merges batch \
-         persist respectively). Decomposes \
+         5-persist-and-activate-batched — the flush_pending_merges batch \
+         persist; N=1 and N>1 share one path). Decomposes \
          rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s \
          is the I-139 signal — N sequential PG awaits in the actor."
     );
