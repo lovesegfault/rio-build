@@ -502,28 +502,41 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // bug_118: the synthesized timeout below is a typed
     // `Status::deadline_exceeded` so it classifies, not launders through
     // anyhow into "unknown".
-    // streaming-open-ban: the open routes through `bounded_open` as the
-    // structural witness — abort/bound are `pending()`/`MAX` because the
-    // per-chunk idle bound (pump + response-wait) IS the enforcement and
-    // `rpc.abort()`s this task on expiry; a finite bound here would
-    // re-introduce the I-211 whole-stream deadline.
+    // streaming-open-ban: the open routes through `bounded_open` and the
+    // per-chunk idle detector IS the abort future — the pump /
+    // response-wait fires `idle_tx` on expiry, so the Aborted arm is the
+    // live bounding mechanism (not a `pending()` witness a future caller
+    // could copy as the sanctioned way to satisfy the lint without
+    // bounding anything). `bound` stays `MAX`: a finite value here is a
+    // whole-stream deadline, which would re-introduce I-211.
+    let (idle_tx, idle_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut idle_tx = Some(idle_tx);
     let mut rpc: tokio::task::JoinHandle<
         Result<tonic::Response<types::PutPathResponse>, tonic::Status>,
     > = tokio::spawn(async move {
         match rio_common::transport::bounded_open(
-            std::future::pending(),
+            async move {
+                let _ = idle_rx.await;
+            },
             std::time::Duration::MAX,
             client.put_path(req),
         )
         .await
         {
             rio_common::transport::OpenOutcome::Opened(r) => r,
-            // Unreachable (pending()/MAX): the task is `rpc.abort()`ed on
-            // idle, dropping this future before either arm can resolve.
-            rio_common::transport::OpenOutcome::Aborted
-            | rio_common::transport::OpenOutcome::TimedOut { .. } => Err(
-                tonic::Status::deadline_exceeded("PutPath bounded_open witness arm"),
-            ),
+            // Per-chunk idle bound fired (pump or response-wait sent
+            // `idle_tx`). The contextual message is synthesized at the
+            // outer site that fired it; this generic Err is observed
+            // only if the outer site drops `idle_tx` without
+            // synthesizing (it does not).
+            rio_common::transport::OpenOutcome::Aborted => Err(tonic::Status::deadline_exceeded(
+                "PutPath per-chunk idle bound",
+            )),
+            rio_common::transport::OpenOutcome::TimedOut { .. } => {
+                unreachable!(
+                    "bound is Duration::MAX (a finite bound is the I-211 whole-stream deadline)"
+                )
+            }
         }
     });
 
@@ -635,8 +648,8 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // and won't respond on stream-close: abort the task and synthesize
     // the typed DeadlineExceeded the surfacing fn expects (bug_118).
     let rpc_join = if pump_idle {
-        rpc.abort();
-        let _ = rpc.await;
+        let _ = idle_tx.take().expect("idle_tx is single-use").send(());
+        let _ = (&mut rpc).await;
         Ok(Err(tonic::Status::deadline_exceeded(format!(
             "PutPath stream idle for {GRPC_STREAM_TIMEOUT:?} (store not pulling chunks)"
         ))))
@@ -644,8 +657,8 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
         match tokio::time::timeout(GRPC_STREAM_TIMEOUT, &mut rpc).await {
             Ok(join) => join,
             Err(_elapsed) => {
-                rpc.abort();
-                let _ = rpc.await;
+                let _ = idle_tx.take().expect("idle_tx is single-use").send(());
+                let _ = (&mut rpc).await;
                 Ok(Err(tonic::Status::deadline_exceeded(format!(
                     "PutPath response idle for {GRPC_STREAM_TIMEOUT:?} (store parked)"
                 ))))
