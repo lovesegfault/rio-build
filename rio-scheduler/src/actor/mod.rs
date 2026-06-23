@@ -2134,7 +2134,7 @@ impl DagActor {
                     // the periodic dispatch sweep blocks the queue at
                     // the same scale as a merge flush and has no
                     // `_priced` wrapper. The cost-axis input model is
-                    // Tick + merge-flush ONLY (see `note_turn_cost`):
+                    // Tick + merge-flush only (see `note_turn_cost`):
                     // the estimator tracks the work-class it gates
                     // (MergeDag drain). `flush_pending_pull_outcomes`
                     // is the same multi-RTT shape but DELIBERATELY does

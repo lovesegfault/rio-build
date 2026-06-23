@@ -73,8 +73,7 @@ impl ConnStage {
 /// well-formed id the peer puts on the wire). Replaces the prior
 /// `accepted_channels` / `over_bound_channels` / `sessions` /
 /// `channel_writers` parallel maps — every per-channel datum lives on
-/// the variant, so there is no "key set X is exactly the Y subset of
-/// `channels`" invariant to hand-assert.
+/// the variant, so no parallel-map key-set invariant is hand-asserted.
 pub(super) enum ChannelDisposition {
     /// Accepted in `channel_open_session`, not yet exec'd. Counted in
     /// `open_channels`. Carries the channel's window-aware write half
