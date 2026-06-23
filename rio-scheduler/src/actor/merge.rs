@@ -420,7 +420,7 @@ impl DagActor {
             // overwhelmingly merge[0]'s data — sending it to
             // merge[N-1] would deliver INTERNAL: <path it never sent>
             // to the wrong gateway. Remaining replies get a
-            // synthesised per-merge error of the SAME retry class
+            // synthesised per-merge error of the same retry class
             // (single-source `retry_class()`, not an inline matches!):
             // Retryable → `NotLeader` (the gateway's retry guard keys
             // on UNAVAILABLE/RESOURCE_EXHAUSTED); Terminal →
@@ -666,7 +666,7 @@ impl DagActor {
         // children are already durably produced+vouched), not an
         // authorization boundary. Batch evidence ⊇ per-merge evidence
         // ⇒ strictly fewer redundant Pruned jobs; settlement reads
-        // the SAME post-commit durable state either way (every batch
+        // the same post-commit durable state either way (every batch
         // member commits in this one tx). A "passes the gate" outcome
         // means "no job created" — there is no resource granted.
         // Pinned by `vouch_gate_is_batch_scoped`.
@@ -697,7 +697,7 @@ impl DagActor {
         // Cross-merge AS-5 dedup: pre-P2 merge[k+1]'s phase-5 ran AFTER
         // merge[k]'s phase-6d cleared the in-mem status, so the
         // `status() ∈ {Poisoned,DepFailed,Failed}` gate below was an
-        // implicit dedup. Batched phase-5 reads the SAME pre-phase-6
+        // implicit dedup. Batched phase-5 reads the same pre-phase-6
         // state for every merge — without an explicit dedup, two
         // overlapping reprobe lanes would push two `poison_cleared`
         // ledger rows (each with a fresh attempt_id; the ON CONFLICT
