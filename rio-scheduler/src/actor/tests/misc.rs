@@ -750,8 +750,10 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
         })
         .await?;
     // P2: intake only queues; the reply.send (and orphan-cancel) fires
-    // from `flush_pending_merges` — Tick is flush trigger (ii).
-    handle.send_unchecked(ActorCommand::Tick).await?;
+    // from `flush_pending_merges`. Trigger (v) — the inline
+    // post-dispatch `armed_at.elapsed() ≥ 10ms` check — fires after
+    // the sleep + any subsequent command; barrier supplies one.
+    tokio::time::sleep(crate::actor::merge::MERGE_PERSIST_FLUSH_DEADLINE).await;
     barrier(&handle).await;
 
     // Actor should log the orphan cancellation.

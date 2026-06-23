@@ -146,52 +146,27 @@ impl DagActor {
     #[instrument(skip(self, req), fields(build_id = %req.build_id))]
     // Production routes ActorCommand::MergeDag → handle_merge_dag_intake
     // → flush_pending_merges; this is the synchronous N=1 entry the
-    // direct &mut DagActor test callers use (mbt_* / sla_contract).
-    // Both paths share `persist_merges`.
+    // direct &mut DagActor test callers use (mbt_* / sla_contract). It
+    // is NOT a re-implementation: it pushes one PendingMerge and calls
+    // `flush_pending_merges`, so the mbt_*/sla_contract surface
+    // exercises the production orchestration (the only difference vs
+    // intake is no eager-flush trigger / no deadline arm — those need
+    // the run loop). Any post-persist step added between
+    // persist_merges-Ok and finish_merge_dag lands once, in flush.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) async fn handle_merge_dag(
         &mut self,
         req: MergeDagRequest,
     ) -> Result<super::BuildEventReceivers, ActorError> {
-        // I-139: per-phase timing. handle_merge_dag was >300s for a
-        // 153k-node / 837k-edge DAG with only ~22s in the batched DB
-        // phase; the rest had no logging. Each phase now self-reports
-        // so future regressions localize immediately. The two extracted
-        // phases keep their own per-step `phase!` macros; this scope
-        // tracks the inter-phase boundaries + total.
-        let t_total = Instant::now();
-        // rio_scheduler_builds_total is incremented at terminal transition
-        // (complete_build/transition_build_to_failed/handle_cancel_build)
-        // with an outcome label, so SLI queries can compute success rate.
-
-        // Phases 0–4: validate, merge into DAG, cache-check. All
-        // early-return error paths through phase 4 (cycle, breaker
-        // open, insert_build PG error) live here; on Err in-mem state
-        // is already rolled back inside.
-        let mut p = self.prepare_merge_persist(req).await?;
-
-        // Phase 5: PG persist + → Active. The N=1 form of the
-        // generalized batch persist — same code path
-        // `flush_pending_merges` runs for N>1, so single-merge tests
-        // exercise the production burst path. On Err the fenced tx
-        // aborted with no in-mem mutation; rollback is the caller's.
-        let t_phase = Instant::now();
-        if let Err(e) = self.persist_merges(std::slice::from_mut(&mut p)).await {
-            error!(build_id = %p.ingest.build_id, error = %e,
-                   "merge DB persistence failed; rolling back");
-            self.cleanup_failed_merge(p.ingest.build_id, p.ingest.merge_result)
-                .await;
-            return Err(e);
-        }
-        metrics::histogram!("rio_scheduler_merge_phase_seconds",
-                            "phase" => "5-persist-and-activate")
-        .record(t_phase.elapsed().as_secs_f64());
-        // Post-commit: feed the in-memory job view from the merge
-        // transaction's created jobs (never inside the tx — the view is
-        // a droppable cache; a rolled-back merge must leave no entry).
-        self.note_created_materialization_jobs(&p.ingest.created_jobs)
-            .await;
-        Ok(self.finish_merge_dag(p.ingest, t_total).await)
+        debug_assert!(
+            self.pending_merges.is_empty(),
+            "handle_merge_dag is the direct-&mut test entry; a non-empty \
+             pending_merges here means a test mixed it with intake"
+        );
+        let (tx, rx) = oneshot::channel();
+        self.pending_merges.push(PendingMerge { req, reply: tx });
+        self.flush_pending_merges().await;
+        rx.await.map_err(|_| ActorError::ChannelSend)?
     }
 
     /// Phases 6+ of merge: post-Active reconciliation, count update,
@@ -200,11 +175,8 @@ impl DagActor {
     /// every DB write here is log-and-continue. Extracted from
     /// `handle_merge_dag` so the P2 batched-flush path can run phase 5
     /// for N merges in one transaction, then this per-merge.
-    async fn finish_merge_dag(
-        &mut self,
-        ingest: MergeIngest,
-        t_total: Instant,
-    ) -> super::BuildEventReceivers {
+    async fn finish_merge_dag(&mut self, ingest: MergeIngest) -> super::BuildEventReceivers {
+        let t_phase6 = Instant::now();
         let build_id = ingest.build_id;
         let total_derivations = ingest.nodes.len() as u32;
 
@@ -315,11 +287,11 @@ impl DagActor {
             self.sweep_ready_cached().await;
         }
         debug!(
-            elapsed = ?t_total.elapsed(),
+            elapsed = ?t_phase6.elapsed(),
             nodes = ingest.nodes.len(),
             edges = ingest.edges_len,
             newly_inserted = ingest.merge_result.newly_inserted.len(),
-            "handle_merge_dag total"
+            "finish_merge_dag (phase 6+)"
         );
 
         ingest.event_rx
@@ -483,8 +455,7 @@ impl DagActor {
             let build_id = p.ingest.build_id;
             self.note_created_materialization_jobs(&p.ingest.created_jobs)
                 .await;
-            let t = Instant::now();
-            let rx = self.finish_merge_dag(p.ingest, t).await;
+            let rx = self.finish_merge_dag(p.ingest).await;
             self.send_merge_reply(build_id, reply, Ok(rx)).await;
         }
     }
@@ -680,6 +651,20 @@ impl DagActor {
         // batch: P2 sums up to 32 merges' pruned-parent sets into one
         // held fenced tx, so the pre-P2 per-node serial call would be
         // hundreds of round-trips here.
+        //
+        // SCOPE WIDENING (P2, intentional): the gate now runs AFTER
+        // the whole batch's links/edges/activate are written, so
+        // merge[i]'s pruned-parent verdict sees merge[j]'s evidence.
+        // This is NOT per-merge semantically equivalent to the serial
+        // path — but it is benign by construction: the vouch-gate is a
+        // job-REDUNDANCY check (skip a Pruned-origin job whose
+        // children are already durably produced+vouched), not an
+        // authorization boundary. Batch evidence ⊇ per-merge evidence
+        // ⇒ strictly fewer redundant Pruned jobs; settlement reads
+        // the SAME post-commit durable state either way (every batch
+        // member commits in this one tx). A "passes the gate" outcome
+        // means "no job created" — there is no resource granted.
+        // Pinned by `vouch_gate_is_batch_scoped`.
         let pruned_ids: Vec<Uuid> = prepared
             .iter()
             .flat_map(|p| {
