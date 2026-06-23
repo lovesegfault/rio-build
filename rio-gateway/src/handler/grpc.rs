@@ -502,9 +502,30 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // bug_118: the synthesized timeout below is a typed
     // `Status::deadline_exceeded` so it classifies, not launders through
     // anyhow into "unknown".
+    // streaming-open-ban: the open routes through `bounded_open` as the
+    // structural witness — abort/bound are `pending()`/`MAX` because the
+    // per-chunk idle bound (pump + response-wait) IS the enforcement and
+    // `rpc.abort()`s this task on expiry; a finite bound here would
+    // re-introduce the I-211 whole-stream deadline.
     let mut rpc: tokio::task::JoinHandle<
         Result<tonic::Response<types::PutPathResponse>, tonic::Status>,
-    > = tokio::spawn(async move { client.put_path(req).await });
+    > = tokio::spawn(async move {
+        match rio_common::transport::bounded_open(
+            std::future::pending(),
+            std::time::Duration::MAX,
+            client.put_path(req),
+        )
+        .await
+        {
+            rio_common::transport::OpenOutcome::Opened(r) => r,
+            // Unreachable (pending()/MAX): the task is `rpc.abort()`ed on
+            // idle, dropping this future before either arm can resolve.
+            rio_common::transport::OpenOutcome::Aborted
+            | rio_common::transport::OpenOutcome::TimedOut { .. } => Err(
+                tonic::Status::deadline_exceeded("PutPath bounded_open witness arm"),
+            ),
+        }
+    });
 
     // Read exactly nar_size bytes in NAR_CHUNK_SIZE chunks, forward each.
     // Backpressure: tx.send blocks when rpc isn't pulling. On a short read
