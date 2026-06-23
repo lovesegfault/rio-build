@@ -755,8 +755,14 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
     // flushes before serving the first barrier; the second barrier
     // serializes behind the flush's PG awaits so logs_contain
     // observes the orphan-cancel line. (Tick-head trigger ii is
-    // deleted.)
-    tokio::time::sleep(crate::actor::merge::MERGE_PERSIST_FLUSH_DEADLINE).await;
+    // deleted.) ×2 DEADLINE: the actor arms its deadline at
+    // `intake_time + DEADLINE`, which is a few hundred µs AFTER this
+    // task's `send.await` returned — sleeping exactly DEADLINE here
+    // can wake before the actor's Sleep is Ready, and the two
+    // barriers then beat the flush through rx (the prior loop-top
+    // `now ≥ d` check absorbed that ε; the Sleep arm needs the
+    // timer to have fired).
+    tokio::time::sleep(crate::actor::merge::MERGE_PERSIST_FLUSH_DEADLINE * 2).await;
     barrier(&handle).await;
     barrier(&handle).await;
 
