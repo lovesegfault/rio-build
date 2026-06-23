@@ -2012,8 +2012,9 @@ pub const SUBMIT_RETRIES: u32 = 4;
 /// Sized for the deposed-believer fence window (≤ ~5s): 4 retries at
 /// 0.5/1/2/4s = 7.5s. The 89s sustained cost-axis backpressure hold
 /// that motivated 72cf3a359's 8-retry/~79.5s widen is structurally
-/// eliminated by `prices_into_drain` (af4785ef0) + the P2 phase-5
-/// coalesce — the scheduler's own doc claims the gate "reverts to a
+/// eliminated by the Tick/flush-only EWMA feed (af4785ef0) + the P2
+/// phase-5 coalesce — the scheduler's own doc claims the gate "reverts
+/// to a
 /// never-engages safety valve". Per the structural>retry>widen
 /// hierarchy, keeping the widen would mask any future regression in
 /// that law (a 60s hold would now succeed silently instead of

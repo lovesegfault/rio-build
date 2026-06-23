@@ -347,10 +347,10 @@ impl DagActor {
     /// [`Self::flush_pending_merges`] + feed the flush's wall-clock
     /// cost into [`Self::note_turn_cost`]. The flush IS the
     /// MergeDag-class work the cost-axis backpressure law gates on;
-    /// the `MergeDag` command itself is now µs-class intake
-    /// (`prices_into_drain` no longer folds it), so every flush
-    /// trigger — (i) eager here, (iv) the deadline arm — routes
-    /// through this wrapper.
+    /// the `MergeDag` command itself is now µs-class intake (its arm
+    /// does not feed `note_turn_cost`), so every flush trigger — (i)
+    /// eager here, (iv) the deadline arm — routes through this
+    /// wrapper.
     /// `flush_pending_merges` is module-private so a new flush trigger
     /// in `mod.rs`/`housekeeping.rs` cannot reach for it directly and
     /// silently regress the cost-axis law on that path (the EWMA

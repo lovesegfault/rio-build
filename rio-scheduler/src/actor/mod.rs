@@ -133,8 +133,8 @@ pub(crate) async fn coalesce_due(deadline: Option<tokio::time::Instant>) {
 
 /// EWMA weight for the per-turn cost estimate feeding the cost-axis
 /// backpressure law (round-9 B6, re-derived sh-024 §S2). The EWMA is
-/// FED by [`ActorCommand::prices_into_drain`] variants (Tick) and
-/// every merge flush ([`DagActor::flush_pending_merges_priced`]),
+/// FED by the `Tick` arm and every merge flush
+/// ([`DagActor::flush_pending_merges_priced`]),
 /// and EVALUATED per main-mailbox dequeue. At the
 /// prior 0.3 a
 /// single 1.3 s spike (ewma 0.39, drain 44.5 s) activated and decayed
@@ -1044,8 +1044,7 @@ pub struct DagActor {
     /// cancellation token, not channel closure).
     admin_fast_tx: mpsc::Sender<FastAdmin>,
     /// Per-turn work-cost EWMA in seconds (round-9 B6) — fed by
-    /// [`DagActor::note_turn_cost`] after every
-    /// [`ActorCommand::prices_into_drain`] command (Tick) and every
+    /// [`DagActor::note_turn_cost`] from the `Tick` arm and every
     /// merge flush ([`DagActor::flush_pending_merges_priced`]);
     /// consumed by `update_backpressure`'s cost axis (projected drain
     /// = depth × this). Plain `f64`: only the single-threaded actor
@@ -1857,8 +1856,8 @@ impl DagActor {
                 // after the FIRST push, so the burst still drains
                 // before this arm is Ready). The merge half routes
                 // through `_priced` so the cost-axis EWMA sees the
-                // flush (intake MergeDag turns are ~µs and
-                // `prices_into_drain` no longer folds them).
+                // flush (intake MergeDag turns are ~µs and do not
+                // feed `note_turn_cost`).
                 () = &mut pull_due, if self.pull_flush_deadline.is_some() => {
                     self.flush_pending_pull_outcomes().await;
                     continue;
@@ -1905,7 +1904,6 @@ impl DagActor {
             // "actor wedged" report self-localizes from `kubectl logs`
             // instead of needing a debugger attach.
             let cmd_name = cmd.name();
-            let prices_into_drain = cmd.prices_into_drain();
             let t_cmd = Instant::now();
 
             match cmd {
@@ -1917,8 +1915,8 @@ impl DagActor {
                     // trigger routes through
                     // `flush_pending_merges_priced` so the cost-axis
                     // EWMA sees real merge cost regardless of which
-                    // trigger fired (`prices_into_drain` no longer
-                    // folds this variant — flush-driven).
+                    // trigger fired (this arm does not feed
+                    // `note_turn_cost` — flush-driven).
                     self.handle_merge_dag_intake(req, reply).await;
                 }
                 ActorCommand::ProcessCompletion {
@@ -2123,6 +2121,16 @@ impl DagActor {
                 }
                 ActorCommand::Tick => {
                     self.handle_tick().await;
+                    // B6: feed the per-turn cost EWMA — the NEXT
+                    // iteration's update_backpressure prices the queue
+                    // with it. Tick is the only variant-routed feed:
+                    // the periodic dispatch sweep blocks the queue at
+                    // the same scale as a merge flush and has no
+                    // `_priced` wrapper. Every other 100ms+ handler
+                    // routes through one (the cost-axis input model is
+                    // flush-driven, not variant-driven — see
+                    // `note_turn_cost`).
+                    self.note_turn_cost(t_cmd.elapsed());
                 }
                 ActorCommand::QueryBuildStatus {
                     build_id,
@@ -2188,16 +2196,6 @@ impl DagActor {
             }
 
             let cmd_elapsed = t_cmd.elapsed();
-            // B6: feed the per-turn cost EWMA — the NEXT iteration's
-            // update_backpressure prices the queue with it (the
-            // engagement window is the first dequeue after a stall,
-            // which is exactly when the built-up queue needs shedding).
-            // Only Tick folds variant-routed; merge-flush cost feeds
-            // via `flush_pending_merges_priced` — see
-            // `ActorCommand::prices_into_drain`.
-            if prices_into_drain {
-                self.note_turn_cost(cmd_elapsed);
-            }
             metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => cmd_name)
                 .record(cmd_elapsed.as_secs_f64());
             if cmd_elapsed >= std::time::Duration::from_secs(1) {
@@ -2219,8 +2217,7 @@ impl DagActor {
 
     /// Record one Tick / merge-flush cost into the per-turn EWMA
     /// (round-9 B6) — the producer side of the cost-axis backpressure
-    /// law. Called by `run_inner` only for the variants
-    /// [`ActorCommand::prices_into_drain`] returns true for, and by
+    /// law. Called by `run_inner`'s `Tick` arm and by
     /// [`DagActor::flush_pending_merges_priced`] at every flush
     /// trigger (the flush-driven feed; post-P2 `MergeDag` intake is
     /// µs-class and folding it decayed any prior flush spike by
@@ -2344,7 +2341,7 @@ impl DagActor {
         self.handle_admin(fa.query);
         let elapsed = t.elapsed();
         // Fast-lane admin handlers are NOT folded into the cost-axis
-        // EWMA: none are MergeDag/Tick (`prices_into_drain`). Their
+        // EWMA: none are MergeDag/Tick. Their
         // cost still surfaces in `actor_cmd_seconds{cmd="Admin"}` and
         // the 1s-WARN below.
         metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => "Admin")

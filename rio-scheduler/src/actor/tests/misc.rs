@@ -942,8 +942,8 @@ async fn test_backpressure_hysteresis() -> TestResult {
 ///
 /// Structural drive (no wall clock): the cost observations are fed
 /// directly to `note_turn_cost` — exactly what `run_inner` records
-/// after each `prices_into_drain()` command — and the law is asserted
-/// on the flag.
+/// from the `Tick` arm and `flush_pending_merges_priced` — and the law
+/// is asserted on the flag.
 // r[verify sched.admission.work-per-turn]
 // r[verify sched.backpressure.hysteresis+3]
 #[tokio::test]
@@ -1025,7 +1025,7 @@ impl RisingEdges {
 /// fold-everything topology, each 1.3 s spike (ewma = 0.39, drain =
 /// 44.5 s ≥ 30) activated and the inter-spike µs/ms-class commands
 /// decayed it below LOW 80 µs later — sh-024 saw `queue_backpressure`
-/// +24 in 120 s. With the `prices_into_drain` gate the inter-spike
+/// +24 in 120 s. With the Tick/flush-only feed the inter-spike
 /// work never touches the EWMA, so flap is structurally impossible:
 /// the gate either never engages (a few spikes from cold) or engages
 /// once and HOLDS while the slow-Tick stream persists — both correct.
@@ -1051,10 +1051,9 @@ async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> Tes
         actor.update_backpressure(114, 10_000);
         edges.observe(&reader);
         // …then the inter-spike work (fast-lane admin / ReportPull-
-        // Outcome / SubstituteProgress) processes. None of it folds
-        // into the EWMA (`prices_into_drain` = false), so the only
-        // production effect is another `update_backpressure` at the
-        // NEXT main-cmd dequeue.
+        // Outcome / SubstituteProgress) processes. None of it feeds
+        // `note_turn_cost`, so the only production effect is another
+        // `update_backpressure` at the NEXT main-cmd dequeue.
         actor.update_backpressure(114, 10_000);
         edges.observe(&reader);
     }
@@ -1062,9 +1061,9 @@ async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> Tes
         edges.count <= 1,
         "cost-axis backpressure flapped {}× over 24 single-1.3s-spike \
          cycles (the sh-024 §S2 +24-in-120s flap). With the \
-         prices_into_drain gate inter-spike work never decays the \
-         EWMA: ≤ 1 rising edge regardless of whether the slow-Tick \
-         stream accumulates past HIGH.",
+         Tick/flush-only feed inter-spike work never decays the EWMA: \
+         ≤ 1 rising edge regardless of whether the slow-Tick stream \
+         accumulates past HIGH.",
         edges.count
     );
     Ok(())
@@ -1075,7 +1074,7 @@ async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> Tes
 /// pathological Tick at 1 % depth MUST engage and SURVIVE the
 /// inter-evaluation work: at α = 0.05 one observation lands ewma =
 /// 7 s (drain = 700 s ≫ HIGH). The inter-spike fast-lane / µs-class
-/// commands no longer fold (`prices_into_drain` gate), so the
+/// commands do not feed `note_turn_cost`, so the
 /// evidence is preserved BY CONSTRUCTION until the next Tick/
 /// MergeDag — and one subsequent idle Tick at α=0.05 gives ewma =
 /// 0.05×0.001 + 0.95×7.0 = 6.65 → drain = 665 s, STILL active. At
@@ -1095,8 +1094,8 @@ async fn backpressure_cost_axis_survives_fast_lane_decay() -> TestResult {
         reader.is_active(),
         "one 140 s Tick at q=100 must engage (drain = 100 × α × 140 s)"
     );
-    // Inter-spike fast-lane / µs/ms-class commands process; none fold
-    // (`prices_into_drain` = false), so production sees only another
+    // Inter-spike fast-lane / µs/ms-class commands process; none feed
+    // `note_turn_cost`, so production sees only another
     // `update_backpressure` at the NEXT main-cmd dequeue with ewma
     // unchanged.
     actor.update_backpressure(100, 10_000);
@@ -1122,7 +1121,7 @@ async fn backpressure_cost_axis_survives_fast_lane_decay() -> TestResult {
 // r[verify sched.admission.work-per-turn]
 /// **Bimodal-mix flap regression.** The mailbox during a nix-fast-build
 /// burst is bimodal across 5 OOM: SubstituteProgress 4µs × 65k vs
-/// MergeDag 303ms × 256. Pre-`prices_into_drain`-gate, one slow Tick
+/// MergeDag 303ms × 256. Pre-Tick/flush-only-feed, one slow Tick
 /// (3.3s) lifted ewma to 0.166 → drain = 247s @ q=1484 → ACTIVATE;
 /// ~60 × 4µs SubstituteProgress feeds decayed it to 0.007 → drain =
 /// 9.8s → DEACTIVATE 112µs later — 11 flaps in 5min. With the gate,
@@ -1144,8 +1143,8 @@ async fn backpressure_cost_axis_bimodal_mix_does_not_flap() -> TestResult {
     let mut edges = RisingEdges::new(false);
     // The diagnosed trace, 5 cycles: one 3.3s Tick spike @ q≈1484,
     // then ~60 SubstituteProgress 4µs commands. Those commands do
-    // NOT fold (`prices_into_drain` = false); production only
-    // re-evaluates `update_backpressure` per dequeue.
+    // NOT feed `note_turn_cost`; production only re-evaluates
+    // `update_backpressure` per dequeue.
     for _ in 0..5 {
         actor.note_turn_cost(std::time::Duration::from_millis(3300));
         actor.update_backpressure(1484, 10_000);
@@ -1160,59 +1159,11 @@ async fn backpressure_cost_axis_bimodal_mix_does_not_flap() -> TestResult {
         "bimodal mix flapped {}× (pre-gate: every 3.3s spike activated \
          and 60×4µs feeds at α=0.05 decayed it below LOW within the \
          same evaluation window — the live 11-flaps-in-5min trace). \
-         With the prices_into_drain gate the µs/ms-class work never \
+         With the Tick/flush-only feed the µs/ms-class work never \
          touches the EWMA; the gate engages once and holds.",
         edges.count
     );
     Ok(())
-}
-
-/// `prices_into_drain` is exhaustive: only Tick folds variant-routed
-/// into the cost-axis EWMA (merge cost feeds via
-/// `flush_pending_merges_priced` at every flush trigger — the
-/// flush-driven model). A new variant added without considering this
-/// is the structural seam — the post-P1 re-diagnosis 89s-hold was
-/// 8.8k mid-cost commands inflating an estimator meant to track merge
-/// drain time. This test pins the list so the next variant add hits a
-/// deliberate `false` arm or an explicit `true` here.
-#[test]
-fn prices_into_drain_is_exhaustive() {
-    use crate::actor::command::ActorCommand;
-    // Same exhaustiveness device as `name()`: every arm enumerated;
-    // a new variant is a compile error here. The `false` arms are the
-    // assertion — they are NOT an `_ => false` wildcard.
-    fn check(c: &ActorCommand) -> bool {
-        match c {
-            // Post-P2 intake delegate: µs-class, flush feeds the EWMA.
-            ActorCommand::MergeDag { .. } => false,
-            ActorCommand::Tick => true,
-            ActorCommand::ProcessCompletion { .. } => false,
-            ActorCommand::SubstituteProgress { .. } => false,
-            ActorCommand::CancelBuild { .. } => false,
-            ActorCommand::PullAssignment { .. } => false,
-            ActorCommand::ListMaterializationJobs { .. } => false,
-            ActorCommand::ReportPullOutcome { .. } => false,
-            ActorCommand::ReportRunningTelemetry { .. } => false,
-            ActorCommand::ReportAttemptOutcome { .. } => false,
-            ActorCommand::AckSpawnedIntents { .. } => false,
-            ActorCommand::QueryBuildStatus { .. } => false,
-            ActorCommand::WatchBuild { .. } => false,
-            ActorCommand::CleanupTerminalBuild { .. } => false,
-            ActorCommand::Admin(_) => false,
-            ActorCommand::ClearPoison { .. } => false,
-            ActorCommand::LeaderAcquired => false,
-            ActorCommand::LeaderLost => false,
-            ActorCommand::LeaderRebound => false,
-            ActorCommand::Debug(_) => false,
-        }
-    }
-    // Spot-check the production fn agrees with the exhaustive match
-    // above (the match is the structural pin; these assert the
-    // production impl matches it).
-    assert!(ActorCommand::Tick.prices_into_drain());
-    assert!(check(&ActorCommand::Tick));
-    assert!(!ActorCommand::LeaderLost.prices_into_drain());
-    assert!(!check(&ActorCommand::LeaderLost));
 }
 
 // ---------------------------------------------------------------------------
