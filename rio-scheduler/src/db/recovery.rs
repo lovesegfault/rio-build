@@ -34,16 +34,33 @@ const CHILD_LIVE_VOUCHER_SQL: &str = "EXISTS (SELECT 1 FROM build_derivations bd
      WHERE bd.derivation_id = c.derivation_id \
        AND b.status IN ('pending', 'active'))";
 
+/// The shared aggregate composition + FROM/JOIN body — single-sourced
+/// so a future predicate change (e.g. a third bool_and term) cannot
+/// silently let the merge-path batch gate and the recovery-path
+/// classifier disagree on what `Vouched` means (the bug_390 class).
+/// `{head}` carries `e.parent_id, ` for the batch form.
+macro_rules! classify_evidence_body {
+    ($head:literal) => {
+        concat!(
+            "SELECT ",
+            $head,
+            "count(*), \
+             bool_and(({p}) AND ({v})), \
+             bool_or(({p}) AND NOT ({v})) \
+             FROM derivation_edges e \
+             JOIN derivations c ON c.derivation_id = e.child_id \
+             WHERE e.parent_id "
+        )
+    };
+}
+
 /// The durable-classifier query (T-D2.2), assembled once from the
 /// shared fragments (a `LazyLock` so sqlx sees a `'static` string).
 static CLASSIFY_EVIDENCE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "SELECT count(*), \
-                bool_and(({CHILD_PRODUCED_SQL}) AND ({CHILD_LIVE_VOUCHER_SQL})), \
-                bool_or(({CHILD_PRODUCED_SQL}) AND NOT ({CHILD_LIVE_VOUCHER_SQL})) \
-         FROM derivation_edges e \
-         JOIN derivations c ON c.derivation_id = e.child_id \
-         WHERE e.parent_id = $1",
+        concat!(classify_evidence_body!(""), "= $1"),
+        p = CHILD_PRODUCED_SQL,
+        v = CHILD_LIVE_VOUCHER_SQL,
     )
 });
 
@@ -54,13 +71,12 @@ static CLASSIFY_EVIDENCE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
 /// path asks).
 static CLASSIFY_EVIDENCE_BATCH_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "SELECT e.parent_id, count(*), \
-                bool_and(({CHILD_PRODUCED_SQL}) AND ({CHILD_LIVE_VOUCHER_SQL})), \
-                bool_or(({CHILD_PRODUCED_SQL}) AND NOT ({CHILD_LIVE_VOUCHER_SQL})) \
-         FROM derivation_edges e \
-         JOIN derivations c ON c.derivation_id = e.child_id \
-         WHERE e.parent_id = ANY($1::uuid[]) \
-         GROUP BY e.parent_id",
+        concat!(
+            classify_evidence_body!("e.parent_id, "),
+            "= ANY($1::uuid[]) GROUP BY e.parent_id"
+        ),
+        p = CHILD_PRODUCED_SQL,
+        v = CHILD_LIVE_VOUCHER_SQL,
     )
 });
 

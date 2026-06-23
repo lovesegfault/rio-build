@@ -456,7 +456,7 @@ impl DagActor {
             self.note_created_materialization_jobs(&p.ingest.created_jobs)
                 .await;
             let rx = self.finish_merge_dag(p.ingest).await;
-            self.send_merge_reply(build_id, reply, Ok(rx)).await;
+            self.send_merge_reply(build_id, reply, rx).await;
         }
     }
 
@@ -468,10 +468,9 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
         reply: oneshot::Sender<Result<super::BuildEventReceivers, ActorError>>,
-        result: Result<super::BuildEventReceivers, ActorError>,
+        rx: super::BuildEventReceivers,
     ) {
-        let was_ok = result.is_ok();
-        if reply.send(result).is_err() && was_ok {
+        if reply.send(Ok(rx)).is_err() {
             warn!(
                 build_id = %build_id,
                 "MergeDag reply receiver dropped, cancelling orphaned build"
@@ -544,8 +543,9 @@ impl DagActor {
         // membership and existing-node status are consistent. At N=1
         // the dedup set is moot (one merge's `nodes` are
         // hash-distinct).
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut node_rows: Vec<crate::db::DerivationRow> = Vec::new();
+        let n_nodes_est: usize = prepared.iter().map(|p| p.ingest.nodes.len()).sum();
+        let mut seen: HashSet<&str> = HashSet::with_capacity(n_nodes_est);
+        let mut node_rows: Vec<crate::db::DerivationRow> = Vec::with_capacity(n_nodes_est);
         for p in prepared.iter() {
             for node in &p.ingest.nodes {
                 if !seen.insert(node.drv_hash.as_str()) {
@@ -596,10 +596,11 @@ impl DagActor {
         // SubmitBuild not in this request's `nodes`). Does NOT read
         // `self.dag.node().db_id` for nodes in THIS batch — that
         // field isn't set until after commit() below.
-        let mut all_links: Vec<(Uuid, Uuid)> = Vec::new();
-        let mut all_edges: Vec<(Uuid, Uuid)> = Vec::new();
+        let n_edges_est: usize = prepared.iter().map(|p| p.edges.len()).sum();
+        let mut all_links: Vec<(Uuid, Uuid)> = Vec::with_capacity(n_nodes_est);
+        let mut all_edges: Vec<(Uuid, Uuid)> = Vec::with_capacity(n_edges_est);
         let mut build_ids: Vec<Uuid> = Vec::with_capacity(prepared.len());
-        let mut all_wanted: Vec<crate::db::wanted::WantedRow<'_>> = Vec::new();
+        let mut all_wanted: Vec<crate::db::wanted::WantedRow<'_>> = Vec::with_capacity(n_nodes_est);
         for p in prepared.iter() {
             build_ids.push(p.ingest.build_id);
             let path_to_hash: HashMap<&str, &str> = p
@@ -668,11 +669,12 @@ impl DagActor {
         let pruned_ids: Vec<Uuid> = prepared
             .iter()
             .flat_map(|p| {
-                p.ingest
-                    .nodes
+                // Iterate the (small, often empty) pruned set directly —
+                // the unpruned fall-through walks ≈Σ|nodes| against an
+                // empty set otherwise, inside the held fenced tx.
+                p.pruned_closure_parents
                     .iter()
-                    .filter(|n| p.pruned_closure_parents.contains(n.drv_hash.as_str()))
-                    .filter_map(|n| id_map.get(n.drv_hash.as_str()).map(|(id, _)| *id))
+                    .filter_map(|h| id_map.get(h.as_str()).map(|(id, _)| *id))
             })
             .collect();
         let vouched =
@@ -700,16 +702,15 @@ impl DagActor {
         let mut reset_seen: HashSet<&str> = HashSet::new();
         for p in prepared.iter() {
             let start = job_specs.len();
-            let mut queued: HashSet<String> = HashSet::new();
-            for node in &p.ingest.nodes {
-                if p.pruned_closure_parents.contains(node.drv_hash.as_str())
-                    && let Some((db_id, _)) = id_map.get(node.drv_hash.as_str())
+            let mut queued: HashSet<&str> = HashSet::new();
+            for h in &p.pruned_closure_parents {
+                if let Some((db_id, _)) = id_map.get(h.as_str())
                     && !vouched.contains(db_id)
                 {
-                    queued.insert(node.drv_hash.clone());
+                    queued.insert(h.as_str());
                     job_specs.push((
                         *db_id,
-                        node.drv_hash.clone(),
+                        h.clone(),
                         p.tenant_id,
                         crate::state::JobOrigin::Pruned,
                     ));
@@ -719,7 +720,7 @@ impl DagActor {
                 if !queued.contains(h.as_str())
                     && let Some((db_id, _)) = id_map.get(h.as_str())
                 {
-                    queued.insert(h.as_str().to_owned());
+                    queued.insert(h.as_str());
                     job_specs.push((
                         *db_id,
                         h.as_str().to_owned(),
@@ -890,30 +891,32 @@ impl DagActor {
         // clamp-law doc); raw-loading paths (recovery) are covered by
         // the read-time `ClampedFloor` projection at every consumer.
         //
+        // db_id assignment is idempotent — ONE pass over the deduped
+        // id_map (O(|unique|)) instead of once per merge (O(Σ|nodes|)).
+        for (hash, (db_id, _)) in &id_map {
+            if let Some(state) = self.dag.node_mut(hash) {
+                state.db_id = Some(*db_id);
+            }
+        }
         // Slice `created` back per-merge (input-order ⇔ result-order).
         let mut created_iter = created.into_iter();
         let mut spec_iter = job_specs.into_iter();
         for (p, span) in prepared.iter_mut().zip(job_spans) {
-            // db_id / floor hydration over THIS merge's nodes only
-            // (id_map is batch-global; restricting by p.nodes preserves
-            // the `newly_inserted.contains` floor-promotion guard).
-            for node in &p.ingest.nodes {
-                if let Some((db_id, floor)) = id_map.get(node.drv_hash.as_str())
-                    && let Some(state) = self.dag.node_mut(&node.drv_hash)
+            // Floor hydration over newly_inserted only (disjoint
+            // across merges — `dag.merge` deduplicates). The db_id
+            // half is hoisted above (idempotent over the deduped
+            // id_map); restricting floor to newly_inserted preserves
+            // the I-208 promotion guard.
+            for hash in &p.ingest.merge_result.newly_inserted {
+                if let Some((_, floor)) = id_map.get(hash.as_str())
+                    && let Some(state) = self.dag.node_mut(hash.as_str())
                 {
-                    state.db_id = Some(*db_id);
-                    if p.ingest
-                        .merge_result
-                        .newly_inserted
-                        .contains(node.drv_hash.as_str())
-                    {
-                        let f = &mut state.sched.resource_floor;
-                        f.mem_bytes = f.mem_bytes.max(floor.mem_bytes);
-                        f.disk_bytes = f.disk_bytes.max(floor.disk_bytes);
-                        f.deadline_secs = f.deadline_secs.max(floor.deadline_secs);
-                        f.cores = f.cores.max(floor.cores);
-                        super::floor::clamp_floor_to_live(f, &self.sla_ceilings);
-                    }
+                    let f = &mut state.sched.resource_floor;
+                    f.mem_bytes = f.mem_bytes.max(floor.mem_bytes);
+                    f.disk_bytes = f.disk_bytes.max(floor.disk_bytes);
+                    f.deadline_secs = f.deadline_secs.max(floor.deadline_secs);
+                    f.cores = f.cores.max(floor.cores);
+                    super::floor::clamp_floor_to_live(f, &self.sla_ceilings);
                 }
             }
             // BuildInfo Pending→Active (PG side committed above).
