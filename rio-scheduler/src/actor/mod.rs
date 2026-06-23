@@ -1475,9 +1475,13 @@ impl DagActor {
             // push regardless.
             pull_flush_deadline: _,
             // Retained: same drain-with-NotLeader-before-wipe
-            // discipline as `pending_pull_outcomes` (Hazard L);
-            // `handle_merge_dag_intake`'s inline `is_leader()` gate
-            // means a standby/mid-acquire never pushed.
+            // discipline as `pending_pull_outcomes` (Hazard L). NO
+            // leader gate at intake — a standby DOES queue merges
+            // (r[sched.lease.k8s-lease+2], "DAGs are still merged so
+            // state is warm for takeover"); a queued-on-standby merge
+            // either commits under the new tenure or is rejected by
+            // the phase-5 begin_fenced/commit_refenced fence, so a
+            // stale-tenure entry surviving this wipe is safe.
             pending_merges: _,
             merge_flush_deadline: _,
             // Retained: flush-scoped (always empty between flushes;
