@@ -427,10 +427,19 @@ impl DagActor {
         }
 
         // Phase 5: ONE fenced transaction for the whole batch.
+        // `culprit` is `persist_merges`' out-param: the index of the
+        // prepared merge whose data the error is attributable to (left
+        // at 0 for batch-wide tx/DB failures). The Batch-2 per-merge
+        // edge loop is the only per-merge-attributable site
+        // (`MissingDbId` naming merge[k]'s drv_path); routing the
+        // original to `replies[0]` unconditionally delivered
+        // INTERNAL:<path it never sent> to the wrong gateway when k>0
+        // — see `batch_persist_err_routes_to_culprit_merge`.
         let t_persist = Instant::now();
-        if let Err(e) = self.persist_merges(&mut prepared).await {
+        let mut culprit = 0usize;
+        if let Err(e) = self.persist_merges(&mut prepared, &mut culprit).await {
             error!(
-                error = %e, batch = prepared.len(),
+                error = %e, batch = prepared.len(), culprit,
                 "batched phase-5 persist failed; rolling back every prepared merge"
             );
             // Reverse-order rollback: later merges layered on earlier
@@ -439,16 +448,11 @@ impl DagActor {
             // `removed_retriable`.
             //
             // ActorError is not Clone (sqlx::Error). The ORIGINAL typed
-            // error goes to the FIRST-prepared reply: `persist_merges`
-            // iterates `prepared` forward, so a per-merge-attributable
-            // failure (e.g. `MissingDbId` naming a drv_path) is
-            // overwhelmingly merge[0]'s data — sending it to
-            // merge[N-1] would deliver INTERNAL: <path it never sent>
-            // to the wrong gateway. Remaining replies get a
-            // synthesised per-merge error of the same retry class
-            // (single-source `synthesize_same_class()` — its
-            // debug_assert is the structural tie-back to
-            // `retry_class()`): the gateway's retry guard keys on
+            // error goes to `replies[culprit]`; every sibling gets a
+            // synthesised error of the same retry class (single-source
+            // [`ActorError::synthesize_for_class`] — its debug_assert
+            // is the structural tie-back to `retry_class()`): the
+            // gateway's retry guard keys on
             // UNAVAILABLE/RESOURCE_EXHAUSTED. At N=1 the original is
             // exact.
             let msg = e.to_string();
@@ -460,12 +464,14 @@ impl DagActor {
                 self.cleanup_failed_merge(p.ingest.build_id, p.ingest.merge_result)
                     .await;
             }
-            let mut replies = replies.into_iter();
-            if let Some(first) = replies.next() {
-                let _ = first.send(Err(e));
-            }
-            for reply in replies {
-                let _ = reply.send(Err(ActorError::synthesize_for_class(class, msg.clone())));
+            let mut original = Some(e);
+            for (i, reply) in replies.into_iter().enumerate() {
+                let err = if i == culprit {
+                    original.take().expect("culprit visited once")
+                } else {
+                    ActorError::synthesize_for_class(class, msg.clone())
+                };
+                let _ = reply.send(Err(err));
             }
             return;
         }
@@ -527,15 +533,26 @@ impl DagActor {
     ///
     /// On `Err` NOTHING is committed (the fenced tx aborts) and no
     /// in-memory state is touched — the caller rolls back every
-    /// prepared merge via `cleanup_failed_merge`.
+    /// prepared merge via `cleanup_failed_merge`. `culprit` is left at
+    /// the index of the prepared merge whose data the error is
+    /// attributable to: the Batch-2 per-merge edge loop sets it to `k`
+    /// before each merge's edge resolution (the only per-merge-
+    /// attributable site — `MissingDbId` names merge[k]'s drv_path);
+    /// every batch-wide DB call leaves it at 0. The caller routes the
+    /// original typed error to `replies[*culprit]`.
     ///
     /// On `Ok` every prepared merge is Active in PG; per-merge
     /// `ingest.created_jobs` is populated, db_id/floor hydrated,
     /// `BuildInfo→Active` applied, and the best-effort
     /// `record_resubmit_resets` run once for the batch.
     #[allow(clippy::too_many_lines)]
-    async fn persist_merges(&mut self, prepared: &mut [PreparedMerge]) -> Result<(), ActorError> {
+    async fn persist_merges(
+        &mut self,
+        prepared: &mut [PreparedMerge],
+        culprit: &mut usize,
+    ) -> Result<(), ActorError> {
         debug_assert!(!prepared.is_empty());
+        *culprit = 0;
         let serving_generation = self.serving_generation();
         // r[impl sched.evidence.durability+4]
         // Claims-floor fence for the whole merge transaction (stamps,
@@ -628,7 +645,11 @@ impl DagActor {
         let mut all_edges: Vec<(Uuid, Uuid)> = Vec::with_capacity(n_edges_est);
         let mut build_ids: Vec<Uuid> = Vec::with_capacity(prepared.len());
         let mut all_wanted: Vec<crate::db::wanted::WantedRow<'_>> = Vec::with_capacity(n_nodes_est);
-        for p in prepared.iter() {
+        for (k, p) in prepared.iter().enumerate() {
+            // The per-merge-attributable error site: a `MissingDbId`
+            // from `resolve` below names merge[k]'s edge endpoint —
+            // route the original to `replies[k]`, not `replies[0]`.
+            *culprit = k;
             build_ids.push(p.ingest.build_id);
             let path_to_hash: HashMap<&str, &str> = p
                 .ingest
@@ -664,6 +685,7 @@ impl DagActor {
                 all_edges.push((parent, child));
             }
         }
+        *culprit = 0;
         crate::db::SchedulerDb::batch_insert_build_derivations_multi(
             tx.conn(),
             &link_builds,

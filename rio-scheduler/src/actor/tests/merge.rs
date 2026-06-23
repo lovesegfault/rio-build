@@ -2922,3 +2922,77 @@ async fn merge_flush_not_starved_under_sustained_rx() -> TestResult {
     );
     Ok(())
 }
+
+/// Regression: the batch-tx error fan-out routed the original typed
+/// error to `replies[0]` unconditionally. `persist_merges`' Batch-2
+/// per-merge edge loop is per-merge-attributable: a `MissingDbId` from
+/// merge[k>0]'s edge resolution names a drv_path merge[0] never sent —
+/// the wrong gateway got the detailed INTERNAL, the actual culprit got
+/// a synthesized generic of the right class but wrong variant.
+///
+/// merge[0]: well-formed single node A.
+/// merge[1]: single node B + dangling edge B→nonexistent. `dag.merge`
+///   warn-skips the dangling endpoint (so phases 0-4 accept it);
+///   `persist_merges`' Batch-2 `resolve()` then `?`-returns
+///   `MissingDbId{drv_path: nonexistent}` at k=1.
+///
+/// Asserts merge[1] gets the original `MissingDbId` (its own path);
+/// merge[0] gets a synthesized sibling error of the same retry class.
+#[tokio::test]
+async fn batch_persist_err_routes_to_culprit_merge() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    let dangling = test_drv_path("culprit-dangling");
+    let (tx0, rx0) = oneshot::channel();
+    actor
+        .pending_merges
+        .push(crate::actor::merge::PendingMerge {
+            req: MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: Some(DEFAULT_TEST_TENANT),
+                nodes: vec![make_node("culprit-a")],
+                edges: vec![],
+                ..Default::default()
+            },
+            reply: tx0,
+        });
+    let (tx1, rx1) = oneshot::channel();
+    actor
+        .pending_merges
+        .push(crate::actor::merge::PendingMerge {
+            req: MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: Some(DEFAULT_TEST_TENANT),
+                nodes: vec![make_node("culprit-b")],
+                edges: vec![rio_proto::types::DerivationEdge {
+                    parent_drv_path: test_drv_path("culprit-b"),
+                    child_drv_path: dangling.clone(),
+                }],
+                ..Default::default()
+            },
+            reply: tx1,
+        });
+    actor.flush_pending_merges_priced().await;
+
+    let r1 = rx1.await?.expect_err("merge[1] sent the dangling edge");
+    assert!(
+        matches!(&r1, ActorError::MissingDbId { drv_path } if *drv_path == dangling),
+        "merge[1] (the culprit) must get the ORIGINAL MissingDbId naming \
+         its own dangling path; got {r1:?}"
+    );
+    let r0 = rx0.await?.expect_err("batch tx aborted → all replies Err");
+    assert!(
+        !matches!(r0, ActorError::MissingDbId { .. }),
+        "merge[0] must NOT get the original MissingDbId for a path it never \
+         sent (RED at base: replies[0] unconditionally got the original); \
+         got {r0:?}"
+    );
+    assert_eq!(
+        r0.retry_class(),
+        r1.retry_class(),
+        "synthesized sibling error preserves the original's retry class"
+    );
+    Ok(())
+}
