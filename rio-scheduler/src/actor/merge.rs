@@ -339,9 +339,12 @@ impl DagActor {
     ///
     /// Flush triggers: (i) `len ≥ MERGE_PERSIST_BATCH_MAX` here;
     /// (iii) `handle_leader_lost` (drains with `NotLeader`); (iv) the
-    /// [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm. NO `handle_tick`
-    /// head — Tick must never synchronously drain the merge buffer
-    /// (Tick 304ms→2.57s regression; see `housekeeping.rs`).
+    /// [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm; (v) the inline
+    /// post-dispatch `merge_flush_armed_at.elapsed() ≥ DEADLINE` check
+    /// in `run_inner` — the only sub-BATCH_MAX drain path while rx is
+    /// continuously Ready (biased select! starves trigger iv). NO
+    /// `handle_tick` head — Tick must never synchronously drain the
+    /// merge buffer (Tick 304ms→2.57s regression; `housekeeping.rs`).
     pub(super) async fn handle_merge_dag_intake(
         &mut self,
         req: MergeDagRequest,
@@ -359,6 +362,7 @@ impl DagActor {
         // flushes at N=1. Reset on the empty→nonempty edge.
         if self.pending_merges.is_empty() {
             self.merge_flush_deadline.reset();
+            self.merge_flush_armed_at = Some(std::time::Instant::now());
         }
         self.pending_merges.push(PendingMerge { req, reply });
         if self.pending_merges.len() >= MERGE_PERSIST_BATCH_MAX {
@@ -386,6 +390,7 @@ impl DagActor {
             return;
         }
         let batch = std::mem::take(&mut self.pending_merges);
+        self.merge_flush_armed_at = None;
         metrics::histogram!("rio_scheduler_mergedag_coalesce_batch_size")
             .record(batch.len() as f64);
 

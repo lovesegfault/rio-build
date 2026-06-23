@@ -679,6 +679,19 @@ pub struct DagActor {
     /// and `reset()` on empty→nonempty discipline as
     /// `pull_flush_deadline`.
     merge_flush_deadline: tokio::time::Interval,
+    /// P2 flush trigger (v): wall-clock instant of the empty→nonempty
+    /// push. The biased select! orders `rx.recv()` before the
+    /// `merge_flush_deadline` arm, so under sustained mailbox pressure
+    /// (the documented 8.8k PullAssignment×12ms ≈105s case, or a 65k
+    /// SubstituteProgress backlog) trigger (iv) is unreachable and —
+    /// since the Tick-head flush was deleted — a sub-BATCH_MAX batch
+    /// would have NO drain path. The run loop checks
+    /// `armed_at.elapsed() ≥ DEADLINE` inline AFTER every command
+    /// dispatch (not as a select! arm) so the latency bound holds
+    /// regardless of rx readiness. `None` while `pending_merges` is
+    /// empty; set by intake, cleared by flush and the leader-lost
+    /// drain.
+    merge_flush_armed_at: Option<std::time::Instant>,
     /// sh-027 §3, flush trigger (iv): the
     /// [`REPORT_OUTCOME_FLUSH_DEADLINE`](pull::REPORT_OUTCOME_FLUSH_DEADLINE)
     /// (250ms) select! arm — bounds ack latency for sub-BATCH_MAX
@@ -1290,6 +1303,7 @@ impl DagActor {
                 iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 iv
             },
+            merge_flush_armed_at: None,
             pending_walk_completed: Vec::new(),
             status_outbox: std::collections::VecDeque::new(),
             db,
@@ -1484,6 +1498,7 @@ impl DagActor {
             // stale-tenure entry surviving this wipe is safe.
             pending_merges: _,
             merge_flush_deadline: _,
+            merge_flush_armed_at: _,
             // Retained: flush-scoped (always empty between flushes;
             // `flush_pending_pull_outcomes` and `handle_leader_lost`
             // both `debug_assert!` it).
@@ -2145,6 +2160,22 @@ impl DagActor {
             // `ActorCommand::prices_into_drain`.
             if prices_into_drain {
                 self.note_turn_cost(cmd_elapsed);
+            }
+            // P2 flush trigger (v): inline post-dispatch deadline check.
+            // The biased select! orders rx before the trigger-(iv) arm,
+            // so a sustained-Ready rx starves it; this check runs AFTER
+            // every command regardless of rx readiness and is the only
+            // sub-BATCH_MAX drain path while rx never empties. Feeds
+            // `note_turn_cost` (the flush IS MergeDag-class work) so the
+            // EWMA does not decay to zero while real merge cost piles up
+            // here.
+            if self
+                .merge_flush_armed_at
+                .is_some_and(|t| t.elapsed() >= merge::MERGE_PERSIST_FLUSH_DEADLINE)
+            {
+                let t = Instant::now();
+                self.flush_pending_merges().await;
+                self.note_turn_cost(t.elapsed());
             }
             metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => cmd_name)
                 .record(cmd_elapsed.as_secs_f64());

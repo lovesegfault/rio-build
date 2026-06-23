@@ -2778,3 +2778,95 @@ async fn merge_phase_4_never_awaits_store_rpc() -> TestResult {
     );
     Ok(())
 }
+
+// ===========================================================================
+// P2 flush trigger (v): inline post-dispatch deadline — starvation regression
+// ===========================================================================
+
+/// Regression: with the Tick-head flush deleted (9fdd3947f) AND the
+/// biased select! ordering rx before the deadline arm, a sub-BATCH_MAX
+/// `pending_merges` batch had NO drain path while rx is continuously
+/// Ready. Five MergeDags + a sustained non-MergeDag flood: under the
+/// bug the deadline arm is starved and replies arrive only when the
+/// flood stops; under the inline post-dispatch check (trigger v) the
+/// flush fires after `MERGE_PERSIST_FLUSH_DEADLINE` (10ms in test)
+/// regardless of rx readiness.
+///
+/// Structural property under test: replies arrive WHILE the flood is
+/// still running. The flood task does not stop until the replies have
+/// been observed, so under the bug the await never resolves (caught by
+/// the 5s timeout — wide enough to be CI-noise-immune; the fix
+/// resolves in tens of ms).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_flush_not_starved_under_sustained_rx() -> TestResult {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_db, handle, _task) = setup().await;
+
+    // 5 MergeDags (sub-BATCH_MAX): capture reply futures, do NOT await.
+    let mut replies = Vec::new();
+    for i in 0..5 {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                req: MergeDagRequest {
+                    build_id: Uuid::new_v4(),
+                    tenant_id: Some(DEFAULT_TEST_TENANT),
+                    nodes: vec![make_node(&format!("starve-{i}"))],
+                    edges: vec![],
+                    ..Default::default()
+                },
+                reply: tx,
+            })
+            .await?;
+        replies.push(rx);
+    }
+
+    // Sustained flood: SubstituteProgress is the cheapest non-MergeDag
+    // command (no PG, no DAG mutation). Runs until told to stop — under
+    // the bug, rx never empties → biased select! never reaches the
+    // deadline arm → the await below never resolves.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = tokio::spawn({
+        let handle = handle.clone();
+        let stop = stop.clone();
+        async move {
+            let h = crate::state::DrvHash::from("flood-nonexistent");
+            while !stop.load(Ordering::Relaxed) {
+                let _ = handle
+                    .send_unchecked(ActorCommand::SubstituteProgress {
+                        drv_hash: h.clone(),
+                        bytes_done: 0,
+                        bytes_expected: 0,
+                        upstream_uri: String::new(),
+                    })
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    // The structural assertion: replies resolve while the flood is
+    // still running. 5s ≫ 10ms deadline + a 5-node persist; under the
+    // bug this hits the timeout (the flood never stops on its own).
+    let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for rx in replies {
+            rx.await
+                .expect("reply channel dropped")
+                .expect("merge failed");
+        }
+    })
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    let _ = flood.await;
+
+    assert!(
+        res.is_ok(),
+        "sub-BATCH_MAX merge batch starved under sustained rx pressure: \
+         biased select! orders rx before the deadline arm, and with the \
+         Tick-head flush deleted there is no other drain path — the \
+         inline post-dispatch check (trigger v) must fire"
+    );
+    Ok(())
+}
