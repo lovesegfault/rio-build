@@ -693,9 +693,11 @@ pub struct DagActor {
     /// on the empty→nonempty push; cleared by flush and the
     /// leader-lost drain. ONE field for ONE deadline, read at two
     /// sites: trigger (iv) is the `sleep_until` select! arm (reachable
-    /// when rx idles); trigger (v) is the inline post-dispatch `now ≥
-    /// deadline` check (the only sub-BATCH_MAX drain path while rx is
-    /// continuously Ready — biased select! orders rx before (iv)).
+    /// only when EVERY higher-biased arm idles); trigger (v) is the
+    /// loop-top `now ≥ deadline` check, which runs unconditionally
+    /// before select! and so is immune to which arm fires — the only
+    /// sub-BATCH_MAX drain path under a sustained rx OR fast-lane
+    /// flood (both biased before (iv); the fast arm `continue`s).
     /// `tokio::time::Instant`, not `std::`, so the two read sites
     /// agree under `start_paused` (the std-vs-tokio split made batch
     /// size non-deterministic across debug/CI runs).
@@ -1783,6 +1785,25 @@ impl DagActor {
         // mailbox is empty (no main work to be fair to).
         let mut consecutive_fast: usize = 0;
         loop {
+            // Coalesce flush trigger (v): the loop-top deadline backstop
+            // for BOTH buffers. Runs UNCONDITIONALLY before select! so it
+            // is immune to which arm fires (and to that arm's `continue`):
+            // the biased select! orders the fast lane AND `rx.recv()`
+            // before the trigger-(iv) `coalesce_due` arms, so a sustained
+            // fast-lane flood (with the `rx.is_empty()` quota reset
+            // below) OR a sustained-Ready rx starves (iv) — this check is
+            // the only sub-BATCH_MAX drain path under either flood. Same
+            // `tokio::time` clock as (iv) so the two read sites agree
+            // under `start_paused`. Placed BEFORE the quota reset so a
+            // 16-serve fast burst that crosses the deadline flushes on
+            // the 17th iteration regardless of the reset.
+            let now = tokio::time::Instant::now();
+            if self.pull_flush_deadline.is_some_and(|d| now >= d) {
+                self.flush_pending_pull_outcomes().await;
+            }
+            if self.merge_flush_deadline.is_some_and(|d| now >= d) {
+                self.flush_pending_merges_priced().await;
+            }
             if consecutive_fast >= ADMIN_FAST_LANE_DRAIN_QUOTA && rx.is_empty() {
                 consecutive_fast = 0;
             }
@@ -2149,22 +2170,6 @@ impl DagActor {
             // `ActorCommand::prices_into_drain`.
             if prices_into_drain {
                 self.note_turn_cost(cmd_elapsed);
-            }
-            // Coalesce flush trigger (v): inline post-dispatch deadline
-            // check for BOTH buffers. The biased select! orders rx
-            // before the trigger-(iv) arm, so a sustained-Ready rx
-            // starves it; this check runs AFTER every command
-            // regardless of rx readiness and is the only sub-BATCH_MAX
-            // drain path while rx never empties. Same `tokio::time`
-            // clock as trigger (iv) — the prior `std::time::Instant`
-            // disagreed under `start_paused` and a slow debug run
-            // could fire at N=1 even though the (iv) arm hadn't.
-            let now = tokio::time::Instant::now();
-            if self.pull_flush_deadline.is_some_and(|d| now >= d) {
-                self.flush_pending_pull_outcomes().await;
-            }
-            if self.merge_flush_deadline.is_some_and(|d| now >= d) {
-                self.flush_pending_merges_priced().await;
             }
             metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => cmd_name)
                 .record(cmd_elapsed.as_secs_f64());

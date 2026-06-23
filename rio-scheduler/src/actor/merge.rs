@@ -325,10 +325,11 @@ impl DagActor {
     ///
     /// Flush triggers: (i) `len ≥ MERGE_PERSIST_BATCH_MAX` here;
     /// (iii) `handle_leader_lost` (drains with `NotLeader`); (iv) the
-    /// [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm; (v) the inline
-    /// post-dispatch `now ≥ merge_flush_deadline` check in `run_inner`
-    /// — the only sub-BATCH_MAX drain path while rx is continuously
-    /// Ready (biased select! starves trigger iv). NO `handle_tick`
+    /// [`MERGE_PERSIST_FLUSH_DEADLINE`] select! arm; (v) the loop-top
+    /// `now ≥ merge_flush_deadline` check in `run_inner` — runs
+    /// unconditionally before select! so it is immune to which arm
+    /// fires (the only sub-BATCH_MAX drain path under a sustained rx
+    /// OR fast-lane flood, both biased before (iv)). NO `handle_tick`
     /// head — Tick must never synchronously drain the merge buffer
     /// (Tick 304ms→2.57s regression; `housekeeping.rs`).
     pub(super) async fn handle_merge_dag_intake(
@@ -361,7 +362,7 @@ impl DagActor {
     /// the `MergeDag` command itself is now µs-class intake
     /// (`prices_into_drain` no longer folds it), so every flush
     /// trigger — (i) eager here, (iv) the deadline arm, (v) the
-    /// inline post-dispatch check — routes through this wrapper.
+    /// loop-top check — routes through this wrapper.
     /// `flush_pending_merges` is module-private so a new flush trigger
     /// in `mod.rs`/`housekeeping.rs` cannot reach for it directly and
     /// silently regress the cost-axis law on that path (the EWMA

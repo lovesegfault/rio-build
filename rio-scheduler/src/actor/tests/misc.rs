@@ -750,12 +750,12 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
         })
         .await?;
     // P2: intake only queues; the reply.send (and orphan-cancel) fires
-    // from `flush_pending_merges`. The first barrier's post-dispatch
-    // trigger-(v) check (inline `armed_at.elapsed() ≥ DEADLINE`)
-    // enters the flush; the second barrier serializes behind the
-    // flush's PG awaits so logs_contain observes the orphan-cancel
-    // line. (Tick-head trigger ii is deleted; the deadline arm (iv) is
-    // racy against the test's sleep on current_thread.)
+    // from `flush_pending_merges`. The first barrier's loop-top
+    // trigger-(v) check (`now ≥ merge_flush_deadline`) enters the
+    // flush; the second barrier serializes behind the flush's PG
+    // awaits so logs_contain observes the orphan-cancel line.
+    // (Tick-head trigger ii is deleted; the deadline arm (iv) is racy
+    // against the test's sleep on current_thread.)
     tokio::time::sleep(crate::actor::merge::MERGE_PERSIST_FLUSH_DEADLINE).await;
     barrier(&handle).await;
     barrier(&handle).await;
@@ -783,6 +783,97 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
         Err(e) => panic!("unexpected error: {e:?}"),
     }
 
+    Ok(())
+}
+
+/// 5th select!-starvation variant: a sustained admin fast-lane flood
+/// (with `rx` empty so the `consecutive_fast` quota keeps resetting)
+/// must NOT starve the merge-coalesce deadline. The biased select!
+/// orders the fast arm before the trigger-(iv) `coalesce_due` arm, and
+/// the fast arm `continue`s — so a flood that keeps the fast lane
+/// non-empty starves (iv) AND skips any post-select! check. Loop-top
+/// trigger-(v) is the chokepoint: it runs unconditionally before
+/// select! every iteration, so the next fast-arm iteration past
+/// `MERGE_PERSIST_FLUSH_DEADLINE` flushes regardless.
+///
+/// multi_thread so the flood refills the fast lane CONCURRENTLY with
+/// the actor's serve loop — on current_thread the actor drains the
+/// lane in a sync burst, parks, and trigger-(iv) fires (bug masked).
+/// RED at iter-14 base (post-dispatch trigger-(v)): the 2s timeout
+/// fires with `sent` in the hundreds of thousands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_coalesce_deadline_survives_fast_lane_flood() -> TestResult {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_db, handle, _task) = setup().await;
+
+    // 1. Queue ONE MergeDag → handle_merge_dag_intake arms
+    //    merge_flush_deadline = now + 10ms (test const).
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: Some(DEFAULT_TEST_TENANT),
+                nodes: vec![make_node("flood-v-a")],
+                edges: vec![],
+                ..Default::default()
+            },
+            reply: reply_tx,
+        })
+        .await?;
+    // Serialize: MergeDag intake processed, deadline armed, rx empty.
+    barrier(&handle).await;
+
+    // 2. Sustained fast-lane flood, DIRECTLY on admin_fast_tx with
+    //    try_send (NO main-rx fallback): rx STAYS empty so the
+    //    loop-top `consecutive_fast` quota reset keeps the fast arm
+    //    enabled indefinitely, and the concurrent refill means the
+    //    actor's biased select! finds the fast arm Ready on every
+    //    poll — trigger-(iv) starves and the fast arm `continue`
+    //    skips any post-select! check. spawn_blocking: a true OS
+    //    thread spinning try_send, independent of the actor's worker.
+    let sent = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = tokio::task::spawn_blocking({
+        let fast_tx = handle.admin_fast_tx.clone();
+        let sent = sent.clone();
+        let stop = stop.clone();
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                let (tx, _rx) = oneshot::channel();
+                if fast_tx
+                    .try_send(crate::actor::FastAdmin::new(AdminQuery::GetSpawnIntents {
+                        req: crate::actor::SpawnIntentsRequest::default(),
+                        reply: tx,
+                    }))
+                    .is_ok()
+                {
+                    sent.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+
+    // 3. Reply must arrive within DEADLINE (10ms) + flush cost. 2s is
+    //    the structural-vs-timeout discriminant: with the bug the
+    //    flood holds the merge forever (timeout); with loop-top (v)
+    //    the very next fast-arm iteration past 10ms flushes.
+    let r = tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx).await;
+    stop.store(true, Ordering::Relaxed);
+    let _ = flood.await;
+    let n = sent.load(Ordering::Relaxed);
+    let r = r.unwrap_or_else(|_| {
+        panic!(
+            "merge reply starved under fast-lane flood ({n} fast sends accepted): \
+             trigger-(v) must run at loop top, immune to the fast arm's `continue`"
+        )
+    });
+    assert!(
+        n >= crate::actor::ADMIN_FAST_LANE_DRAIN_QUOTA,
+        "flood non-vacuous: ≥{} fast sends accepted past the quota reset; got {n}",
+        crate::actor::ADMIN_FAST_LANE_DRAIN_QUOTA,
+    );
+    r??;
     Ok(())
 }
 
