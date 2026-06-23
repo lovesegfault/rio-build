@@ -73,7 +73,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_gateway_errors_total",
         "Protocol errors (labeled by type; type=session also carries \
-         stage=tcp-accepted|auth-attempted|authenticated|channel-open)"
+         stage=tcp-accepted|auth-attempted|authenticated|channel-open; \
+         type=channel_limit is the once-per-terminated-connection hard \
+         backstop, type=channel_limit_soft is per-over-bound-open)"
     );
     describe_counter!(
         "rio_gateway_builds_leaked_on_disconnect_total",

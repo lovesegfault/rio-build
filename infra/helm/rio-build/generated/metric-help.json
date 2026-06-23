@@ -87,7 +87,7 @@
   "rio_gateway_channels_active": "Currently active protocol sessions (one per accepted nix-daemon exec, not SSH-level open channels); the gateway autoscaling signal",
   "rio_gateway_connections_active": "Currently active SSH connections",
   "rio_gateway_connections_total": "Total SSH connections (labeled by result: new/accepted/rejected/rejected_jwt)",
-  "rio_gateway_errors_total": "Protocol errors (labeled by type; type=session also carries stage=tcp-accepted|auth-attempted|authenticated|channel-open)",
+  "rio_gateway_errors_total": "Protocol errors (labeled by type; type=session also carries stage=tcp-accepted|auth-attempted|authenticated|channel-open; type=channel_limit is the once-per-terminated-connection hard backstop, type=channel_limit_soft is per-over-bound-open)",
   "rio_gateway_handshakes_total": "Protocol handshakes completed (labeled by result: success/rejected/failure)",
   "rio_gateway_jwt_mint_degraded_total": "JWT mint failed but jwt.required=false, degraded to tenant_name fallback",
   "rio_gateway_jwt_refresh_failed_total": "Session JWT re-mint failed; stale token kept (downstream will reject ExpiredSignature)",

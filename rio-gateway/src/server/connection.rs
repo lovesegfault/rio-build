@@ -1430,7 +1430,15 @@ impl Handler for ConnectionHandler {
                 limit = self.max_channels_per_connection,
                 "per-connection channel bound exceeded; accepting open, will reject at exec"
             );
-            metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit").increment(1);
+            // `channel_limit_soft`: counts every over-bound OPEN
+            // (accept-then-reject-at-exec). `channel_limit` (the hard
+            // backstop above) preserves its once-per-terminated-
+            // connection semantics — the dashboard alert keys on it.
+            // Conflating both under one label flipped the alert's
+            // meaning (one busy ControlMaster looked like a stream of
+            // connection kills).
+            metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit_soft")
+                .increment(1);
             self.over_bound_channels.insert(channel_id);
             // Drop both halves — no protocol path for this channel. The
             // russh table entry stays until the client (or our
