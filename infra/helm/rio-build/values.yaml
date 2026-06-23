@@ -1422,6 +1422,11 @@ gateway:
   # grpc.health.v1 on each, routes to leader.
   schedulerBalanceHost: rio-scheduler-headless
   schedulerBalancePort: 9001
+  # Same balanced-channel for the store: without this the gateway falls
+  # back to a single eager h2 conn pinned (via conntrack) to one store
+  # pod — every in-flight RPC cancels when that pod churns under HPA.
+  storeBalanceHost: rio-store-headless.rio-store
+  storeBalancePort: 9002
   # Cap on transitive input derivations resolved per build (DoS guard).
   # Matches gateway wire MAX_COLLECTION_COUNT (1M). drv_cache ≈ 1-3GB at
   # the cap (parsed Derivation, not just path strings); gateway memory
