@@ -776,14 +776,27 @@ impl DagActor {
         // WHERE exec_id IS NOT NULL guard does not apply at
         // exec_id=None) and double-count the resubmit-cycle clear.
         let mut reset_seen: HashSet<&str> = HashSet::new();
+        // Cross-merge job dedup: same drv_hash via two merges' lanes
+        // would push two `job_specs` rows. The partial-unique
+        // `(derivation_id) WHERE status='pending' AND exec_id IS NULL`
+        // index makes the SECOND insert `created=false`, but both rows
+        // still entered `created_jobs` (one per merge) — both reported
+        // `created=true` to their merge's phase-6 (the per-merge slice
+        // re-read `created_iter` in input order, so the first-merge
+        // slice took the `created=true` AND the second-merge slice took
+        // the next `created` row, double-seeding the M-085 reset).
+        // Same batch-scoped pattern as `pruned_ids`/`reset_seen`:
+        // pre-P2 merge[k+1]'s lanes ran AFTER merge[k]'s job had
+        // committed (ON CONFLICT deduped serially). At N=1 the set
+        // degenerates to the per-merge intra-lane dedup.
+        let mut queued: HashSet<&str> = HashSet::new();
         for p in prepared.iter() {
             let start = job_specs.len();
-            let mut queued: HashSet<&str> = HashSet::new();
             for h in &p.pruned_closure_parents {
                 if let Some((db_id, _)) = id_map.get(h.as_str())
                     && !vouched.contains(db_id)
+                    && queued.insert(h.as_str())
                 {
-                    queued.insert(h.as_str());
                     job_specs.push((
                         *db_id,
                         DrvHash::from(h.as_str()),
@@ -793,10 +806,9 @@ impl DagActor {
                 }
             }
             for h in &p.new_sub_lane {
-                if !queued.contains(h.as_str())
-                    && let Some((db_id, _)) = id_map.get(h.as_str())
+                if let Some((db_id, _)) = id_map.get(h.as_str())
+                    && queued.insert(h.as_str())
                 {
-                    queued.insert(h.as_str());
                     job_specs.push((
                         *db_id,
                         h.clone(),
@@ -819,8 +831,8 @@ impl DagActor {
             // seed_initial_states reads dep statuses (the
             // bug_089/bug_132 phase-ordering invariant).
             for h in &p.reprobe_sub_lane {
-                if !queued.contains(h.as_str())
-                    && let Some((db_id, _)) = id_map.get(h.as_str())
+                if let Some((db_id, _)) = id_map.get(h.as_str())
+                    && queued.insert(h.as_str())
                 {
                     job_specs.push((
                         *db_id,
