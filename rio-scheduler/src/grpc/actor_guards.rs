@@ -90,6 +90,13 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // the previous mapping turned every fence trip into a
         // user-visible failure.
         ActorError::StaleGeneration { .. } => Status::unavailable(err.to_string()),
+        // P2 batch fan-out: this merge was an INNOCENT sibling of a
+        // failed coalesced tx — pre-P2 it would have succeeded solo.
+        // UNAVAILABLE so the gateway's bounded SubmitBuild retry
+        // re-submits; the next batch lacks the culprit. Generic
+        // string (NO culprit detail): siblings may be different
+        // tenants — cross-tenant leak otherwise.
+        ActorError::BatchSiblingFailed => Status::unavailable(err.to_string()),
     };
     // The code DERIVES from the retry class
     // (sched.grpc.fence-retryable): pinned exhaustively by the

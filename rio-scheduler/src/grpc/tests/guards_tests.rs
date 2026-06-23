@@ -26,7 +26,8 @@ fn _actor_error_exhaustive(e: &ActorError) {
         | ActorError::StoreUnavailable
         | ActorError::PermissionDenied { .. }
         | ActorError::NotLeader
-        | ActorError::StaleGeneration { .. } => {}
+        | ActorError::StaleGeneration { .. }
+        | ActorError::BatchSiblingFailed => {}
     }
 }
 
@@ -89,6 +90,15 @@ fn test_actor_error_to_status_all_arms() {
             },
             Code::Unavailable,
             "below the durable claims floor",
+        ),
+        (
+            // P2 batch fan-out: an innocent sibling of a failed
+            // coalesced tx is RETRYABLE — pre-P2 it would have
+            // succeeded solo. Generic string: siblings may be
+            // different tenants (cross-tenant leak otherwise).
+            ActorError::BatchSiblingFailed,
+            Code::Unavailable,
+            "co-batched submission failed",
         ),
     ];
     // Count derived from the enum (strum::EnumCount), not a hardcoded
@@ -203,6 +213,7 @@ fn retry_class_code_consistency() {
             serving: 1,
             floor: 2,
         },
+        ActorError::BatchSiblingFailed,
     ];
     assert_eq!(
         actor_errors.len(),

@@ -2936,8 +2936,10 @@ async fn merge_flush_not_starved_under_sustained_rx() -> TestResult {
 ///   `persist_merges`' Batch-2 `resolve()` then `?`-returns
 ///   `MissingDbId{drv_path: nonexistent}` at k=1.
 ///
-/// Asserts merge[1] gets the original `MissingDbId` (its own path);
-/// merge[0] gets a synthesized sibling error of the same retry class.
+/// Asserts merge[1] gets the original `MissingDbId` (its own path,
+/// Terminal); merge[0] gets `BatchSiblingFailed` (Retryable — pre-P2
+/// it would have succeeded solo, so the gateway retries it into a
+/// fresh batch without the culprit).
 #[tokio::test]
 async fn batch_persist_err_routes_to_culprit_merge() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -2982,17 +2984,29 @@ async fn batch_persist_err_routes_to_culprit_merge() -> TestResult {
         "merge[1] (the culprit) must get the ORIGINAL MissingDbId naming \
          its own dangling path; got {r1:?}"
     );
+    assert_eq!(
+        r1.retry_class(),
+        crate::actor::RetryClass::Terminal,
+        "culprit's MissingDbId is Terminal"
+    );
     let r0 = rx0.await?.expect_err("batch tx aborted → all replies Err");
     assert!(
-        !matches!(r0, ActorError::MissingDbId { .. }),
-        "merge[0] must NOT get the original MissingDbId for a path it never \
-         sent (RED at base: replies[0] unconditionally got the original); \
-         got {r0:?}"
+        matches!(r0, ActorError::BatchSiblingFailed),
+        "merge[0] (innocent) must get unit BatchSiblingFailed, NOT the \
+         original MissingDbId for a path it never sent (RED at iter-14 \
+         base: replies[0] got a class-preserving Terminal synthesised \
+         error and the gateway terminally failed a valid request); got {r0:?}"
+    );
+    assert!(
+        !r0.to_string().contains("culprit-dangling"),
+        "sibling's wire error must NOT carry the culprit's drv_path \
+         (siblings may be different tenants — cross-tenant leak); got {r0}"
     );
     assert_eq!(
         r0.retry_class(),
-        r1.retry_class(),
-        "synthesized sibling error preserves the original's retry class"
+        crate::actor::RetryClass::Retryable,
+        "innocent sibling is RETRYABLE — pre-P2 it would have succeeded \
+         solo; the gateway retries it into a fresh batch without the culprit"
     );
     Ok(())
 }

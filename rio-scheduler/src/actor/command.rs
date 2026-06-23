@@ -1163,6 +1163,27 @@ pub enum ActorError {
          (a newer leader has claimed); retry against the current leader"
     )]
     StaleGeneration { serving: i64, floor: i64 },
+
+    /// P2 batch-persist fan-out: this merge was an INNOCENT sibling in
+    /// a coalesced phase-5 transaction that aborted because of ANOTHER
+    /// merge's data (the culprit got the original typed error). Pre-P2
+    /// this merge would have been processed solo and succeeded; the
+    /// only reason it failed is co-batching. Maps to UNAVAILABLE so
+    /// the gateway's bounded SubmitBuild retry re-submits — the next
+    /// batch won't include the culprit (whose own gateway saw a
+    /// terminal error), so the innocent succeeds. The prior
+    /// class-preserving fan-out delivered the CULPRIT'S Terminal class
+    /// to siblings, terminally failing valid requests — a P2
+    /// regression vs the serial path.
+    ///
+    /// UNIT (no culprit detail): coalesced merges may belong to
+    /// DIFFERENT TENANTS. Embedding the culprit's error string (which
+    /// names their drv_path) in a sibling's wire error is a
+    /// cross-tenant information leak. The culprit detail goes only to
+    /// `replies[culprit]`; operator diagnosability is the `error!` in
+    /// `flush_pending_merges`.
+    #[error("co-batched submission failed; retrying independently")]
+    BatchSiblingFailed,
 }
 
 // r[impl sched.grpc.fence-retryable]
@@ -1192,7 +1213,8 @@ impl ActorError {
             | Self::ChannelSend
             | Self::Backpressure
             | Self::StoreUnavailable
-            | Self::StaleGeneration { .. } => RetryClass::Retryable,
+            | Self::StaleGeneration { .. }
+            | Self::BatchSiblingFailed => RetryClass::Retryable,
             // The request itself is unservable as posed.
             Self::BuildNotFound(_)
             | Self::Database(_)
@@ -1200,34 +1222,6 @@ impl ActorError {
             | Self::MissingDbId { .. }
             | Self::PermissionDenied { .. } => RetryClass::Terminal,
         }
-    }
-
-    /// A fresh `ActorError` of the given [`RetryClass`], carrying
-    /// `msg`. Single-sources the class-preservation rule for the batch
-    /// error fan-out (`flush_pending_merges`): `replies[1..N]` get a
-    /// synthesised per-merge error whose class — and therefore gRPC
-    /// code, per `retry_class_code_consistency` — matches
-    /// `replies[0]`'s original. Hard-coding `NotLeader` /
-    /// `Database(Protocol)` as
-    /// RetryClass representatives at the fan-out site would silently
-    /// desync if either is ever reclassified; the `debug_assert_eq!`
-    /// here AND the release-mode `retry_class_code_consistency`
-    /// COUNT-pinned exhaustive test are the structural tie-back (the
-    /// debug_assert alone would not catch a `NotLeader→Terminal`
-    /// reclassification in release). Exhaustive match: a third
-    /// RetryClass variant is a compile error here, not a silent
-    /// boolean collapse to Terminal. The Retryable arm discards `msg`
-    /// (`NotLeader` is unit) — observability-only: the gateway retries
-    /// on class and never surfaces the sibling error body to the user;
-    /// an `ActorError::BatchSibling { class, msg }` variant is the
-    /// honest API shape if this fn grows a second caller.
-    pub(crate) fn synthesize_for_class(class: RetryClass, msg: String) -> Self {
-        let out = match class {
-            RetryClass::Retryable => Self::NotLeader,
-            RetryClass::Terminal => Self::Database(sqlx::Error::Protocol(msg)),
-        };
-        debug_assert_eq!(class, out.retry_class());
-        out
     }
 }
 

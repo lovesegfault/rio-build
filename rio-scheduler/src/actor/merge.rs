@@ -449,18 +449,21 @@ impl DagActor {
             // `removed_retriable`.
             //
             // ActorError is not Clone (sqlx::Error). The ORIGINAL typed
-            // error goes to `replies[culprit]`; every sibling gets a
-            // synthesised error of the same retry class (single-source
-            // [`ActorError::synthesize_for_class`] — its debug_assert
-            // is the structural tie-back to `retry_class()`): the
-            // gateway's retry guard keys on
-            // UNAVAILABLE/RESOURCE_EXHAUSTED. At N=1 the original is
-            // exact.
-            let msg = e.to_string();
-            // refusal-census: derives from retry_class() — not an
-            // adjudication site (the source-of-truth match lives in
-            // `ActorError::retry_class`).
-            let class = e.retry_class();
+            // error goes to `replies[culprit]`; every sibling gets
+            // `BatchSiblingFailed` — UNCONDITIONALLY Retryable,
+            // regardless of the culprit's class. Pre-P2 the sibling
+            // would have been processed solo and succeeded; the only
+            // reason it failed is co-batching, so the gateway retries
+            // it (and the next batch won't include the culprit, whose
+            // own gateway saw a terminal error). Preserving the
+            // culprit's Terminal class to siblings (the prior
+            // synthesize_for_class) terminally failed valid requests —
+            // a P2 regression vs the serial path. At N=1 the original
+            // is exact. Siblings get NO culprit detail: coalesced
+            // merges may belong to different tenants — embedding the
+            // culprit's drv_path in a sibling's wire error leaks
+            // cross-tenant information; the `error!` above is the
+            // operator-side detail.
             for p in prepared.into_iter().rev() {
                 self.cleanup_failed_merge(p.ingest.build_id, p.ingest.merge_result)
                     .await;
@@ -470,7 +473,7 @@ impl DagActor {
                 let err = if i == culprit {
                     original.take().expect("culprit visited once")
                 } else {
-                    ActorError::synthesize_for_class(class, msg.clone())
+                    ActorError::BatchSiblingFailed
                 };
                 let _ = reply.send(Err(err));
             }
