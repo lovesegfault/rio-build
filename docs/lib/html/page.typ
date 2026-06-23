@@ -10,16 +10,6 @@
 #import "nav.typ": nav-tree
 #import "/lib/rio.typ": _current-route, _page-toc
 
-// Ayu accent — keeps the mobile-chrome tint in step with style.css.
-// Light/dark pair from meta.typ `accent`; the dark entry carries
-// `media` so a dark-OS user gets the dark tint regardless of the
-// in-page data-theme toggle (browsers only read the meta, not the
-// stylesheet).
-#let _theme-color = (
-  (media: none, content: accent.light),
-  (media: "(prefers-color-scheme: dark)", content: accent.dark),
-)
-
 // `<meta {kind}="k" content="v">` for each pair. The og:* block was
 // ~40 lines of triple-nested `html.elem` copy-paste; one helper, one
 // tuple per tag.
@@ -33,7 +23,13 @@
   // `src-path: none`. No description lookup, no breadcrumb trail, no
   // canonical/OG meta, no edit link, not pagefind-indexed. Named once
   // so the half-dozen gates below read as "is-error-page", not
-  // "src-path is none".
+  // "src-path is none". HOLDS BY ENUMERATION ONLY: 404 is currently
+  // the sole synthesized route. A second one (search-results shell,
+  // redirect stub, generated index) needs `src-path: none` for "no
+  // edit link / no crumb" but is NOT an error page for canonical/OG/
+  // pagefind/noindex — at that point thread an explicit `kind:
+  // "chapter" | "error" | …` param and re-audit each gate below;
+  // don't add a second sentinel.
   let is-error-page = src-path == none
   let desc = if not is-error-page { descriptions.at(src-path, default: none) }
   // QA N3: always emit description/og:description; fall back to a
@@ -82,11 +78,35 @@
           ("og:image:height", "630"),
         ))
       }
-      #for tc in _theme-color {
-        let attrs = (name: "theme-color", content: tc.content)
-        if tc.media != none { attrs.insert("media", tc.media) }
-        html.elem("meta", attrs: attrs)
-      }
+      // Ayu accent — keeps the mobile-chrome tint in step with the
+      // stylesheet. Light/dark pair from meta.typ `accent`; the dark
+      // entry carries `media` so a dark-OS user gets the dark tint
+      // regardless of the in-page data-theme toggle (browsers only
+      // read the meta, not the stylesheet). N=2: two literal calls
+      // are shorter and clearer than the array+loop+conditional-
+      // attrs.insert machinery this replaced.
+      #html.elem("meta", attrs: (name: "theme-color", content: accent.light))
+      #html.elem("meta", attrs: (
+        name: "theme-color",
+        media: "(prefers-color-scheme: dark)",
+        content: accent.dark,
+      ))
+      // `--accent` CSS var, single-sourced from meta.typ `accent` so
+      // style.css carries no hand-synced hex (the prior comment
+      // claimed a docs-html-smoke palette grep tripwire that did not
+      // exist). Same three selectors style.css uses for the rest of
+      // the palette: :root (light), [data-theme=dark] (explicit), and
+      // the @media auto block (no data-theme → follow OS).
+      #html.elem(
+        "style",
+        ":root{--accent:"
+          + accent.light
+          + "}:root[data-theme=dark]{--accent:"
+          + accent.dark
+          + "}@media(prefers-color-scheme:dark){:root:not([data-theme]){--accent:"
+          + accent.dark
+          + "}}",
+      )
       #html.title[#title — rio-build design book]
       // Inline SVG favicon (Ayu accent disc + "r" glyph). data: URI so
       // it ships with every page — no /favicon.ico round-trip.
@@ -134,22 +154,17 @@
         aria-label: "Keyboard shortcuts",
       ))[
         #html.elem("p")[#html.elem("strong")[Keyboard shortcuts]]
-        #html.elem("table")[
-          #html.elem("tr")[#html.elem("td")[#html.elem("kbd")[s]] #html.elem(
-              "td",
-            )[Focus search]]
-          #html.elem("tr")[#html.elem(
-              "td",
-            )[#html.elem("kbd")[←] / #html.elem("kbd")[→]] #html.elem(
-              "td",
-            )[Previous / next chapter]]
-          #html.elem("tr")[#html.elem("td")[#html.elem("kbd")[Esc]] #html.elem(
-              "td",
-            )[Close drawer / clear search]]
-          #html.elem("tr")[#html.elem("td")[#html.elem("kbd")[?]] #html.elem(
-              "td",
-            )[Toggle this help]]
-        ]
+        #html.elem("table", for (keys, label) in (
+          (("s",), "Focus search"),
+          (("←", "→"), "Previous / next chapter"),
+          (("Esc",), "Close drawer / clear search"),
+          (("?",), "Toggle this help"),
+        ) {
+          html.elem("tr")[
+            #html.elem("td", keys.map(k => html.elem("kbd", k)).join([ \/ ]))
+            #html.elem("td")[#label]
+          ]
+        })
       ]
       #html.elem("button", attrs: (
         class: "rio-nav-toggle",

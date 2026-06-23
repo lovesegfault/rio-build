@@ -178,8 +178,11 @@
 
 #let label-for(path) = label("chapter:" + route-for(path))
 
-// Ayu accent hex pair. Typst-side single source for theme-color,
-// favicon, and the og-image card; docs/assets/style.css's `--accent`
-// MUST match (CSS can't read typst — keep the two in step by hand;
-// the docs-html-smoke palette grep is the tripwire).
+// Ayu accent hex pair. SINGLE source for theme-color, favicon, the
+// og-image card, AND style.css's `--accent` var: page.typ emits
+// `<style>:root{--accent:…}…</style>` in <head> from this dict, so
+// style.css declares no `--accent` value and there is no hand-sync
+// duty. (The remaining 11-var dark palette in style.css IS still
+// duplicated between [data-theme=dark] and the @media auto block —
+// deliberate FOUC/no-JS trade per the in-file rationale.)
 #let accent = (light: "#f29718", dark: "#e6b450")
