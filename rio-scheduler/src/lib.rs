@@ -229,16 +229,20 @@ pub fn describe_metrics() {
         "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f, \
          plus the P2 coalesce labels 0to4-prepare-batched / \
          5-persist-and-activate-batched — the flush_pending_merges batch \
-         persist; N=1 and N>1 share one path). Decomposes \
-         rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s \
-         is the I-139 signal — N sequential PG awaits in the actor."
+         persist; N=1 and N>1 share one path). Emitted from \
+         flush_pending_merges, NOT the MergeDag command arm — post-P2 the \
+         arm is µs-class intake for 31/32 turns and \
+         actor_cmd_seconds{cmd=MergeDag} samples NONE of the flush work \
+         (flush fires via trigger iv with no cmd sample, or trigger v under \
+         whatever cmd dequeued). Compare phases against each other, not \
+         against actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the \
+         I-139 signal — N sequential PG awaits in the actor."
     );
     describe_histogram!(
         "rio_scheduler_tick_phase_seconds",
         "Per-phase housekeeping Tick latency (labeled by phase: \
          00-priority-sweep..18-snapshot-publish). Decomposes \
-         rio_scheduler_actor_cmd_seconds{cmd=Tick} the way \
-         merge_phase_seconds decomposes MergeDag: the Tick is a leader-only \
+         rio_scheduler_actor_cmd_seconds{cmd=Tick}: the Tick is a leader-only \
          single-threaded actor turn, so one slow phase head-of-line blocks \
          every queued RPC and starves admin-served probes — a phase in the \
          tens-of-seconds buckets names the term to bound, instead of a \
