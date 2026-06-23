@@ -181,6 +181,17 @@ spec:
               value: {{ $g.schedulerBalancePort | quote }}
             - name: RIO_STORE__ADDR
               value: {{ $g.storeAddr | quote }}
+            {{- if $g.storeBalanceHost }}
+            # Same balance pattern for rio-store, but for load
+            # distribution across replicas (no leader/standby). Without
+            # this the gateway pins one h2 conn through the ClusterIP
+            # to one store pod via conntrack — HPA churn on that pod
+            # mass-cancels every in-flight NAR stream.
+            - name: RIO_STORE__BALANCE_HOST
+              value: {{ $g.storeBalanceHost | quote }}
+            - name: RIO_STORE__BALANCE_PORT
+              value: {{ $g.storeBalancePort | quote }}
+            {{- end }}
             - name: RIO_MAX_TRANSITIVE_INPUTS
               value: {{ $g.maxTransitiveInputs | int | quote }}
             {{- if $g.ssh.authorizedKeysSecret }}
