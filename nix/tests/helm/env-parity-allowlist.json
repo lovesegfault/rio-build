@@ -87,9 +87,7 @@
   "RIO_JWT__KEY_PATH": "conditional wiring: rendered only when its feature flag/secret mount is enabled (rio.mounts include); absent at chart defaults by design.",
   "RIO_JWT__REQUIRED": "conditional wiring: rendered only when its feature flag/secret mount is enabled (rio.mounts include); absent at chart defaults by design.",
   "RIO_METRICS_ADDR": "the port/address is baked into the Service + probe templates; changing it is a coupled chart+code change, not an operator knob.",
-  "RIO_HEALTH_ADDR": "the port/address is baked into the Service + probe templates; changing it is a coupled chart+code change, not an operator knob.",
-  "RIO_STORE__BALANCE_HOST": "unwired by default: this component dials the single Service endpoint (RIO_*__ADDR); the per-replica balance pair is wired only where a component actually balances. The parity check forces the conversation the day that changes.",
-  "RIO_STORE__BALANCE_PORT": "unwired by default: this component dials the single Service endpoint (RIO_*__ADDR); the per-replica balance pair is wired only where a component actually balances. The parity check forces the conversation the day that changes."
+  "RIO_HEALTH_ADDR": "the port/address is baked into the Service + probe templates; changing it is a coupled chart+code change, not an operator knob."
  },
  "rio-controller": {
   "RIO_CLUSTER": "Config-borne via the rendered controller.toml (`cluster = ...`, single-sourced with the scheduler's [sla].cluster from the one values expression; helm/39-cluster-axis-single-source.sh enforces TOML-to-TOML parity). Deliberately NOT an env var \u2014 the env read was exactly the ungoverned side channel this parity check polices in mirror image (merged_bug_001).",
