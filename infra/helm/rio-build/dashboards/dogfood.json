@@ -1,0 +1,244 @@
+{
+  "schemaVersion": 39,
+  "title": "rio-build: Dogfood",
+  "uid": "rio-dogfood",
+  "tags": ["rio-build", "dogfood"],
+  "time": {"from": "now-6h", "to": "now"},
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {"id": 100, "type": "row", "title": "Did the change make it faster?", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}, "collapsed": false},
+    {
+      "id": 1, "type": "timeseries", "title": "Build duration p50 / p90 / p99",
+      "description": "rio_scheduler_build_duration_seconds — end-to-end per-derivation wall-clock as observed by the scheduler. The headline regression signal for the dogfood loop.",
+      "gridPos": {"x": 0, "y": 1, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum by (le) (rate(rio_scheduler_build_duration_seconds_bucket[10m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.9, sum by (le) (rate(rio_scheduler_build_duration_seconds_bucket[10m])))", "legendFormat": "p90", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(rio_scheduler_build_duration_seconds_bucket[10m])))", "legendFormat": "p99", "refId": "C"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": false, "scaleDistribution": {"type": "log", "log": 10}}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Build outcomes",
+      "description": "rio_scheduler_builds_total by outcome — success / failure / cancelled rate.",
+      "gridPos": {"x": 12, "y": 1, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum by (outcome) (rate(rio_scheduler_builds_total[5m]))", "legendFormat": "{{outcome}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 25, "stacking": {"mode": "normal"}, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "CA-cutoff savings",
+      "description": "rio_scheduler_ca_cutoff_saves_total / _seconds_saved — derivations skipped because a CA dep's output content-matched, and the est-seconds saved (ref-seconds, not wall-clock). Direct measure of incremental-rebuild efficacy.",
+      "gridPos": {"x": 18, "y": 1, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum(rate(rio_scheduler_ca_cutoff_saves_total[5m]))", "legendFormat": "drvs skipped /s", "refId": "A"},
+        {"expr": "sum(rate(rio_scheduler_ca_cutoff_seconds_saved[5m]))", "legendFormat": "ref-seconds saved /s", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": false}}, "overrides": [{"matcher": {"id": "byFrameRefID", "options": "B"}, "properties": [{"id": "unit", "value": "short"}, {"id": "custom.axisPlacement", "value": "right"}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+
+    {"id": 200, "type": "row", "title": "Where is time going?", "gridPos": {"x": 0, "y": 9, "w": 24, "h": 1}, "collapsed": false},
+    {
+      "id": 4, "type": "timeseries", "title": "Pipeline stage latency (p50)",
+      "description": "Median wall-clock per stage of a derivation's life: input prefetch → FUSE open (miss) → build proper → upload → node provision. Flat lines that move on a deploy point at the responsible stage.",
+      "gridPos": {"x": 0, "y": 10, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum by (le) (rate(rio_builder_castore_dag_prefetch_seconds_bucket[5m])))", "legendFormat": "input prefetch", "refId": "A"},
+        {"expr": "histogram_quantile(0.5, sum by (le) (rate(rio_builder_castore_fuse_open_seconds_bucket{case=~\"miss_small|miss_stream\"}[5m])))", "legendFormat": "FUSE open (miss)", "refId": "B"},
+        {"expr": "histogram_quantile(0.5, sum by (le) (rate(rio_builder_build_duration_seconds_bucket[5m])))", "legendFormat": "build", "refId": "C"},
+        {"expr": "histogram_quantile(0.5, sum by (le) (rate(rio_store_put_path_duration_seconds_bucket[5m])))", "legendFormat": "upload (store put)", "refId": "D"},
+        {"expr": "max(rio_controller_nodeclaim_lead_time_seconds)", "legendFormat": "node lead time (max-cell q)", "refId": "E"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": true, "scaleDistribution": {"type": "log", "log": 10}}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "MergeDag phase latency (p50)",
+      "description": "rio_scheduler_merge_phase_seconds by phase — decomposes actor_cmd_seconds{cmd=MergeDag}. One phase >1s is the I-139 N-sequential-PG-awaits regression.",
+      "gridPos": {"x": 12, "y": 10, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum by (le, phase) (rate(rio_scheduler_merge_phase_seconds_bucket[5m])))", "legendFormat": "{{phase}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": true, "scaleDistribution": {"type": "log", "log": 10}}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Attempt requeue latency (p50 by cause)",
+      "description": "rio_scheduler_attempt_requeue_seconds — terminal/death observation → requeue. cause=pod-terminal/establishment measures controller-report slack.",
+      "gridPos": {"x": 18, "y": 10, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum by (le, cause) (rate(rio_scheduler_attempt_requeue_seconds_bucket[5m])))", "legendFormat": "{{cause}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+
+    {"id": 300, "type": "row", "title": "Is caching working?", "gridPos": {"x": 0, "y": 18, "w": 24, "h": 1}, "collapsed": false},
+    {
+      "id": 7, "type": "timeseries", "title": "FUSE open hit ratio",
+      "description": "rio_builder_castore_fuse_open_case_total — fraction of open() upcalls served from the backing cache (case=hit) vs cold fetches. The single biggest builder-side perf lever.",
+      "gridPos": {"x": 0, "y": 19, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum(rate(rio_builder_castore_fuse_open_case_total{case=\"hit\"}[5m])) / sum(rate(rio_builder_castore_fuse_open_case_total[5m]))", "legendFormat": "hit ratio", "refId": "A"},
+        {"expr": "sum by (case) (rate(rio_builder_castore_fuse_open_case_total[5m]))", "legendFormat": "{{case}}", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": false}}, "overrides": [{"matcher": {"id": "byFrameRefID", "options": "B"}, "properties": [{"id": "unit", "value": "ops"}, {"id": "max"}, {"id": "custom.axisPlacement", "value": "right"}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Scheduler cache hits by source",
+      "description": "rio_scheduler_cache_hits_total — derivations served from cache without dispatch.",
+      "gridPos": {"x": 8, "y": 19, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum by (source) (rate(rio_scheduler_cache_hits_total[5m]))", "legendFormat": "{{source}}", "refId": "A"},
+        {"expr": "sum by (outcome) (rate(rio_scheduler_ca_hash_compares_total[5m]))", "legendFormat": "ca-compare {{outcome}}", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 15, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Materialization & chunk dedup",
+      "description": "rio_scheduler_materialization_jobs_resolved_total by outcome (upstream substitute health) and rio_store_chunk_dedup_ratio (store-side reuse).",
+      "gridPos": {"x": 16, "y": 19, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum by (outcome) (rate(rio_scheduler_materialization_jobs_resolved_total[5m]))", "legendFormat": "mat {{outcome}}", "refId": "A"},
+        {"expr": "max(rio_store_chunk_dedup_ratio)", "legendFormat": "chunk dedup ratio", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": false}}, "overrides": [{"matcher": {"id": "byFrameRefID", "options": "B"}, "properties": [{"id": "unit", "value": "percentunit"}, {"id": "custom.axisPlacement", "value": "right"}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+
+    {"id": 400, "type": "row", "title": "What's broken?", "gridPos": {"x": 0, "y": 27, "w": 24, "h": 1}, "collapsed": false},
+    {
+      "id": 10, "type": "timeseries", "title": "OOM & resource-floor bumps",
+      "description": "rio_builder_cgroup_oom_total (builder-observed OOMs) and rio_scheduler_resource_floor_bumps_total by reason — reactive upsize retries; nonzero means the SLA model under-provisioned.",
+      "gridPos": {"x": 0, "y": 28, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum(rate(rio_builder_cgroup_oom_total[5m]))", "legendFormat": "OOM kills", "refId": "A"},
+        {"expr": "sum by (reason) (rate(rio_scheduler_resource_floor_bumps_total[5m]))", "legendFormat": "floor-bump {{reason}}", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 15, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Infra requeues & stalls",
+      "description": "rio_scheduler_infra_requeues_total (the live_059 carousel signature) / rio_scheduler_materialization_stalled (parked jobs waiting on upstream) / rio_scheduler_build_timeouts_total.",
+      "gridPos": {"x": 8, "y": 28, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum by (charge) (rate(rio_scheduler_infra_requeues_total[5m]))", "legendFormat": "infra-requeue {{charge}}", "refId": "A"},
+        {"expr": "max(rio_scheduler_materialization_stalled)", "legendFormat": "materialization stalled", "refId": "B"},
+        {"expr": "sum(rate(rio_scheduler_build_timeouts_total[5m]))", "legendFormat": "timeouts", "refId": "C"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 15, "spanNulls": false}}, "overrides": [{"matcher": {"id": "byFrameRefID", "options": "B"}, "properties": [{"id": "unit", "value": "short"}, {"id": "custom.axisPlacement", "value": "right"}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Hard failures (should be flat-zero)",
+      "description": "FUSE circuit open, input-materialization failures (JIT throughput floor), store integrity/HMAC failures, unroutable feature requests. Any nonzero is an incident.",
+      "gridPos": {"x": 16, "y": 28, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "max(rio_builder_fuse_circuit_open)", "legendFormat": "FUSE circuit open", "refId": "A"},
+        {"expr": "sum(rate(rio_builder_input_materialization_failures_total[5m]))", "legendFormat": "input-mat failures", "refId": "B"},
+        {"expr": "sum(rate(rio_store_integrity_failures_total[5m])) + sum(rate(rio_store_hmac_rejected_total[5m]))", "legendFormat": "store integrity/hmac", "refId": "C"},
+        {"expr": "sum(rate(rio_scheduler_unroutable_features_total[5m]))", "legendFormat": "unroutable features", "refId": "D"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": false}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.001}]}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+
+    {"id": 500, "type": "row", "title": "Is the cluster sized right?", "gridPos": {"x": 0, "y": 36, "w": 24, "h": 1}, "collapsed": false},
+    {
+      "id": 13, "type": "timeseries", "title": "Queue vs capacity",
+      "description": "rio_scheduler_derivations_queued / _running and rio_scheduler_open_attempts (busy fleet — successor to workers_active). Queued ≫ open_attempts = under-provisioned.",
+      "gridPos": {"x": 0, "y": 37, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "max(rio_scheduler_derivations_queued)", "legendFormat": "queued", "refId": "A"},
+        {"expr": "max(rio_scheduler_derivations_running)", "legendFormat": "running", "refId": "B"},
+        {"expr": "max(rio_scheduler_open_attempts)", "legendFormat": "open attempts (fleet)", "refId": "C"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 15, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Builder utilisation",
+      "description": "rio_builder_{cpu,memory}_fraction — parent-cgroup polled every 10s. CPU >1.0 expected on multi-core under load; memory ≈0 means no pod limit set.",
+      "gridPos": {"x": 8, "y": 37, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "avg(rio_builder_cpu_fraction)", "legendFormat": "cpu (avg)", "refId": "A"},
+        {"expr": "max(rio_builder_cpu_fraction)", "legendFormat": "cpu (max)", "refId": "B"},
+        {"expr": "avg(rio_builder_memory_fraction)", "legendFormat": "mem (avg)", "refId": "C"},
+        {"expr": "max(rio_builder_memory_fraction)", "legendFormat": "mem (max)", "refId": "D"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": false}}, "overrides": [{"matcher": {"id": "byRegexp", "options": "^cpu.*"}, "properties": [{"id": "unit", "value": "short"}, {"id": "custom.axisPlacement", "value": "right"}, {"id": "custom.axisLabel", "value": "cores"}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Data movement by hop",
+      "description": "Per-hop byte rate (obs.metric.transfer-volume): gateway egress, builder FUSE fetch, builder upload, store substitute. Shows whether the cluster is input-bound or output-bound.",
+      "gridPos": {"x": 16, "y": 37, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum by (direction) (rate(rio_gateway_bytes_total[1m]))", "legendFormat": "gateway {{direction}}", "refId": "A"},
+        {"expr": "sum(rate(rio_builder_castore_fuse_fetch_bytes_total[1m]))", "legendFormat": "builder FUSE fetch", "refId": "B"},
+        {"expr": "sum(rate(rio_builder_upload_bytes_total[1m]))", "legendFormat": "builder upload", "refId": "C"},
+        {"expr": "sum(rate(rio_store_substitute_bytes_total[1m]))", "legendFormat": "store substitute", "refId": "D"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "Bps", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 15, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 16, "type": "timeseries", "title": "Node churn",
+      "description": "rio_controller_nodeclaim_created_total vs _reaped_total{reason} — provisioning vs reap rate. reason=ice spike = AWS capacity drought.",
+      "gridPos": {"x": 0, "y": 45, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum(rate(rio_controller_nodeclaim_created_total[5m]))", "legendFormat": "created", "refId": "A"},
+        {"expr": "sum by (reason) (rate(rio_controller_nodeclaim_reaped_total[5m]))", "legendFormat": "reaped {{reason}}", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 15, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 17, "type": "timeseries", "title": "Critical-path accuracy",
+      "description": "rio_scheduler_critical_path_accuracy — actual/estimated graph completion. >1.0 = scheduler under-estimated.",
+      "gridPos": {"x": 12, "y": 45, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum by (le) (rate(rio_scheduler_critical_path_accuracy_bucket[10m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.9, sum by (le) (rate(rio_scheduler_critical_path_accuracy_bucket[10m])))", "legendFormat": "p90", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "spanNulls": true}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    }
+  ]
+}
