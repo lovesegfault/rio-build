@@ -23,9 +23,10 @@ pub struct Config {
     /// required even with balance — it's the ClusterIP Service, used
     /// as the TLS verify domain (the cert's SAN).
     pub scheduler: rio_common::config::UpstreamAddrs,
-    /// rio-store upstream. Env: `RIO_STORE__ADDR`. Gateway connects
-    /// single-channel only (no `balance_host` — store load is
-    /// builder-driven, gateway's QueryPathInfo is light).
+    /// rio-store upstream. Env: `RIO_STORE__ADDR` /
+    /// `RIO_STORE__BALANCE_HOST` / `RIO_STORE__BALANCE_PORT`. Same
+    /// balanced/single-channel split as `scheduler` above; the
+    /// BalancedChannel guard is held in main.rs (`_store_balance_guard`).
     pub store: rio_common::config::UpstreamAddrs,
     /// SSH host key file path. Required.
     pub host_key: std::path::PathBuf,
@@ -208,17 +209,6 @@ impl rio_common::config::ValidateConfig for Config {
         self.scheduler
             .ensure_required("scheduler.addr", "gateway")?;
         self.store.ensure_required("store.addr", "gateway")?;
-        // Per the field doc: gateway connects to store single-channel
-        // only. main.rs's `let (store, _) = connect(...)` drops the
-        // BalancedChannel guard — silently accepting `balance_host`
-        // here would abort the probe loop and route to a stale IP on
-        // pod churn. Reject at startup instead.
-        anyhow::ensure!(
-            self.store.balance_host.is_none(),
-            "store.balance_host is not supported for the gateway (store load is \
-             builder-driven; gateway uses single-channel via store.addr) — \
-             unset RIO_STORE__BALANCE_HOST"
-        );
         // Lossy is fine: trim-then-empty check for operator-facing
         // error messages, not a parse. A non-UTF-8 config path would
         // fail at file-open anyway.
@@ -401,31 +391,17 @@ mod tests {
         }
     }
 
-    /// bug_088: gateway connects to store single-channel only;
-    /// `store.balance_host` is silently dropped in main.rs (`let
-    /// (store, _) = connect(...)`). Reject at config-validate so the
-    /// operator sees a startup error instead of stale-IP routing on
-    /// store-pod churn.
+    /// Both scheduler and store balanced modes are supported — main.rs
+    /// holds `_balance_guard` (scheduler) and `_store_balance_guard`
+    /// (store, since b80acbf61). Positive cases so a future
+    /// per-upstream rejection has a tripwire.
     #[test]
-    fn config_rejects_store_balance_host() {
-        let mut cfg = test_valid_config();
-        cfg.store.balance_host = Some("rio-store-headless".into());
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("RIO_STORE__BALANCE_HOST"),
-            "error must name the env var to unset: {err}"
-        );
-    }
-
-    /// Scheduler balanced mode IS supported (the guard is held in
-    /// main.rs's `_balance_guard`). Positive case so the rejection
-    /// above stays scoped to `store`.
-    #[test]
-    fn config_accepts_scheduler_balance_host() {
+    fn config_accepts_balance_hosts() {
         let mut cfg = test_valid_config();
         cfg.scheduler.balance_host = Some("rio-scheduler-headless".into());
+        cfg.store.balance_host = Some("rio-store-headless".into());
         cfg.validate()
-            .expect("scheduler.balance_host must remain supported");
+            .expect("scheduler/store balance_host must be accepted");
     }
 
     /// jwt.required=true without key_path is a misconfiguration —

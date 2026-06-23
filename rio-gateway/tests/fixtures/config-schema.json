@@ -20,7 +20,7 @@
         }
       },
       "store": {
-        "description": "rio-store upstream. Env: `RIO_STORE__ADDR`. Gateway connects\nsingle-channel only (no `balance_host` — store load is\nbuilder-driven, gateway's QueryPathInfo is light).",
+        "description": "rio-store upstream. Env: `RIO_STORE__ADDR` /\n`RIO_STORE__BALANCE_HOST` / `RIO_STORE__BALANCE_PORT`. Same\nbalanced/single-channel split as `scheduler` above; the\nBalancedChannel guard is held in main.rs (`_store_balance_guard`).",
         "$ref": "#/$defs/UpstreamAddrs",
         "default": {
           "addr": "",
