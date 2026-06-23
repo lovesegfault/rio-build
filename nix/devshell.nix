@@ -24,6 +24,12 @@
   # nix/quint-mcp.nix — hermetic quint-llm-kit MCP servers (KB search +
   # LSP bridge), invoked by the project-scoped .mcp.json.
   quintMcp,
+  # inputs.nix with doCheck=false — the pinned nix-daemon golden
+  # conformance runs against. Without this the dev shell falls through
+  # to ambient `nix-daemon` on PATH and rio-gateway::golden_conformance
+  # tests diverge from CI (which injects nixForTests via
+  # nix/lib/nextest-args.nix).
+  nixForTests,
 }:
 let
   # nixpkgs still ships sqlx-cli 0.8.6 while the workspace is on sqlx
@@ -51,6 +57,10 @@ let
     });
 
   shellPackages = with pkgs; [
+    # Pinned nix-daemon for golden conformance — first so it shadows
+    # ambient nix on PATH (CI parity; see nix/lib/nextest-args.nix).
+    nixForTests
+
     # CI gate driver — `nix-fast-build --flake .#checks.x86_64-linux`
     # streams eval+build (per-attr nix-eval-jobs workers → builds
     # queue as drvs become known). Replaces the old `.#ci` aggregate.
