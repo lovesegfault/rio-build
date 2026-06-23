@@ -66,6 +66,61 @@ Running in a fresh AWS account just works: `cargo xtask k8s -p eks up
 --bootstrap` computes the bucket name, creates it, migrates state into
 it. Everything downstream reads the same computed name.
 
+### Multiple clusters in one account
+
+Each cluster gets its own tofu workspace + `cluster_name`. Most
+resources are `${cluster_name}-`-prefixed, but a few are
+account-global and need handling on the second cluster:
+
+```bash
+# 1. Personal workspace (state isolated at env:/<name>/eks/).
+#    Do NOT set TF_WORKSPACE in .env.local — it would also leak
+#    into infra/eks/bootstrap, which is account-global.
+tofu -chdir=infra/eks workspace new <name>
+
+# 2. cluster_name in .env.local (default "rio-build" collides on IAM):
+#    TF_VAR_cluster_name=rio-<name>
+
+# 3. ECR repos are named rio-* (no cluster prefix) and already exist
+#    in the default workspace's state. Import them so apply doesn't
+#    try to recreate:
+for img in gateway scheduler store controller builder fetcher bootstrap dashboard; do
+  tofu -chdir=infra/eks import "aws_ecr_repository.rio[\"$img\"]" "rio-$img"
+done
+#    Note: every workspace's `tofu destroy` will then delete the
+#    shared repos (force_delete=true) — destroy with care.
+
+# 4. Each cluster's NAT gateway needs one Elastic IP. The default
+#    EC2-VPC EIP quota is 5; a 5th+ cluster needs a quota bump
+#    (Service Quotas → ec2 → L-0263D0A3). Without it, the NAT fails
+#    to create and the system node group goes CREATE_FAILED with
+#    "Instances failed to join the kubernetes cluster" (no internet
+#    egress) — taint the node group + re-apply after the bump.
+```
+
+### Cross-arch builds
+
+`up --push` builds docker images for both `x86_64-linux` and
+`aarch64-linux`, and `up --ami` builds both arches' node AMIs (the
+deploy preflight requires all three AMIs to exist). On a single-arch
+host without binfmt emulation, set `RIO_REMOTE_STORE` in `.env.local`
+to an `ssh-ng://` Nix store that can build both:
+
+```
+RIO_REMOTE_STORE=ssh-ng://builder.example
+```
+
+xtask then offloads the multi-arch `nix build` there and copies
+results back. Alternatively, pre-build
+`.#packages.{x86_64,aarch64}-linux.{dockerImages,ami}` (and
+`.#packages.x86_64-linux.ami-bios`) into the local store via your own
+remote-build mechanism before running `up`; xtask will find them
+cached.
+
+`--ami-arch x86-64` skips building the arm64 AMI, but does **not**
+skip the arm64 docker images or the deploy-time arm64 AMI check — it
+is not a single-arch escape hatch.
+
 ## Iterating
 
 The cluster stays up. `cargo xtask k8s -p eks up --deploy` runs `helm
