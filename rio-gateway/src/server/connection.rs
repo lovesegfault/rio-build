@@ -965,21 +965,33 @@ impl ConnectionHandler {
         channel: ChannelId,
         write_half: Option<ChannelWriteHalf<Msg>>,
     ) {
-        let prior = self
-            .channels
-            .insert(channel, ChannelDisposition::Accepted { write_half });
         // russh allocates channel ids server-side (next free in its
         // table); a `channel_open_session` for an id already in this
-        // map would mean russh re-delivered or re-used a live id. An
-        // evicted `Session(_)` here would fire `ChannelSession::Drop`
-        // (cancel + abort) on a live protocol task and silently skew
-        // `open_channels` toward a premature 2×bound termination —
-        // assert in debug rather than mask with `is_none()` skip.
-        debug_assert!(
-            prior.is_none(),
-            "channel_open_session for an id already in self.channels: {channel:?}"
-        );
-        self.open_channels += 1;
+        // map would mean russh re-delivered or re-used a live id.
+        // Evicting a `Session(_)` would fire `ChannelSession::Drop`
+        // (cancel + abort) on a live protocol task AND skew
+        // `open_channels` toward a premature 2×bound termination
+        // (only one `note_channel_closed` decrement). Debug asserts;
+        // release WARNs and idempotently skips both the overwrite and
+        // the increment — same defensive posture as the pre-iter22
+        // `accepted_channels.insert(ch)` skip, but loud.
+        match self.channels.entry(channel) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(ChannelDisposition::Accepted { write_half });
+                self.open_channels += 1;
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                debug_assert!(
+                    false,
+                    "channel_open_session for an id already in self.channels: {channel:?}"
+                );
+                warn!(
+                    channel = ?channel,
+                    "channel_open_session for an id already tracked; \
+                     skipping (russh id reuse without close)"
+                );
+            }
+        }
     }
 
     // r[impl gw.conn.channel-limit+4]
@@ -1486,13 +1498,18 @@ impl Handler for ConnectionHandler {
             // connection kills).
             metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit_soft")
                 .increment(1);
-            let prior = self
-                .channels
-                .insert(channel_id, ChannelDisposition::OverBound);
-            debug_assert!(
-                prior.is_none(),
-                "channel_open_session for an id already in self.channels: {channel_id:?}"
-            );
+            // Same idempotent-skip as `note_channel_accepted`: never
+            // evict a live `Session(_)` on a russh id-reuse.
+            if let std::collections::hash_map::Entry::Vacant(e) = self.channels.entry(channel_id) {
+                e.insert(ChannelDisposition::OverBound);
+            } else {
+                debug_assert!(
+                    false,
+                    "channel_open_session for an id already in self.channels: {channel_id:?}"
+                );
+                warn!(channel = ?channel_id,
+                      "over-bound open for an id already tracked; skipping");
+            }
             // Drop both halves — no protocol path for this channel. The
             // russh table entry stays until the client (or our
             // exec-time `reject_exec`) closes it.

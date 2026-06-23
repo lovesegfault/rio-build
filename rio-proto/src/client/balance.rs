@@ -248,6 +248,15 @@ async fn tick(
 ///
 /// Typical usage: construct once in `main()`, `.channel()` into
 /// service clients, keep the guard alive for process lifetime.
+///
+/// `#[must_use]` is the bug_088 tripwire: dropping the guard aborts
+/// the probe loop and the channel silently routes to stale endpoints
+/// after the first upstream rollout. (Destructuring the
+/// `Option<BalancedChannel>` half of `connect_raw`'s return into `_`
+/// still bypasses the lint — main.rs binding `_store_balance_guard`
+/// is the held convention.)
+#[must_use = "dropping a BalancedChannel aborts the endpoint probe; \
+              hold the guard for process lifetime (bug_088)"]
 pub struct BalancedChannel {
     channel: Channel,
     _task: tokio::task::JoinHandle<()>,

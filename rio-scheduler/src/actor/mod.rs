@@ -1816,9 +1816,14 @@ impl DagActor {
         // `coalesce_due` shape, which the move-before-rx would
         // otherwise put in the polled-every-iteration position).
         // Mirror `Option<Instant>` → pinned Sleep. `None` resets to a
-        // fixed far-future instant so the Sleep never reads as elapsed
-        // outside the `is_some()`-guarded arm; `Some(d)` resets iff the
-        // deadline changed. One helper so a robustness tweak lands once.
+        // fixed far-future instant; `Some(d)` resets iff the deadline
+        // changed. One helper so a robustness tweak lands once.
+        // SAFEGUARD: the `is_some()` arm guard is the SOLE busy-loop
+        // defense (tokio::select! does not poll a guard-false arm) —
+        // `far_future` is captured once and would read as elapsed past
+        // ~1y uptime or a `start_paused` test that `advance()`s past
+        // it; do NOT drop or reorder the `is_some()` guard on the
+        // assumption the Sleep itself stays unready.
         let far_future = tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365);
         fn sync_due(
             sleep: std::pin::Pin<&mut tokio::time::Sleep>,
