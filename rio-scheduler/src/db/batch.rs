@@ -293,7 +293,14 @@ impl SchedulerDb {
         builds: &[Uuid],
         drvs: &[Uuid],
     ) -> Result<(), sqlx::Error> {
-        debug_assert_eq!(builds.len(), drvs.len());
+        // Release-asserted: a length mismatch reaches PG multi-arg
+        // UNNEST, which silently NULL-pads the shorter array — a
+        // wrong-data write, not a wrong-crash. Caller invariant.
+        assert_eq!(
+            builds.len(),
+            drvs.len(),
+            "batch_insert_build_derivations_multi: parallel-array length mismatch"
+        );
         if builds.is_empty() {
             return Ok(());
         }

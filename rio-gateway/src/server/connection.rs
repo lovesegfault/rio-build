@@ -957,28 +957,29 @@ impl ConnectionHandler {
     /// Record an accepted `channel_open_session` toward the
     /// per-connection channel bound. The map entry is what later
     /// authorizes the matching close (and exec) to be acted on.
-    /// `write_half` is `Some` on the production path; `None` only at
-    /// the bookkeeping-helper test seam (`ChannelWriteHalf` has no
-    /// public constructor).
-    fn note_channel_accepted(
-        &mut self,
-        channel: ChannelId,
-        write_half: Option<ChannelWriteHalf<Msg>>,
-    ) {
-        // russh allocates channel ids server-side (next free in its
-        // table); a `channel_open_session` for an id already in this
-        // map would mean russh re-delivered or re-used a live id.
-        // Evicting a `Session(_)` would fire `ChannelSession::Drop`
-        // (cancel + abort) on a live protocol task AND skew
-        // `open_channels` toward a premature 2×bound termination
-        // (only one `note_channel_closed` decrement). Debug asserts;
-        // release WARNs and idempotently skips both the overwrite and
-        // the increment — same defensive posture as the pre-iter22
-        // `accepted_channels.insert(ch)` skip, but loud.
+    /// Record a `channel_open_session` outcome (accepted OR
+    /// over-bound) for `channel`. `open_channels` increments only when
+    /// [`ChannelDisposition::is_accepted`] — over-bound opens are
+    /// tracked but do not count toward the `r[gw.conn.channel-limit]`
+    /// soft bound.
+    ///
+    /// russh allocates channel ids server-side (next free in its
+    /// table); a `channel_open_session` for an id already in this map
+    /// would mean russh re-delivered or re-used a live id. Evicting a
+    /// `Session(_)` would fire `ChannelSession::Drop` (cancel + abort)
+    /// on a live protocol task AND skew `open_channels` toward a
+    /// premature 2×bound termination (only one `note_channel_closed`
+    /// decrement). Debug asserts; release WARNs and idempotently
+    /// skips both the overwrite and the increment — same defensive
+    /// posture as the pre-iter22 `accepted_channels.insert(ch)` skip,
+    /// but loud.
+    fn note_channel_open(&mut self, channel: ChannelId, disposition: ChannelDisposition) {
         match self.channels.entry(channel) {
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(ChannelDisposition::Accepted { write_half });
-                self.open_channels += 1;
+                if disposition.is_accepted() {
+                    self.open_channels += 1;
+                }
+                e.insert(disposition);
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 debug_assert!(
@@ -1438,7 +1439,8 @@ impl Handler for ConnectionHandler {
         // ControlMaster fan-out (a 128-core CI box running
         // nix-fast-build behind one mux is ~128 channels, ~4× under the
         // soft bound). `open_channels` cannot exceed `max` (over-bound
-        // opens return before `note_channel_accepted`), so inside this
+        // opens are not `is_accepted()` so the helper skips the
+        // increment), so inside this
         // branch `open_channels == max` and the backstop reduces to the
         // over-bound count alone.
         //
@@ -1460,11 +1462,7 @@ impl Handler for ConnectionHandler {
         if self.open_channels >= self.max_channels_per_connection {
             // Derived count — read only inside this already-pathological
             // branch, over ≤2×max entries; not worth a parallel field.
-            let over_bound = self
-                .channels
-                .values()
-                .filter(|d| matches!(d, ChannelDisposition::OverBound))
-                .count();
+            let over_bound = self.channels.values().filter(|d| !d.is_accepted()).count();
             if over_bound >= self.max_channels_per_connection {
                 warn!(
                     peer = ?self.peer_addr,
@@ -1498,18 +1496,7 @@ impl Handler for ConnectionHandler {
             // connection kills).
             metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit_soft")
                 .increment(1);
-            // Same idempotent-skip as `note_channel_accepted`: never
-            // evict a live `Session(_)` on a russh id-reuse.
-            if let std::collections::hash_map::Entry::Vacant(e) = self.channels.entry(channel_id) {
-                e.insert(ChannelDisposition::OverBound);
-            } else {
-                debug_assert!(
-                    false,
-                    "channel_open_session for an id already in self.channels: {channel_id:?}"
-                );
-                warn!(channel = ?channel_id,
-                      "over-bound open for an id already tracked; skipping");
-            }
+            self.note_channel_open(channel_id, ChannelDisposition::OverBound);
             // Drop both halves — no protocol path for this channel. The
             // russh table entry stays until the client (or our
             // exec-time `reject_exec`) closes it.
@@ -1528,7 +1515,12 @@ impl Handler for ConnectionHandler {
         // to deliver to the dropped half fail fast and are ignored.
         let (read_half, write_half) = channel.split();
         drop(read_half);
-        self.note_channel_accepted(channel_id, Some(write_half));
+        self.note_channel_open(
+            channel_id,
+            ChannelDisposition::Accepted {
+                write_half: Some(write_half),
+            },
+        );
         // Deliberately NOT disarming the empty-connection grace timer
         // here: a bare channel open is not activity. An open-but-never-
         // exec'd channel has no ChannelSession, no session permit, and
@@ -1834,15 +1826,15 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Gated on the disposition lookup: only `OverBound` traffic is
-        // excluded from the rx throughput counter (intentionally
-        // dropped — pre-soft-bound the path was unreachable). Pre-exec
-        // and dead-session tail data on accepted channels still count,
-        // preserving rx/tx parity with the unconditional tx increment.
-        // One immutable lookup on the hot path; `client_tx` is
-        // Arc-backed, so clone-then-send and re-lookup only on the rare
-        // dead-session arm — no take/reinsert window where the entry
-        // sits with `client_tx == None` across the await.
+        // Gated on the disposition lookup: `OverBound` traffic and data
+        // for an unknown channel id are excluded from the rx throughput
+        // counter (both intentionally dropped — pre-soft-bound neither
+        // path was reachable). Pre-exec and dead-session tail data on
+        // accepted channels still count, preserving rx/tx parity with
+        // the unconditional tx increment. One immutable lookup on the
+        // hot path; NLL ends the borrow at `tx`'s last use (the send
+        // await), so the rare dead-session arm's `get_mut` re-lookup
+        // type-checks without a per-chunk Sender clone.
         let tx = match self.channels.get(&channel) {
             None => {
                 debug!(channel = ?channel, len = data.len(), "data for unknown channel");
@@ -1859,7 +1851,7 @@ impl Handler for ConnectionHandler {
                 else {
                     return Ok(());
                 };
-                tx.clone()
+                tx
             }
         };
         debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
@@ -2028,7 +2020,7 @@ mod tests {
         let real = channel_id(1);
         let forged = channel_id(2);
 
-        handler.note_channel_accepted(real, None);
+        handler.note_channel_open(real, ChannelDisposition::Accepted { write_half: None });
         assert_eq!(handler.open_channels, 1, "accepted open must be counted");
 
         // A close for a channel that was never accepted must be ignored.
