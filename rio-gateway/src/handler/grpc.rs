@@ -537,7 +537,6 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // bounding anything). `bound` stays `MAX`: a finite value here is a
     // whole-stream deadline, which would re-introduce I-211.
     let (idle_tx, idle_rx) = tokio::sync::oneshot::channel::<()>();
-    let mut idle_tx = Some(idle_tx);
     let mut rpc: tokio::task::JoinHandle<
         Result<tonic::Response<types::PutPathResponse>, tonic::Status>,
     > = tokio::spawn(async move {
@@ -656,6 +655,34 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 
     drop(tx); // close channel → ReceiverStream yields None → rpc completes
 
+    // Error priority: pump error (NarRead — client short read) > rpc
+    // error. A short read truncates the stream; the useful message is
+    // "NAR read at X of Y", not "store rejected incomplete stream". The
+    // pump's only Failed variant is NarRead — a closed channel returns
+    // Done above, so an early store rejection (auth/quota/validation)
+    // surfaces via rpc_result with the store's actual Status, not a
+    // generic "channel closed". Hoisted ABOVE the response wait: when
+    // the pump already knows the terminal NarRead error, waiting up to
+    // GRPC_STREAM_TIMEOUT on a store that may be parked — and
+    // discarding whatever it returns — is dead latency holding the SSH
+    // channel; and an rpc-task panic at the join below would otherwise
+    // `?`-surface BEFORE the pump error, inverting the documented
+    // priority. Abort the rpc task (`idle_tx` — bounded_open's abort)
+    // and await it so the spawned task completes before we return.
+    // bug_118: exactly ONE emission per terminal failure — the error
+    // that SURFACES is the one surfaced through the emit law (a
+    // swallowed rpc error behind a winning pump error stays uncounted
+    // by design: one operation, one terminal observation).
+    let pump_idle = match pump {
+        Pump::Failed(e) => {
+            let _ = idle_tx.send(());
+            let _ = (&mut rpc).await;
+            return Err(surface_put_path_failure_any(e));
+        }
+        Pump::Idle => true,
+        Pump::Done => false,
+    };
+
     // I-211: the per-chunk idle bound also covers the final response
     // wait — the NarBudget park happens before the first chunk-ack, so a
     // tiny NAR (fewer than CHANNEL_BUF chunks; no send blocks) observes
@@ -666,14 +693,14 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // differ only in the message — both feed the surfacing fn and
     // `transient_retry_after` keys on Code::DeadlineExceeded for retry
     // classification, so they MUST share one synthesis site.
-    let mut rpc_join = if matches!(pump, Pump::Idle) {
+    let rpc_join = if pump_idle {
         None
     } else {
         tokio::time::timeout(GRPC_STREAM_TIMEOUT, &mut rpc)
             .await
             .ok()
     };
-    let rpc_result = match rpc_join.take() {
+    let rpc_result = match rpc_join {
         Some(join) => join.map_err(|e| {
             // bug_118: terminal arm (task panic — no store status).
             surface_put_path_failure_any(
@@ -681,12 +708,12 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
             )
         })?,
         None => {
-            let why = if matches!(pump, Pump::Idle) {
+            let why = if pump_idle {
                 "stream idle" // pump-idle: store not pulling chunks
             } else {
                 "response idle" // response-wait timeout: store parked
             };
-            let _ = idle_tx.take().expect("idle_tx is single-use").send(());
+            let _ = idle_tx.send(());
             let _ = (&mut rpc).await;
             Err(tonic::Status::deadline_exceeded(format!(
                 "PutPath {why} for {GRPC_STREAM_TIMEOUT:?} (store parked on NarBudget)"
@@ -694,19 +721,6 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
         }
     };
 
-    // Error priority: pump error (NarRead — client short read) > rpc error.
-    // A short read truncates the stream; the useful message is "NAR read at
-    // X of Y", not "store rejected incomplete stream". The pump's only
-    // Failed variant is NarRead — a closed channel returns Done above, so an
-    // early store rejection (auth/quota/validation) surfaces via rpc_result
-    // with the store's actual Status, not a generic "channel closed".
-    // bug_118: exactly ONE emission per terminal failure — the error
-    // that SURFACES is the one surfaced through the emit law (a
-    // swallowed rpc error behind a winning pump error stays uncounted
-    // by design: one operation, one terminal observation).
-    if let Pump::Failed(e) = pump {
-        return Err(surface_put_path_failure_any(e));
-    }
     let status = match rpc_result {
         Ok(resp) => return Ok(resp.into_inner().created),
         // bug_118: the surfacing fn IS the emit site — the store's
