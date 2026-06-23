@@ -2005,25 +2005,26 @@ impl ReattachBudget {
 /// derives the expected attempt count (`SUBMIT_RETRIES + 1`) instead
 /// of hand-syncing a literal.
 #[doc(hidden)]
-pub const SUBMIT_RETRIES: u32 = 8;
+pub const SUBMIT_RETRIES: u32 = 4;
 
 /// Backoff schedule for the pre-build_id `SubmitBuild` retry loop.
 ///
-/// Budget covers BOTH refusal classes: the deposed-believer fence
-/// window (≤ ~5s, the original 4×0.5/1/2/4 = 7.5s sizing) AND a
-/// sustained cost-axis backpressure hold — post-P0/P1 re-diagnosis
-/// observed the gate held for 89s before the prices_into_drain fix
-/// landed; the 4-retry/7.5s budget exhausted in 3 of those windows.
-/// 8 retries at 0.5/1/2/4/8/16/16/16/16s ≈ 79.5s sleep + 9 attempts
-/// under the per-attempt timeout covers a ~90s hold without making
-/// a genuine outage hang the client. Proportional jitter so a
-/// nix-fast-build burst's N parallel submits don't herd into the
-/// same backpressure-release instant.
+/// Sized for the deposed-believer fence window (≤ ~5s): 4 retries at
+/// 0.5/1/2/4s = 7.5s. The 89s sustained cost-axis backpressure hold
+/// that motivated 72cf3a359's 8-retry/~79.5s widen is structurally
+/// eliminated by `prices_into_drain` (af4785ef0) + the P2 phase-5
+/// coalesce — the scheduler's own doc claims the gate "reverts to a
+/// never-engages safety valve". Per the structural>retry>widen
+/// hierarchy, keeping the widen would mask any future regression in
+/// that law (a 60s hold would now succeed silently instead of
+/// surfacing for triage). Proportional jitter so a nix-fast-build
+/// burst's N parallel submits don't herd into the same
+/// backpressure-release instant.
 #[doc(hidden)]
 pub const SUBMIT_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
     base: std::time::Duration::from_millis(500),
     mult: 2.0,
-    cap: std::time::Duration::from_secs(16),
+    cap: std::time::Duration::from_secs(4),
     jitter: rio_common::backoff::Jitter::Proportional(0.25),
 };
 
