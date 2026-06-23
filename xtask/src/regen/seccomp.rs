@@ -104,7 +104,17 @@ pub async fn run(tag: &str) -> Result<()> {
                 info!("  {url} → {status}, trying fallback");
                 continue;
             }
-            break 'fetch resp.json().await?;
+            // Body-read / JSON-parse errors (truncated body, mid-body
+            // reset, HTML maintenance page on a 200) must ALSO fall
+            // through — `?` here would return from run() and skip
+            // urls[1].
+            match resp.json().await {
+                Ok(v) => break 'fetch v,
+                Err(e) => {
+                    info!("  {url} → body error ({e}), trying fallback");
+                    continue;
+                }
+            }
         }
         anyhow::bail!("moby {tag}: default.json not at any known path ({urls:?})");
     };
