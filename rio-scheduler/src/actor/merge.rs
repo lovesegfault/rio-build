@@ -352,8 +352,24 @@ impl DagActor {
         }
         self.pending_merges.push(PendingMerge { req, reply });
         if self.pending_merges.len() >= MERGE_PERSIST_BATCH_MAX {
-            self.flush_pending_merges().await;
+            self.flush_pending_merges_priced().await;
         }
+    }
+
+    /// [`Self::flush_pending_merges`] + feed the flush's wall-clock
+    /// cost into [`Self::note_turn_cost`]. The flush IS the
+    /// MergeDag-class work the cost-axis backpressure law gates on;
+    /// the `MergeDag` command itself is now µs-class intake
+    /// (`prices_into_drain` no longer folds it), so every flush
+    /// trigger — (i) eager here, (iv) the deadline arm, (v) the
+    /// inline post-dispatch check — routes through this wrapper. A
+    /// future flush trigger that calls [`Self::flush_pending_merges`]
+    /// directly silently regresses the cost-axis law on that path
+    /// (the EWMA decays to zero while real merge cost piles up).
+    pub(super) async fn flush_pending_merges_priced(&mut self) {
+        let t = std::time::Instant::now();
+        self.flush_pending_merges().await;
+        self.note_turn_cost(t.elapsed());
     }
 
     /// Drain [`Self::pending_merges`]: per-merge phases 0-4, ONE fenced

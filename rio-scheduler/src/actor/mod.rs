@@ -120,8 +120,9 @@ pub(crate) const ADMIN_FAST_LANE_DRAIN_QUOTA: usize = 16;
 
 /// EWMA weight for the per-turn cost estimate feeding the cost-axis
 /// backpressure law (round-9 B6, re-derived sh-024 §S2). The EWMA is
-/// FED only by [`ActorCommand::prices_into_drain`] variants
-/// (MergeDag, Tick) and EVALUATED per main-mailbox dequeue. At the
+/// FED by [`ActorCommand::prices_into_drain`] variants (Tick) and
+/// every merge flush ([`DagActor::flush_pending_merges_priced`]),
+/// and EVALUATED per main-mailbox dequeue. At the
 /// prior 0.3 a
 /// single 1.3 s spike (ewma 0.39, drain 44.5 s) activated and decayed
 /// below LOW within a handful of cheap feeds — sh-024 saw
@@ -1035,7 +1036,8 @@ pub struct DagActor {
     admin_fast_tx: mpsc::Sender<FastAdmin>,
     /// Per-turn work-cost EWMA in seconds (round-9 B6) — fed by
     /// [`DagActor::note_turn_cost`] after every
-    /// [`ActorCommand::prices_into_drain`] command (MergeDag, Tick);
+    /// [`ActorCommand::prices_into_drain`] command (Tick) and every
+    /// merge flush ([`DagActor::flush_pending_merges_priced`]);
     /// consumed by `update_backpressure`'s cost axis (projected drain
     /// = depth × this). Plain `f64`: only the single-threaded actor
     /// loop reads/writes it.
@@ -1835,17 +1837,15 @@ impl DagActor {
                 }
                 // P2 flush trigger (iv): same placement-after-rx +
                 // guard + reset-on-first-push discipline as the
-                // pull_flush_deadline arm above. The flush IS
-                // MergeDag-class work, so feed `note_turn_cost` (the
-                // queued-intake MergeDag turns themselves are now ~µs
-                // and would otherwise decay the EWMA to zero while
-                // real merge work piles up here).
+                // pull_flush_deadline arm above. Routes through the
+                // `_priced` wrapper so the cost-axis EWMA sees the
+                // flush (the queued-intake MergeDag turns themselves
+                // are ~µs and `prices_into_drain` no longer folds
+                // them — flush-driven, not variant-driven).
                 _ = self.merge_flush_deadline.tick(),
                     if !self.pending_merges.is_empty() =>
                 {
-                    let t = Instant::now();
-                    self.flush_pending_merges().await;
-                    self.note_turn_cost(t.elapsed());
+                    self.flush_pending_merges_priced().await;
                     continue;
                 }
             };
@@ -1878,11 +1878,12 @@ impl DagActor {
                     // P2: queue for batched phase-5 persist. The reply
                     // (and the orphan-cancel-on-drop) fire from
                     // `flush_pending_merges` after the batch tx
-                    // commits. The eager-flush trigger (i) inside
-                    // intake means a full-batch flush's cost is
-                    // attributed to THIS turn → `note_turn_cost`
-                    // below sees it; the deadline-arm flush feeds
-                    // `note_turn_cost` itself.
+                    // commits. Intake itself is µs-class; every flush
+                    // trigger routes through
+                    // `flush_pending_merges_priced` so the cost-axis
+                    // EWMA sees real merge cost regardless of which
+                    // trigger fired (`prices_into_drain` no longer
+                    // folds this variant — flush-driven).
                     self.handle_merge_dag_intake(req, reply).await;
                 }
                 ActorCommand::ProcessCompletion {
@@ -2156,7 +2157,8 @@ impl DagActor {
             // update_backpressure prices the queue with it (the
             // engagement window is the first dequeue after a stall,
             // which is exactly when the built-up queue needs shedding).
-            // Only MergeDag/Tick fold — see
+            // Only Tick folds variant-routed; merge-flush cost feeds
+            // via `flush_pending_merges_priced` — see
             // `ActorCommand::prices_into_drain`.
             if prices_into_drain {
                 self.note_turn_cost(cmd_elapsed);
@@ -2165,17 +2167,13 @@ impl DagActor {
             // The biased select! orders rx before the trigger-(iv) arm,
             // so a sustained-Ready rx starves it; this check runs AFTER
             // every command regardless of rx readiness and is the only
-            // sub-BATCH_MAX drain path while rx never empties. Feeds
-            // `note_turn_cost` (the flush IS MergeDag-class work) so the
-            // EWMA does not decay to zero while real merge cost piles up
-            // here.
+            // sub-BATCH_MAX drain path while rx never empties. Routes
+            // through `_priced` so the cost-axis EWMA sees the flush.
             if self
                 .merge_flush_armed_at
                 .is_some_and(|t| t.elapsed() >= merge::MERGE_PERSIST_FLUSH_DEADLINE)
             {
-                let t = Instant::now();
-                self.flush_pending_merges().await;
-                self.note_turn_cost(t.elapsed());
+                self.flush_pending_merges_priced().await;
             }
             metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => cmd_name)
                 .record(cmd_elapsed.as_secs_f64());
@@ -2196,10 +2194,14 @@ impl DagActor {
     // Backpressure
     // -----------------------------------------------------------------------
 
-    /// Record one MergeDag/Tick handler cost into the per-turn EWMA
+    /// Record one Tick / merge-flush cost into the per-turn EWMA
     /// (round-9 B6) — the producer side of the cost-axis backpressure
     /// law. Called by `run_inner` only for the variants
-    /// [`ActorCommand::prices_into_drain`] returns true for.
+    /// [`ActorCommand::prices_into_drain`] returns true for, and by
+    /// [`DagActor::flush_pending_merges_priced`] at every flush
+    /// trigger (the flush-driven feed; post-P2 `MergeDag` intake is
+    /// µs-class and folding it decayed any prior flush spike by
+    /// 0.95^31 per BATCH_MAX burst).
     ///
     /// The estimator tracks the work-class it gates (MergeDag drain
     /// time), not the whole mailbox mix. The mailbox during a burst is

@@ -964,24 +964,28 @@ impl ActorCommand {
     /// True for variants whose handler cost is folded into the
     /// per-turn cost EWMA ([`super::DagActor::note_turn_cost`]).
     ///
-    /// Only `MergeDag` and `Tick` price into projected drain: the
-    /// estimator the cost-axis backpressure law gates on is "how long
-    /// until the queued MergeDag work clears", and those two are the
-    /// commands that actually compete for that drain budget (303ms
-    /// avg, 65% PG persist; Tick is the periodic dispatch sweep that
-    /// blocks the queue at the same scale). Everything else is µs-
-    /// to-low-ms class and either contributes nothing material (65k ×
-    /// 4µs = 0.26s total) or — the post-P1 re-diagnosis case — sits
-    /// at a mid-cost rate (8.8k × 12ms PullAssignment) that kept the
-    /// 1ms-floored EWMA pinned in the 30s/10s hysteresis band for 89s
-    /// after the actual MergeDag work had cleared.
+    /// Only `Tick` prices into projected drain. The estimator the
+    /// cost-axis backpressure law gates on is "how long until the
+    /// queued merge work clears"; post-P2 the `MergeDag` handler is a
+    /// µs-class intake delegate (push + maybe-flush) and the real
+    /// merge cost surfaces at the FLUSH, which feeds `note_turn_cost`
+    /// directly via [`super::DagActor::flush_pending_merges_priced`]
+    /// at every trigger ((i) eager, (iv) deadline arm, (v) inline
+    /// post-dispatch). With `MergeDag` still folding here, a 32-batch
+    /// burst fed 31 µs intake samples per flush spike — 0.95^31≈0.20
+    /// decay between flushes, the exact engage/release flap the gate
+    /// was added to suppress (4th estimator round). `Tick` remains
+    /// the one variant-routed feed: it is the periodic dispatch sweep
+    /// that blocks the queue at the same scale and has no separate
+    /// flush wrapper.
     ///
     /// A NEW command variant whose handler is 100ms+ and runs at
-    /// MergeDag-like cadence MUST be added here (the
-    /// `prices_into_drain_is_exhaustive` test pins this list). A new
-    /// µs/ms-class variant stays out.
+    /// merge-flush-like cadence either feeds via a `_priced` flush
+    /// wrapper (preferred — the cost-axis input model is now
+    /// flush-driven, not variant-driven) or is added here. The
+    /// `prices_into_drain_is_exhaustive` test pins this list.
     pub(super) fn prices_into_drain(&self) -> bool {
-        matches!(self, Self::MergeDag { .. } | Self::Tick)
+        matches!(self, Self::Tick)
     }
 }
 

@@ -1072,12 +1072,14 @@ async fn backpressure_cost_axis_bimodal_mix_does_not_flap() -> TestResult {
     Ok(())
 }
 
-/// `prices_into_drain` is exhaustive: only MergeDag and Tick fold
-/// into the cost-axis EWMA. A new variant added without considering
-/// this is the structural seam — the post-P1 re-diagnosis 89s-hold
-/// was 8.8k mid-cost commands inflating an estimator meant to track
-/// MergeDag drain time. This test pins the list so the next variant
-/// add hits a deliberate `false` arm or an explicit `true` here.
+/// `prices_into_drain` is exhaustive: only Tick folds variant-routed
+/// into the cost-axis EWMA (merge cost feeds via
+/// `flush_pending_merges_priced` at every flush trigger — the
+/// flush-driven model). A new variant added without considering this
+/// is the structural seam — the post-P1 re-diagnosis 89s-hold was
+/// 8.8k mid-cost commands inflating an estimator meant to track merge
+/// drain time. This test pins the list so the next variant add hits a
+/// deliberate `false` arm or an explicit `true` here.
 #[test]
 fn prices_into_drain_is_exhaustive() {
     use crate::actor::command::ActorCommand;
@@ -1086,7 +1088,8 @@ fn prices_into_drain_is_exhaustive() {
     // assertion — they are NOT an `_ => false` wildcard.
     fn check(c: &ActorCommand) -> bool {
         match c {
-            ActorCommand::MergeDag { .. } => true,
+            // Post-P2 intake delegate: µs-class, flush feeds the EWMA.
+            ActorCommand::MergeDag { .. } => false,
             ActorCommand::Tick => true,
             ActorCommand::ProcessCompletion { .. } => false,
             ActorCommand::SubstituteProgress { .. } => false,
