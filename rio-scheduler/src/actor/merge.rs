@@ -538,7 +538,7 @@ impl DagActor {
     /// the index of the prepared merge whose data the error is
     /// attributable to: the Batch-2 per-merge edge loop sets it to `k`
     /// before each merge's edge resolution (the only per-merge-
-    /// attributable site — `MissingDbId` names merge[k]'s drv_path);
+    /// attributable site — `MissingDbId` names `merge[k]`'s drv_path);
     /// every batch-wide DB call leaves it at 0. The caller routes the
     /// original typed error to `replies[*culprit]`.
     ///
@@ -740,10 +740,10 @@ impl DagActor {
                     .filter_map(|h| id_map.get(h.as_str()).map(|(id, _)| *id))
             })
             // Cross-merge dedup (overlapping closures — the P2 target
-            // shape) before the = ANY($1::uuid[]) bind; same rationale
-            // as `reset_seen` below. PG's GROUP BY tolerates dupes but
-            // the wire payload + ANY() scan are inflated inside the
-            // held fenced tx.
+            // shape) before the `= any($1::uuid[])` bind; same
+            // rationale as `reset_seen` below. PG's GROUP BY tolerates
+            // dupes but the wire payload + array scan are inflated
+            // inside the held fenced tx.
             .collect::<HashSet<Uuid>>()
             .into_iter()
             .collect();
