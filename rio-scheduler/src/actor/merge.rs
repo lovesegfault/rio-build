@@ -60,6 +60,16 @@ pub(super) struct PendingMerge {
 // concurrent phase-6c-reaching test. nextest's process-per-test model
 // masked this; CLAUDE.md's documented `cargo test` fallback does not.
 
+/// One-site emit for the merge-phase histogram + the per-phase debug
+/// line. The function-local `phase!` macros in `prepare_merge_persist`
+/// / `reconcile_merged_state` (which also reset their `t_phase`) and
+/// `flush_pending_merges`' two batched-phase emits all route here.
+fn record_merge_phase(phase: &'static str, elapsed: std::time::Duration) {
+    metrics::histogram!("rio_scheduler_merge_phase_seconds", "phase" => phase)
+        .record(elapsed.as_secs_f64());
+    debug!(?elapsed, phase, "merge phase");
+}
+
 /// Cross-phase carrier from [`DagActor::prepare_merge_persist`] to
 /// [`DagActor::reconcile_merged_state`].
 ///
@@ -408,11 +418,7 @@ impl DagActor {
                     let _ = reply.send(Err(e));
                 }
             }
-            metrics::histogram!(
-                "rio_scheduler_merge_phase_seconds",
-                "phase" => "0to4-prepare-batched"
-            )
-            .record(t.elapsed().as_secs_f64());
+            record_merge_phase("0to4-prepare-batched", t.elapsed());
         }
         if prepared.is_empty() {
             return;
@@ -480,11 +486,7 @@ impl DagActor {
             }
             return;
         }
-        metrics::histogram!(
-            "rio_scheduler_merge_phase_seconds",
-            "phase" => "5-persist-and-activate-batched"
-        )
-        .record(t_persist.elapsed().as_secs_f64());
+        record_merge_phase("5-persist-and-activate-batched", t_persist.elapsed());
 
         // Phase 6+ per merge, then reply. Every build is now
         // Active+committed; DB writes here are log-and-continue.
@@ -779,10 +781,19 @@ impl DagActor {
         // the Arc bump on push and the move into `CreatedJob`
         // post-commit are both alloc-free.
         // r[impl sched.materialize.job+2]
-        let mut job_specs: Vec<(Uuid, DrvHash, Option<Uuid>, crate::state::JobOrigin)> = Vec::new();
+        let n_reprobe_est: usize = prepared.iter().map(|p| p.reprobe_sub_lane.len()).sum();
+        let n_jobs_est: usize = prepared
+            .iter()
+            .map(|p| {
+                p.pruned_closure_parents.len() + p.new_sub_lane.len() + p.reprobe_sub_lane.len()
+            })
+            .sum();
+        let mut job_specs: Vec<(Uuid, DrvHash, Option<Uuid>, crate::state::JobOrigin)> =
+            Vec::with_capacity(n_jobs_est);
         let mut job_spans: Vec<usize> = Vec::with_capacity(prepared.len());
-        let mut all_reset_hashes: Vec<DrvHash> = Vec::new();
-        let mut all_reset_rows: Vec<crate::db::attempts::AttemptRow> = Vec::new();
+        let mut all_reset_hashes: Vec<DrvHash> = Vec::with_capacity(n_reprobe_est);
+        let mut all_reset_rows: Vec<crate::db::attempts::AttemptRow> =
+            Vec::with_capacity(n_reprobe_est);
         // Cross-merge AS-5 dedup: pre-P2 merge[k+1]'s phase-5 ran AFTER
         // merge[k]'s phase-6d cleared the in-mem status, so the
         // `status() ∈ {Poisoned,DepFailed,Failed}` gate below was an
@@ -792,7 +803,7 @@ impl DagActor {
         // ledger rows (each with a fresh attempt_id; the ON CONFLICT
         // WHERE exec_id IS NOT NULL guard does not apply at
         // exec_id=None) and double-count the resubmit-cycle clear.
-        let mut reset_seen: HashSet<&str> = HashSet::new();
+        let mut reset_seen: HashSet<&str> = HashSet::with_capacity(n_reprobe_est);
         // Cross-merge job dedup: same drv_hash via two merges' lanes
         // would push two `job_specs` rows. The partial-unique
         // `(derivation_id) WHERE status='pending' AND exec_id IS NULL`
@@ -806,7 +817,7 @@ impl DagActor {
         // pre-P2 merge[k+1]'s lanes ran AFTER merge[k]'s job had
         // committed (ON CONFLICT deduped serially). At N=1 the set
         // degenerates to the per-merge intra-lane dedup.
-        let mut queued: HashSet<&str> = HashSet::new();
+        let mut queued: HashSet<&str> = HashSet::with_capacity(n_jobs_est);
         for p in prepared.iter() {
             let start = job_specs.len();
             // Three lanes share one push body — only `origin` and the
@@ -1119,10 +1130,7 @@ impl DagActor {
         let mut t_phase = Instant::now();
         macro_rules! phase {
             ($name:literal) => {
-                let elapsed = t_phase.elapsed();
-                metrics::histogram!("rio_scheduler_merge_phase_seconds", "phase" => $name)
-                    .record(elapsed.as_secs_f64());
-                debug!(?elapsed, phase = $name, "merge phase");
+                record_merge_phase($name, t_phase.elapsed());
                 t_phase = Instant::now();
             };
         }
@@ -1413,10 +1421,7 @@ impl DagActor {
         let mut t_phase = Instant::now();
         macro_rules! phase {
             ($name:literal) => {
-                let elapsed = t_phase.elapsed();
-                metrics::histogram!("rio_scheduler_merge_phase_seconds", "phase" => $name)
-                    .record(elapsed.as_secs_f64());
-                debug!(?elapsed, phase = $name, "merge phase");
+                record_merge_phase($name, t_phase.elapsed());
                 t_phase = Instant::now();
             };
         }

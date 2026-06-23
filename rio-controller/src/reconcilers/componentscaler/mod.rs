@@ -678,7 +678,7 @@ mod tests {
         );
     }
 
-    fn cs_spec(min: i32, max: i32) -> ComponentScalerSpec {
+    fn spec(min: i32, max: i32) -> ComponentScalerSpec {
         ComponentScalerSpec::test_fixture(min, max)
     }
 
@@ -726,14 +726,7 @@ mod tests {
         // burst), in-band load.
         let status_since: Option<Duration> = None;
         let since = freshest_since_up(status_since, state.last_scale_up.lock().get(&key).copied());
-        let d = decide::decide(
-            &cs_spec(2, 14),
-            &cs_status(50.0),
-            6,
-            100,
-            cs_total(0.5),
-            since,
-        );
+        let d = decide::decide(&spec(2, 14), &cs_status(50.0), 6, 100, cs_total(0.5), since);
         // Load-bearing: the EMITTED decision (the walk-down-at-next-
         // lull blast radius — `d.desired`, not gate state).
         assert_eq!(
@@ -777,14 +770,7 @@ mod tests {
         // only).
         let since = freshest_since_up(None, state.last_scale_up.lock().get(&key).copied());
         assert_eq!(since, None);
-        let d = decide::decide(
-            &cs_spec(2, 14),
-            &cs_status(50.0),
-            5,
-            200,
-            cs_total(0.9),
-            since,
-        );
+        let d = decide::decide(&spec(2, 14), &cs_status(50.0), 5, 200, cs_total(0.9), since);
         assert_eq!(
             d.desired, 6,
             "a failed scale patch leaves no phantom fence — the \
@@ -810,14 +796,7 @@ mod tests {
         // Fresh restart: neither record.
         let since = freshest_since_up(None, None);
         assert_eq!(since, None);
-        let d = decide::decide(
-            &cs_spec(2, 14),
-            &cs_status(50.0),
-            8,
-            100,
-            cs_total(0.5),
-            since,
-        );
+        let d = decide::decide(&spec(2, 14), &cs_status(50.0), 8, 100, cs_total(0.5), since);
         assert_eq!(
             d.desired, 7,
             "None-both (restart/fresh CR) → allow scale-down \
@@ -827,14 +806,7 @@ mod tests {
         // alone — the in-process record is the supplement for the
         // status-write-failure edge, never a replacement.
         let since = freshest_since_up(Some(Duration::from_secs(30)), None);
-        let d = decide::decide(
-            &cs_spec(2, 14),
-            &cs_status(50.0),
-            8,
-            100,
-            cs_total(0.5),
-            since,
-        );
+        let d = decide::decide(&spec(2, 14), &cs_status(50.0), 8, 100, cs_total(0.5), since);
         assert_eq!(
             d.desired, 8,
             "restart with status preserved → the durable stamp \
