@@ -440,8 +440,18 @@ impl DagActor {
         let t_persist = Instant::now();
         let mut culprit = 0usize;
         if let Err(e) = self.persist_merges(&mut prepared, &mut culprit).await {
+            // `build_id` is the operator-side join key to the gateway's
+            // SubmitBuild error (the pre-P2 inline path's
+            // `#[instrument(fields(build_id))]` carried it; the
+            // production intake→flush route bypasses that span and
+            // `cleanup_failed_merge` logs nothing on the common Ok
+            // rollback). Siblings get no per-build line — the
+            // `BatchSiblingFailed` they receive is intentionally
+            // detail-free (cross-tenant), so the culprit's id is the
+            // one anchor a `grep build_id=<uuid>` needs.
             error!(
                 error = %e, batch = prepared.len(), culprit,
+                build_id = %prepared[culprit].ingest.build_id,
                 "batched phase-5 persist failed; rolling back every prepared merge"
             );
             // Reverse-order rollback: later merges layered on earlier
@@ -1069,9 +1079,18 @@ impl DagActor {
         // call for the batch (`record_resubmit_resets` already takes a
         // slice and opens its own fenced tx).
         // r[impl sched.db.clear-poison-batch+3]
+        // Cross-merge dedup (same `pruned_ids`/`reset_seen` rationale —
+        // overlapping closures are the P2 target shape): N submissions
+        // resetting the same poisoned root in one coalesce window would
+        // otherwise write N `resubmit_reset` ledger rows (exec_id=None
+        // so the ON CONFLICT guard does not apply) and N×
+        // `clear_poison_batch_in_tx` slice entries in the SECOND
+        // fenced tx `record_resubmit_resets` opens.
         let resubmit_resets: Vec<DrvHash> = prepared
             .iter()
             .flat_map(|p| p.ingest.merge_result.reset_on_resubmit.iter().cloned())
+            .collect::<HashSet<DrvHash>>()
+            .into_iter()
             .collect();
         if !resubmit_resets.is_empty()
             && let Err(e) = self.record_resubmit_resets(&resubmit_resets).await
