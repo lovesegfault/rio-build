@@ -62,6 +62,7 @@ async fn test_scheduler_cache_check_skips_build() -> TestResult {
     // Build should be Succeeded (all 1 derivation cached).
     let status = query_status(&handle, build_id).await?;
     assert_eq!(status.cached_derivations, 1);
+    assert_eq!(status.built_derivations, 0, "cache hit is not a build");
     assert_eq!(
         status.completed_derivations, 1,
         "completed should count cached exactly once (no double-counting)"

@@ -141,6 +141,7 @@ pub struct SettledCounts {
     pub total: u32,
     pub completed: u32,
     pub cached: u32,
+    pub built: u32,
     pub failed: u32,
 }
 
@@ -222,6 +223,11 @@ pub struct BuildInfo {
     pub completed_count: u32,
     /// Number of derivations that are cached.
     pub cached_count: u32,
+    /// Number of derivations resolved by an actual build (executor
+    /// reported `BuildResultStatus::Built`). Event-driven like
+    /// `cached_count` — the DAG node status is just `Completed` and
+    /// doesn't record how, so this can't be derived from a summary scan.
+    pub built_count: u32,
     /// Number of derivations that have failed.
     pub failed_count: u32,
     /// First failure (summary + culprit + classification, one struct).
@@ -278,6 +284,7 @@ impl BuildInfo {
             recovered_completed: 0,
             completed_count: 0,
             cached_count: 0,
+            built_count: 0,
             failed_count: 0,
             first_failure: None,
             submitted_at: crate::state::RecoveredInstant::fresh_now(),
@@ -482,6 +489,7 @@ mod tests {
                 total: 0,
                 completed: 0,
                 cached: 0,
+                built: 0,
                 failed: 0,
             },
             outcome: TerminalOutcome::Succeeded {
@@ -519,6 +527,7 @@ mod tests {
                     total: 0,
                     completed: 0,
                     cached: 0,
+                    built: 0,
                     failed: 0,
                 },
                 outcome: TerminalOutcome::Succeeded {

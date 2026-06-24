@@ -60,7 +60,7 @@ impl SchedulerDb {
             r#"
             SELECT build_id, tenant_id, status, priority_class,
                    keep_going, options_json,
-                   total_drvs, completed_drvs, cached_drvs,
+                   total_drvs, completed_drvs, cached_drvs, built_drvs,
                    EXTRACT(EPOCH FROM (now() - submitted_at))::float8
                        AS submitted_age_secs
             FROM builds

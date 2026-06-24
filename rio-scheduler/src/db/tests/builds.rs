@@ -91,7 +91,7 @@ async fn test_list_builds_denorm_counts_roundtrip() -> anyhow::Result<()> {
     // Persist + re-read. No build_derivations rows exist — proves the
     // SELECT no longer joins (the old query would've returned 0 from
     // the COUNT regardless of these column values).
-    db.persist_build_counts_batch(&[(build_id, 100, 50, 12)])
+    db.persist_build_counts_batch(&[(build_id, 100, 50, 12, 7)])
         .await?;
     let (_, rows) = db.list_builds(None, None, 10, 0).await?;
     let row = rows.iter().find(|r| r.build_id == build_id).unwrap();

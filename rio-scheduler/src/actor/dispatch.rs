@@ -1043,7 +1043,7 @@ impl DagActor {
         // `persist_build_counts` RTTs at the iter3 actor profile's
         // phase-17 hot path.
         let cached_builds: Vec<(Uuid, u32)> = cached_per_build.into_iter().collect();
-        let mut counts: Vec<(Uuid, u32, u32, u32)> = Vec::with_capacity(cached_builds.len());
+        let mut counts: Vec<(Uuid, u32, u32, u32, u32)> = Vec::with_capacity(cached_builds.len());
         for &(build_id, n) in &cached_builds {
             // r[impl sched.build.terminal-status-settled+3]
             // Dispatch-time store hits can fan out to resident terminal
@@ -1059,8 +1059,8 @@ impl DagActor {
             }
             // I-140: one build_summary scan shared, not two.
             let summary = self.dag.build_summary(build_id);
-            if let Some((t, c, h)) = self.update_build_counts_with(build_id, &summary) {
-                counts.push((build_id, t, c, h));
+            if let Some((t, c, h, b)) = self.update_build_counts_with(build_id, &summary) {
+                counts.push((build_id, t, c, h, b));
             }
             self.emit_progress_with(build_id, &summary);
         }

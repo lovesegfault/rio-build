@@ -163,6 +163,7 @@ impl BuildEventBus {
         &mut self,
         build_id: Uuid,
         summary: &crate::dag::BuildSummary,
+        built: u32,
     ) {
         self.progress_at.insert(build_id, Instant::now());
         self.emit(
@@ -178,6 +179,7 @@ impl BuildEventBus {
                 // Progress can no longer silently zero a failed count
                 // the snapshot just reported (bug_304).
                 failed: summary.failed,
+                built,
             }),
         );
     }
@@ -224,7 +226,8 @@ impl DagActor {
             return;
         }
         let summary = self.dag.build_summary(build_id);
-        self.events.emit_progress_with(build_id, &summary);
+        let built = self.builds.get(&build_id).map_or(0, |b| b.built_count);
+        self.events.emit_progress_with(build_id, &summary, built);
     }
 
     /// Whether `BuildProgress` emission for this build is frozen because
@@ -255,7 +258,8 @@ impl DagActor {
         if self.build_progress_frozen(build_id) {
             return;
         }
-        self.events.emit_progress_with(build_id, summary);
+        let built = self.builds.get(&build_id).map_or(0, |b| b.built_count);
+        self.events.emit_progress_with(build_id, summary, built);
     }
 
     pub(super) fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {

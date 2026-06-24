@@ -1191,18 +1191,29 @@ async fn relay_substitute_progress<W: AsyncWrite + Unpin>(
     Ok(SubstRelay::Relayed)
 }
 
-/// The `resProgress` field array `[done, expected, running, failed]` —
-/// the ONLY producer of the root progress payload. The live `Progress`
-/// arm and the snapshot correction both call this, so the two surfaces
-/// cannot drift (the live arm hardcoded `failed = 0` while the
-/// snapshot carried the real count, and a build's failed column
-/// flickered to 0 on every live update after a reconnect).
-fn build_progress_fields(done: u64, expected: u64, running: u64, failed: u64) -> [ResultField; 4] {
+/// Map scheduler aggregate counts to nix `actBuilds` resProgress fields
+/// `[done, expected, running, failed]` — the ONLY producer of the root
+/// progress payload, so the live `Progress` arm and the snapshot
+/// correction cannot drift.
+///
+/// Nix's `Worker::updateProgress` emits `done = doneBuilds` (only
+/// `Built`) and `expected = expectedBuilds + doneBuilds`, where
+/// `expectedBuilds` is the live-goal MaintainCount — it decrements when
+/// a goal resolves for ANY reason. In scheduler terms
+/// `live_goals = total − completed − failed`.
+fn nix_builds_progress(
+    total: u32,
+    completed: u32,
+    built: u32,
+    running: u32,
+    failed: u32,
+) -> [ResultField; 4] {
+    let live = total.saturating_sub(completed).saturating_sub(failed);
     [
-        ResultField::Int(done),
-        ResultField::Int(expected),
-        ResultField::Int(running),
-        ResultField::Int(failed),
+        ResultField::Int(u64::from(built)),
+        ResultField::Int(u64::from(live) + u64::from(built)),
+        ResultField::Int(u64::from(running)),
+        ResultField::Int(u64::from(failed)),
     ]
 }
 
@@ -1224,9 +1235,10 @@ async fn relay_build_progress<W: AsyncWrite + Unpin>(
                 "build started"
             );
             // Top-level actBuilds activity. nom and progress-bar
-            // aggregate per-drv actBuild children under this; the
-            // SetExpected{actBuild, N} result drives the "N/M
-            // built" denominator. Idempotent: a second BuildStarted
+            // aggregate per-drv actBuild children under this. The
+            // SetExpected{actBuild, N} below is for nom — stock
+            // progress-bar's "%s built" reads only resProgress on this
+            // root (actBuilds, not actBuild). Idempotent: a second BuildStarted
             // (replayed via WatchBuild after reconnect) re-uses the
             // existing root rather than emitting a duplicate.
             if act.builds_root.is_none() {
@@ -1256,25 +1268,23 @@ async fn relay_build_progress<W: AsyncWrite + Unpin>(
         types::build_event::Event::Progress(prog) => {
             debug!(
                 completed = prog.completed,
+                built = prog.built,
                 running = prog.running,
                 queued = prog.queued,
                 total = prog.total,
                 "build progress"
             );
-            // resProgress fields: [done, expected, running, failed].
-            // `expected` is `total` (NOT total-cached): upstream
-            // progress-bar takes `max(SetExpected, Progress.expected)`
-            // so this is informational.
             if let Some(aid) = act.builds_root {
                 stderr
                     .result(
                         aid,
                         ResultType::Progress,
-                        &build_progress_fields(
-                            u64::from(prog.completed),
-                            u64::from(prog.total),
-                            u64::from(prog.running),
-                            u64::from(prog.failed),
+                        &nix_builds_progress(
+                            prog.total,
+                            prog.completed,
+                            prog.built,
+                            prog.running,
+                            prog.failed,
                         ),
                     )
                     .await?;
@@ -1331,6 +1341,7 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
             .start_activity(ActivityType::Builds, "", verbosity::DEBUG, 0, &[])
             .await?;
         act.builds_root = Some(aid);
+        // SetExpected{actBuild, N} for nom — same as the BuildStarted arm.
         let to_build = u64::from(
             snap.total_derivations
                 .saturating_sub(snap.cached_derivations),
@@ -1453,11 +1464,12 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
             .result(
                 aid,
                 ResultType::Progress,
-                &build_progress_fields(
-                    u64::from(snap.completed_derivations),
-                    u64::from(snap.total_derivations),
-                    u64::from(snap.running_derivations),
-                    u64::from(snap.failed_derivations),
+                &nix_builds_progress(
+                    snap.total_derivations,
+                    snap.completed_derivations,
+                    snap.built_derivations,
+                    snap.running_derivations,
+                    snap.failed_derivations,
                 ),
             )
             .await?;
@@ -6520,6 +6532,7 @@ mod tests {
             &mut act,
             &types::build_event::Event::Progress(types::BuildProgress {
                 completed: 4,
+                built: 4,
                 running: 1,
                 queued: 0,
                 total: 10,
@@ -6551,10 +6564,12 @@ mod tests {
             assert_eq!(wire::read_u64(&mut r).await.unwrap(), 0, "int field");
             *slot = wire::read_u64(&mut r).await.unwrap();
         }
+        // [done, expected, running, failed] = [built, live+built, running, failed]
+        // where live = total−completed−failed = 10−4−5 = 1.
         assert_eq!(
             ints,
-            [4, 10, 1, 5],
-            "resProgress [done, expected, running, failed] — failed must carry the scheduler's count"
+            [4, 5, 1, 5],
+            "resProgress — failed carries through; expected shrinks by failed+completed−built"
         );
     }
 

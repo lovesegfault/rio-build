@@ -2772,6 +2772,12 @@ pub const M_117: () = ();
 /// single-statement no-transaction rule from 022/071.
 pub const M_118: () = ();
 
+/// 119 — `builds.built_drvs`. DEFAULT 0: historical terminal rows keep
+/// 0 (column is for live progress + future analytics); builds in flight
+/// across the deploy under-count for their remaining lifetime, which is
+/// acceptable for a display denominator.
+pub const M_119: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

@@ -120,7 +120,7 @@ impl SchedulerDb {
     /// ONE call instead of N serial RTTs.
     pub(crate) async fn persist_build_counts_batch(
         &self,
-        rows: &[(Uuid, u32, u32, u32)],
+        rows: &[(Uuid, u32, u32, u32, u32)],
     ) -> Result<(), sqlx::Error> {
         if rows.is_empty() {
             return Ok(());
@@ -134,21 +134,28 @@ impl SchedulerDb {
             .collect();
         let completeds: Vec<i32> = rows
             .iter()
-            .map(|(_, _, c, _)| i32::try_from(*c).unwrap_or(i32::MAX))
+            .map(|(_, _, c, ..)| i32::try_from(*c).unwrap_or(i32::MAX))
             .collect();
         let cacheds: Vec<i32> = rows
             .iter()
-            .map(|(.., c)| i32::try_from(*c).unwrap_or(i32::MAX))
+            .map(|(_, _, _, c, _)| i32::try_from(*c).unwrap_or(i32::MAX))
+            .collect();
+        let builts: Vec<i32> = rows
+            .iter()
+            .map(|(.., b)| i32::try_from(*b).unwrap_or(i32::MAX))
             .collect();
         sqlx::query(
-            "UPDATE builds SET total_drvs = u.t, completed_drvs = u.c, cached_drvs = u.h \
-               FROM UNNEST($1::uuid[], $2::int[], $3::int[], $4::int[]) AS u(id, t, c, h) \
+            "UPDATE builds SET total_drvs = u.t, completed_drvs = u.c, \
+                               cached_drvs = u.h, built_drvs = u.b \
+               FROM UNNEST($1::uuid[], $2::int[], $3::int[], $4::int[], $5::int[]) \
+                 AS u(id, t, c, h, b) \
               WHERE builds.build_id = u.id",
         )
         .bind(&ids)
         .bind(&totals)
         .bind(&completeds)
         .bind(&cacheds)
+        .bind(&builts)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -341,17 +348,18 @@ impl SchedulerDb {
                     }
                     None => (None, None, None, None, None),
                 };
-            let (completed, cached) = settled
-                .map(|s| (s.counts.completed as i32, s.counts.cached as i32))
-                .unzip();
+            let completed = settled.map(|s| s.counts.completed as i32);
+            let cached = settled.map(|s| s.counts.cached as i32);
+            let built = settled.map(|s| s.counts.built as i32);
             let failed = settled.map(|s| s.counts.failed as i32);
             sqlx::query(
                 "UPDATE builds SET status = $2, finished_at = now(), error_summary = $3, \
                  completed_drvs = COALESCE($4, completed_drvs), \
                  cached_drvs = COALESCE($5, cached_drvs), \
-                 failed_drvs = $6, \
-                 failed_derivation = $7, failure_status = $8, \
-                 cancel_reason = $9, output_paths = $10 \
+                 built_drvs = COALESCE($6, built_drvs), \
+                 failed_drvs = $7, \
+                 failed_derivation = $8, failure_status = $9, \
+                 cancel_reason = $10, output_paths = $11 \
                  WHERE build_id = $1",
             )
             .bind(build_id)
@@ -359,6 +367,7 @@ impl SchedulerDb {
             .bind(error_summary)
             .bind(completed)
             .bind(cached)
+            .bind(built)
             .bind(failed)
             .bind(failed_derivation)
             .bind(failure_status)
@@ -391,7 +400,7 @@ impl SchedulerDb {
         sqlx::query_as(
             "SELECT status, error_summary, failed_derivation, failure_status, \
                     cancel_reason, output_paths, \
-                    total_drvs, completed_drvs, cached_drvs, failed_drvs \
+                    total_drvs, completed_drvs, cached_drvs, built_drvs, failed_drvs \
              FROM builds \
              WHERE build_id = $1 AND status IN ('succeeded','failed','cancelled') \
                AND ($2::uuid IS NULL OR tenant_id = $2)",
@@ -416,6 +425,7 @@ pub(crate) struct BuildTerminalRow {
     pub total_drvs: Option<i32>,
     pub completed_drvs: Option<i32>,
     pub cached_drvs: Option<i32>,
+    pub built_drvs: Option<i32>,
     pub failed_drvs: Option<i32>,
 }
 

@@ -302,6 +302,7 @@ impl DagActor {
                 total_derivations: settled.counts.total,
                 completed_derivations: settled.counts.completed,
                 cached_derivations: settled.counts.cached,
+                built_derivations: settled.counts.built,
                 running_derivations: 0,
                 failed_derivations: settled.counts.failed,
                 queued_derivations: 0,
@@ -324,6 +325,7 @@ impl DagActor {
             total_derivations: build.total_count,
             completed_derivations: build.recovered_completed + summary.completed,
             cached_derivations: build.cached_count,
+            built_derivations: build.built_count,
             running_derivations: summary.running,
             failed_derivations: summary.failed,
             queued_derivations: summary.queued,
@@ -428,6 +430,7 @@ impl DagActor {
                 total_derivations: settled.counts.total,
                 completed_derivations: settled.counts.completed,
                 cached_derivations: settled.counts.cached,
+                built_derivations: settled.counts.built,
                 running_derivations: 0,
                 failed_derivations: settled.counts.failed,
                 queued_derivations: 0,
@@ -492,6 +495,7 @@ impl DagActor {
             total_derivations: build.total_count,
             completed_derivations: build.recovered_completed + summary.completed,
             cached_derivations: build.cached_count,
+            built_derivations: build.built_count,
             running_derivations: summary.running,
             failed_derivations: summary.failed,
             queued_derivations: summary.queued,
@@ -515,9 +519,8 @@ impl DagActor {
 
     pub(super) async fn update_build_counts(&mut self, build_id: Uuid) {
         let summary = self.dag.build_summary(build_id);
-        if let Some((total, completed, cached)) = self.update_build_counts_with(build_id, &summary)
-        {
-            self.persist_build_counts_batch(&[(build_id, total, completed, cached)])
+        if let Some((t, c, h, b)) = self.update_build_counts_with(build_id, &summary) {
+            self.persist_build_counts_batch(&[(build_id, t, c, h, b)])
                 .await;
         }
     }
@@ -538,7 +541,7 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
         summary: &crate::dag::BuildSummary,
-    ) -> Option<(u32, u32, u32)> {
+    ) -> Option<(u32, u32, u32, u32)> {
         let build = self.builds.get_mut(&build_id)?;
         // r[impl sched.build.terminal-status-settled+3]
         // A settled build's accounting is frozen at the terminal
@@ -563,7 +566,8 @@ impl DagActor {
         let total = build.total_count;
         let completed = build.recovered_completed + summary.completed;
         let cached = build.cached_count;
-        Some((total, completed, cached))
+        let built = build.built_count;
+        Some((total, completed, cached, built))
     }
 
     /// Actor-level wrapper for [`SchedulerDb::persist_build_counts_batch`]
@@ -576,7 +580,7 @@ impl DagActor {
     /// `phase17_join3_under_half_fence` `≤1` bound).
     ///
     /// [`SchedulerDb::persist_build_counts_batch`]: crate::db::SchedulerDb::persist_build_counts_batch
-    pub(super) async fn persist_build_counts_batch(&mut self, rows: &[(Uuid, u32, u32, u32)]) {
+    pub(super) async fn persist_build_counts_batch(&mut self, rows: &[(Uuid, u32, u32, u32, u32)]) {
         if rows.is_empty() {
             return;
         }
@@ -787,6 +791,7 @@ impl DagActor {
             // snapshot/query surfaces use).
             completed: build.recovered_completed + summary.completed,
             cached: build.cached_count,
+            built: build.built_count,
             failed: summary.failed,
         };
         let outcome = match &intent {

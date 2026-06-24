@@ -671,6 +671,7 @@ fn synthesize_terminal_snapshot(
         total_derivations: row.total_drvs.unwrap_or(0).max(0) as u32,
         completed_derivations: row.completed_drvs.unwrap_or(0).max(0) as u32,
         cached_derivations: row.cached_drvs.unwrap_or(0).max(0) as u32,
+        built_derivations: row.built_drvs.unwrap_or(0).max(0) as u32,
         running_derivations: 0,
         failed_derivations: row.failed_drvs.unwrap_or(0).max(0) as u32,
         queued_derivations: 0,

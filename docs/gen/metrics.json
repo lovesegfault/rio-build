@@ -137,6 +137,7 @@
     "rio_scheduler_cleanup_dropped_total",
     "rio_scheduler_confirm_fences_gc_deleted_total",
     "rio_scheduler_critical_path_accuracy",
+    "rio_scheduler_derivation_outcomes_total",
     "rio_scheduler_derivations_gc_deleted_total",
     "rio_scheduler_derivations_queued",
     "rio_scheduler_derivations_running",
@@ -168,6 +169,7 @@
     "rio_scheduler_materialization_stalled",
     "rio_scheduler_materialization_view_node_skew_total",
     "rio_scheduler_merge_phase_seconds",
+    "rio_scheduler_mergedag_coalesce_batch_size",
     "rio_scheduler_open_attempts",
     "rio_scheduler_open_materialization_attempts",
     "rio_scheduler_orphan_builds_cancelled_total",
@@ -770,7 +772,7 @@
       {
         "name": "rio_gateway_errors_total",
         "kind": "counter",
-        "help": "Protocol errors (labeled by type; type=session also carries stage=tcp-accepted|auth-attempted|authenticated|channel-open)"
+        "help": "Protocol errors (labeled by type; type=session also carries stage=tcp-accepted|auth-attempted|authenticated|channel-open; type=channel_limit is the once-per-terminated-connection hard backstop, type=channel_limit_soft is per-over-bound-open)"
       },
       {
         "name": "rio_gateway_handshakes_total",
@@ -1024,6 +1026,11 @@
         "help": "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"
       },
       {
+        "name": "rio_scheduler_derivation_outcomes_total",
+        "kind": "counter",
+        "help": "Executor-reported success outcomes (labeled by outcome: built/substituted/already_valid). Pair with rio_scheduler_cache_hits_total for the no-dispatch resolutions."
+      },
+      {
         "name": "rio_scheduler_derivations_gc_deleted_total",
         "kind": "counter",
         "help": "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)"
@@ -1180,7 +1187,12 @@
       {
         "name": "rio_scheduler_merge_phase_seconds",
         "kind": "histogram",
-        "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+        "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f, plus the P2 coalesce labels 0to4-prepare-batched / 5-persist-and-activate-batched — the flush_pending_merges batch persist; N=1 and N>1 share one path). Emitted from flush_pending_merges, NOT the MergeDag command arm — post-P2 the arm is µs-class intake for 31/32 turns. actor_cmd_seconds{cmd=MergeDag} samples the flush only on the BATCH_MAX-th turn (trigger i eager flush is awaited inside intake — bimodal: 31× µs + 1× the batch flush per 32-burst); trigger iv (the deadline select! arm) bypasses the cmd sample. Compare phases against each other, not against actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+      },
+      {
+        "name": "rio_scheduler_mergedag_coalesce_batch_size",
+        "kind": "histogram",
+        "help": "Count of MergeDag commands drained per flush_pending_merges pass (P2 phase-5 coalesce). N=1 and N>1 share one persist_merges path; le≥8 is where the per-merge ~13-round-trip persist transaction amortizes into one fenced batch tx."
       },
       {
         "name": "rio_scheduler_open_attempts",
@@ -1414,7 +1426,7 @@
       {
         "name": "rio_scheduler_tick_phase_seconds",
         "kind": "histogram",
-        "help": "Per-phase housekeeping Tick latency (labeled by phase: 00-priority-sweep..18-snapshot-publish). Decomposes rio_scheduler_actor_cmd_seconds{cmd=Tick} the way merge_phase_seconds decomposes MergeDag: the Tick is a leader-only single-threaded actor turn, so one slow phase head-of-line blocks every queued RPC and starves admin-served probes — a phase in the tens-of-seconds buckets names the term to bound, instead of a log-silent stall."
+        "help": "Per-phase housekeeping Tick latency (labeled by phase: 00-priority-sweep..18-snapshot-publish). Decomposes rio_scheduler_actor_cmd_seconds{cmd=Tick}: the Tick is a leader-only single-threaded actor turn, so one slow phase head-of-line blocks every queued RPC and starves admin-served probes — a phase in the tens-of-seconds buckets names the term to bound, instead of a log-silent stall."
       },
       {
         "name": "rio_scheduler_timeout_cores_suppressed_total",

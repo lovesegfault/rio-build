@@ -1482,11 +1482,10 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
         })),
         ev(build_event::Event::Progress(types::BuildProgress {
             completed: 1,
+            built: 1,
             running: 1,
             queued: 1,
             total: 3,
-            // critical_path_remaining_secs + assigned_workers: don't
-            // care — this test asserts Progress is silent (no stderr).
             ..Default::default()
         })),
         ev(build_event::Event::Derivation(
@@ -1511,7 +1510,7 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
 
     // r[verify gw.stderr.result.progress]
     // Started → StartActivity{Builds} + Result{SetExpected,[105,2]}
-    // Progress → Result{Progress,[1,3,1,0]}
+    // Progress → Result{Progress,[built, live+built, running, failed]=[1,3,1,0]}
     // Cached/Queued → silent
     // Completed → StopActivity{root}
     let frames = collect_stderr_frames(&mut h.stream).await;

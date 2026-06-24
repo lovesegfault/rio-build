@@ -2728,6 +2728,10 @@ async fn test_completion_no_timestamps_no_sample() -> TestResult {
         rio_proto::types::BuildState::Succeeded as i32,
         "completion should succeed even without timestamps"
     );
+    assert_eq!(
+        status.built_derivations, 1,
+        "a Built report increments built_count (Substituted/cached do not)"
+    );
 
     // …but build_samples is empty (gate rejected None timestamps).
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM build_samples")
@@ -3757,6 +3761,7 @@ async fn exec_correlation_skips_terminal_builds() -> TestResult {
                 total: 1,
                 completed: 1,
                 cached: 0,
+                built: 1,
                 failed: 0,
             },
             outcome: crate::state::TerminalOutcome::Succeeded {

@@ -635,7 +635,7 @@ async fn test_recovery_seeds_denorm_counts_from_pg() -> TestResult {
         sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash IN ('i111-a', 'i111-b')")
             .execute(&pool)
             .await?;
-        sqlx::query("UPDATE builds SET total_drvs = 100, completed_drvs = 50, cached_drvs = 12 WHERE build_id = $1")
+        sqlx::query("UPDATE builds SET total_drvs = 100, completed_drvs = 50, cached_drvs = 12, built_drvs = 7 WHERE build_id = $1")
             .bind(build_id)
             .execute(&pool)
             .await?;
@@ -648,15 +648,15 @@ async fn test_recovery_seeds_denorm_counts_from_pg() -> TestResult {
     // every active build. Pre-fix that wrote (1, 0, 0) — derivation_
     // hashes.len()=1, summary.completed=0. Post-fix it writes
     // (total_count=100, recovered_completed+0=50, cached_count=12).
-    let (total, completed, cached): (i32, i32, i32) = sqlx::query_as(
-        "SELECT total_drvs, completed_drvs, cached_drvs FROM builds WHERE build_id = $1",
+    let (total, completed, cached, built): (i32, i32, i32, i32) = sqlx::query_as(
+        "SELECT total_drvs, completed_drvs, cached_drvs, built_drvs FROM builds WHERE build_id = $1",
     )
     .bind(build_id)
     .fetch_one(&db.pool)
     .await?;
     assert_eq!(
-        (total, completed, cached),
-        (100, 50, 12),
+        (total, completed, cached, built),
+        (100, 50, 12, 7),
         "recovery must preserve PG denorm counts, not recompute from DAG"
     );
 
@@ -665,6 +665,7 @@ async fn test_recovery_seeds_denorm_counts_from_pg() -> TestResult {
     assert_eq!(status.total_derivations, 100, "total_derivations");
     assert_eq!(status.completed_derivations, 50, "completed_derivations");
     assert_eq!(status.cached_derivations, 12, "cached_derivations");
+    assert_eq!(status.built_derivations, 7, "built_derivations");
 
     Ok(())
 }
