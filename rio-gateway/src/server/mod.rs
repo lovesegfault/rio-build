@@ -29,7 +29,7 @@ use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{Server as _, run_stream};
-use russh::{Disconnect, MethodKind, MethodSet};
+use russh::{Disconnect, MethodKind, MethodSet, Preferred, compression};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -1101,6 +1101,13 @@ pub fn build_ssh_config(host_key: PrivateKey) -> russh::server::Config {
         // constant-time delay for it. Subsequent real rejections
         // (unknown pubkey) still get the full 1s.
         auth_rejection_time_initial: Some(std::time::Duration::from_millis(10)),
+        // Advertise `none` only. NAR bodies are already compressed,
+        // so zlib is net expansion + CPU; and russh's compress loop
+        // can ship a truncated packet on incompressible input (#89).
+        preferred: Preferred {
+            compression: std::borrow::Cow::Borrowed(&[compression::NONE]),
+            ..Preferred::DEFAULT
+        },
         ..Default::default()
     }
 }

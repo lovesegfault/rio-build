@@ -134,10 +134,7 @@ pub async fn spawn_remote_nix_build(
 
     let log_file = std::fs::File::create(log_path)?;
     let log_err = log_file.try_clone()?;
-    let store = format!(
-        "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
-        key.display()
-    );
+    let store = format!("ssh-ng://rio@localhost:{port}?ssh-key={}", key.display());
 
     let mut cmd = tokio::process::Command::new("nix");
     cmd.args(["build", "--store", &store, "--eval-store", "auto"])
