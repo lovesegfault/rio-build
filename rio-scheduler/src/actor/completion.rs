@@ -2811,6 +2811,29 @@ impl DagActor {
             .map(|s| s.output_paths.clone())
             .unwrap_or_default();
         let interested_builds = self.get_interested_builds(drv_hash);
+
+        // Once-per-drv: the counter answers "cluster compute spent", so
+        // a drv shared across builds is one outcome. `cache_hits_total`
+        // covers no-dispatch resolutions; this covers executor-reported.
+        let outcome = match result.status {
+            rio_proto::types::BuildResultStatus::Built => "built",
+            rio_proto::types::BuildResultStatus::Substituted => "substituted",
+            rio_proto::types::BuildResultStatus::AlreadyValid => "already_valid",
+            _ => unreachable!("handle_success_completion only called for success-class"),
+        };
+        metrics::counter!("rio_scheduler_derivation_outcomes_total", "outcome" => outcome)
+            .increment(1);
+        if result.status == rio_proto::types::BuildResultStatus::Built {
+            for build_id in &interested_builds {
+                // Same terminal-freeze as cached_count.
+                if let Some(b) = self.builds.get_mut(build_id)
+                    && !b.state().is_terminal()
+                {
+                    b.built_count += 1;
+                }
+            }
+        }
+
         let completed_event = rio_proto::types::build_event::Event::Derivation(
             rio_proto::types::DerivationEvent::completed(
                 self.dag.path_or_hash_fallback(drv_hash),
@@ -3699,14 +3722,14 @@ impl DagActor {
         // each build sees Progress (loop 1) before its terminal_event
         // and BuildCompleted (loop 2).
         let check_builds: Vec<Uuid> = check_builds.into_iter().collect();
-        let mut counts: Vec<(Uuid, u32, u32, u32)> = Vec::with_capacity(check_builds.len());
+        let mut counts: Vec<(Uuid, u32, u32, u32, u32)> = Vec::with_capacity(check_builds.len());
         for &build_id in &check_builds {
             // I-140: build_summary is O(dag_nodes). Compute ONCE per
             // build, share between counts-persist and progress-emit.
             // Previously each fn ran its own scan → 2× per completion.
             let summary = self.dag.build_summary(build_id);
-            if let Some((t, c, h)) = self.update_build_counts_with(build_id, &summary) {
-                counts.push((build_id, t, c, h));
+            if let Some((t, c, h, b)) = self.update_build_counts_with(build_id, &summary) {
+                counts.push((build_id, t, c, h, b));
             }
             // Progress snapshot AFTER update_ancestors (critpath is
             // fresh — root priority dropped when this drv went

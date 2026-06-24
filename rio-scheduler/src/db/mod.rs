@@ -203,6 +203,7 @@ pub(crate) struct RecoveryBuildRow {
     pub total_drvs: i32,
     pub completed_drvs: i32,
     pub cached_drvs: i32,
+    pub built_drvs: i32,
     /// PG-side `now() - submitted_at` so the caller can reconstruct an
     /// `Instant` (same pattern as [`PoisonedDerivationRow`]). Seeds
     /// `BuildInfo::submitted_at` so `r[sched.timeout.per-build]` and

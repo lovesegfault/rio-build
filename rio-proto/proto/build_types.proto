@@ -112,6 +112,8 @@ message BuildSnapshot {
   string failed_derivation = 13;            // FAILED: which derivation caused it
   BuildResultStatus failure_status = 14;    // FAILED: classification for nix-wire BuildStatus
   string cancel_reason = 15;                // CANCELLED
+  // See BuildProgress.built.
+  uint32 built_derivations = 16;
 }
 
 // One currently-executing derivation in a BuildSnapshot.
@@ -197,6 +199,12 @@ message BuildProgress {
   // both render as "no failures", which is the pre-field display for
   // senders that predate the field — no `optional` needed.
   uint32 failed = 7;
+  // Derivations resolved by an actual build (executor reported
+  // BuildResultStatus::Built — not Substituted/AlreadyValid/cached).
+  // Nix's `actBuilds` resProgress wants `done = doneBuilds` (Built only)
+  // and `expected = live_goals + doneBuilds`; the gateway derives both
+  // from this field plus completed/failed/total.
+  uint32 built = 8;
 }
 
 message BuildCompleted {
@@ -872,6 +880,8 @@ message BuildStatus {
   // single-pass.
   optional uint64 critical_path_remaining_secs = 13;
   repeated string assigned_executors = 14;
+  // See BuildProgress.built.
+  uint32 built_derivations = 15;
 }
 
 enum BuildState {

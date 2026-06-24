@@ -2873,6 +2873,7 @@ mod tests {
                 total: 0,
                 completed: 0,
                 cached: 0,
+                built: 0,
                 failed: 0,
             },
             outcome: crate::state::TerminalOutcome::Succeeded {

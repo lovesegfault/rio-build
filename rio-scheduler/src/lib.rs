@@ -303,6 +303,10 @@ pub fn describe_metrics() {
         "Total build duration"
     );
     describe_counter!(
+        "rio_scheduler_derivation_outcomes_total",
+        "Executor-reported success outcomes (labeled by outcome: built/substituted/already_valid). Pair with rio_scheduler_cache_hits_total for the no-dispatch resolutions."
+    );
+    describe_counter!(
         "rio_scheduler_cache_hits_total",
         "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)"
     );
