@@ -92,6 +92,11 @@ pub struct UpOpts {
     /// Build + push docker images (ECR | ctr import).
     #[arg(long)]
     pub(super) push: bool,
+    /// Offload the push-phase image build to the running cluster
+    /// (same gateway path as `rsb`). Requires a reachable gateway,
+    /// i.e. a prior deploy. Incompatible with `--wipe`.
+    #[arg(long)]
+    via_rio: bool,
     /// helm upgrade rio chart.
     #[arg(long)]
     pub(super) deploy: bool,
@@ -748,6 +753,12 @@ pub(super) async fn run_up(
     // are hard errors vs silent skips.
     let explicit = selected.len() != Phase::ALL.len();
     o.validate_phase_opts(&selected)?;
+    if o.via_rio && o.wipe {
+        bail!("--via-rio cannot bootstrap a wiped cluster");
+    }
+    if o.via_rio && !selected.contains(&Phase::Push) {
+        bail!("--via-rio requires --push (or omit phase flags to run all)");
+    }
     // Provider-support validation BEFORE dispatch — same upfront-fail
     // discipline as validate_phase_opts. Without this,
     // `-p k3s up --bootstrap --provision --ami` would install rook
@@ -783,7 +794,7 @@ pub(super) async fn run_up(
             },
         },
     };
-    let cfg = Arc::new(cfg.clone());
+    let mut cfg = cfg.clone();
 
     // ami_branch is built here (not inside run_up_phases) because the
     // EKS-only gate needs `kind`, which the provider-agnostic core
@@ -818,6 +829,23 @@ pub(super) async fn run_up(
     if needs_upfront_backend_init(kind, o.wipe, &selected) {
         eks::init_backend(&cfg).await?;
     }
+
+    // After init_backend so `gateway_endpoint`'s kube/tofu reads hit
+    // the right cluster. The endpoint is held to keep a Tunnel guard
+    // alive across the push phase.
+    let _via_rio_ep = if o.via_rio {
+        let key = crate::ssh::privkey_path(&cfg)?;
+        let ep = ui::step("resolve gateway endpoint", || p.gateway_endpoint(0))
+            .await
+            .context("--via-rio: no reachable gateway (needs a prior deploy)")?;
+        let store = ep.store_url(&key);
+        info!("--via-rio: building images on {store}");
+        cfg.remote_store = Some(store);
+        Some(ep)
+    } else {
+        None
+    };
+    let cfg = Arc::new(cfg);
 
     if o.wipe {
         // wipe makes kube/kubectl/helm calls before the kubeconfig
