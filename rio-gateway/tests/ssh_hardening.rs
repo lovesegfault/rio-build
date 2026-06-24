@@ -68,6 +68,13 @@ fn test_ssh_config_hardened_fields() {
         "auth_rejection_time_initial must short-circuit the `none` probe"
     );
 
+    // compression: `none` only (#89). Default advertises zlib too.
+    assert_eq!(
+        cfg.preferred.compression.as_ref(),
+        [russh::compression::NONE],
+        "must not offer zlib"
+    );
+
     // inactivity_timeout: backstop still present.
     assert_eq!(
         cfg.inactivity_timeout,

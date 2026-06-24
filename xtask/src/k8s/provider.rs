@@ -92,10 +92,9 @@ impl GatewayEndpoint {
             Self::Direct { host, port } => (host.as_str(), *port),
             Self::Tunnel { port, .. } => ("localhost", *port),
         };
-        format!(
-            "ssh-ng://rio@{host}:{port}?compress=true&ssh-key={}",
-            key.display()
-        )
+        // No `compress=true`: NAR bodies are already compressed; SSH
+        // zlib only expands them (and the gateway no longer offers it).
+        format!("ssh-ng://rio@{host}:{port}?ssh-key={}", key.display())
     }
 
     /// Label for the `info!` line in `with_remote_store`.
@@ -240,7 +239,7 @@ mod tests {
         };
         assert_eq!(
             ep.store_url(std::path::Path::new("/k")),
-            "ssh-ng://rio@abc.elb.us-west-2.amazonaws.com:22?compress=true&ssh-key=/k"
+            "ssh-ng://rio@abc.elb.us-west-2.amazonaws.com:22?ssh-key=/k"
         );
         assert_eq!(ep.kind(), "direct (NLB)");
     }
